@@ -187,14 +187,32 @@ def generate_trading_signal(price: float, sentiment: int, volume: float, change_
         return 0
 
 def get_btc_market_data() -> Optional[Dict]:
-    """Get Bitcoin market data from Alpaca"""
-    if not alpaca_available or not alpaca_bot:
-        return None
-    
+    """Get Bitcoin market data from CoinGecko API"""
     try:
-        # Get BTC data (using crypto symbol if available)
-        market_data = alpaca_bot.get_market_data("BTC/USD", 1)
-        return market_data
+        # Use CoinGecko API for real Bitcoin data
+        url = "https://api.coingecko.com/api/v3/simple/price"
+        params = {
+            'ids': 'bitcoin',
+            'vs_currencies': 'usd',
+            'include_24hr_change': 'true',
+            'include_24hr_vol': 'true'
+        }
+        
+        response = requests.get(url, params=params, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        
+        if 'bitcoin' in data:
+            btc_data = data['bitcoin']
+            return {
+                'close': btc_data.get('usd', 45000.0),
+                'volume': btc_data.get('usd_24h_vol', 1000000.0),
+                'change_24h': btc_data.get('usd_24h_change', 0.0)
+            }
+        else:
+            logger.error("No Bitcoin data found in CoinGecko response")
+            return None
+            
     except Exception as e:
         logger.error(f"Error getting BTC market data: {e}")
         return None
@@ -466,24 +484,20 @@ async def buy_btc(amount: float = Form(...), token: str = Form(...)):
         raise HTTPException(status_code=401, detail="Authentication required")
     
     if not alpaca_available:
-        return {"message": "Alpaca trading not available"}
+        return {"message": "Alpaca trading not available - using demo mode"}
     
     try:
-        # Execute buy order through Alpaca
-        result = alpaca_bot.place_buy_order("BTC/USD", amount, 1.0)
-        
+        # For now, simulate the trade since Alpaca doesn't support BTC/USD
+        # In a real implementation, you'd use a crypto exchange API
         trade_log.append({
             "action": "BUY",
             "symbol": "BTC",
             "amount": amount,
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "result": result
+            "result": {"status": "success", "message": "Demo trade executed"}
         })
         
-        if result['status'] == 'success':
-            return {"message": f"Bought ${amount:.2f} worth of Bitcoin", "result": result}
-        else:
-            return {"message": f"Buy order failed: {result.get('reason', 'Unknown error')}", "result": result}
+        return {"message": f"Demo: Bought ${amount:.2f} worth of Bitcoin (simulated)", "result": {"status": "success"}}
             
     except Exception as e:
         return {"message": f"Error buying Bitcoin: {str(e)}"}
@@ -500,24 +514,20 @@ async def sell_btc(amount: float = Form(...), token: str = Form(...)):
         raise HTTPException(status_code=401, detail="Authentication required")
     
     if not alpaca_available:
-        return {"message": "Alpaca trading not available"}
+        return {"message": "Alpaca trading not available - using demo mode"}
     
     try:
-        # Execute sell order through Alpaca
-        result = alpaca_bot.place_sell_order("BTC/USD", amount)
-        
+        # For now, simulate the trade since Alpaca doesn't support BTC/USD
+        # In a real implementation, you'd use a crypto exchange API
         trade_log.append({
             "action": "SELL",
             "symbol": "BTC",
             "amount": amount,
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "result": result
+            "result": {"status": "success", "message": "Demo trade executed"}
         })
         
-        if result['status'] == 'success':
-            return {"message": f"Sold ${amount:.2f} worth of Bitcoin", "result": result}
-        else:
-            return {"message": f"Sell order failed: {result.get('reason', 'Unknown error')}", "result": result}
+        return {"message": f"Demo: Sold ${amount:.2f} worth of Bitcoin (simulated)", "result": {"status": "success"}}
             
     except Exception as e:
         return {"message": f"Error selling Bitcoin: {str(e)}"}
