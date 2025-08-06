@@ -348,21 +348,13 @@ async def dashboard():
             
             // Simple data loading function
             async function loadBTCData() {
+                console.log('loadBTCData called');
                 try {
-                    console.log('Loading BTC data...');
-                    
-                    // Show loading state
-                    document.getElementById('btc-price').innerHTML = 'Loading...';
-                    document.getElementById('btc-info').innerHTML = '<p>Loading market data...</p>';
-                    document.getElementById('btc-news').innerHTML = 'Loading news...';
-                    document.getElementById('signals').innerHTML = '<p>Loading signals...</p>';
-                    
-                    // Simple fetch without complex headers
                     const response = await fetch('/btc_data');
                     console.log('Response status:', response.status);
                     
                     if (!response.ok) {
-                        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+                        throw new Error(`HTTP ${response.status}`);
                     }
                     
                     const data = await response.json();
@@ -371,7 +363,6 @@ async def dashboard():
                     // Update price
                     if (data.price) {
                         document.getElementById('btc-price').innerHTML = `$${data.price.toLocaleString()}`;
-                        console.log('Price updated:', data.price);
                     }
                     
                     // Update market info
@@ -380,17 +371,10 @@ async def dashboard():
                             <p><strong>24h Change:</strong> <span class="${data.change_24h >= 0 ? 'signal-buy' : 'signal-sell'}">${data.change_24h > 0 ? '+' : ''}${data.change_24h.toFixed(2)}%</span></p>
                             <p><strong>Volume:</strong> $${data.volume.toLocaleString()}</p>
                         `;
-                        console.log('Market info updated');
                     }
                     
                     // Update news
-                    if (data.news) {
-                        document.getElementById('btc-news').innerHTML = data.news;
-                        console.log('News updated:', data.news);
-                    } else {
-                        document.getElementById('btc-news').innerHTML = 'Real-time Bitcoin data';
-                        console.log('News set to default');
-                    }
+                    document.getElementById('btc-news').innerHTML = data.news || 'Real-time Bitcoin data';
                     
                     // Update signals
                     if (data.sentiment !== undefined && data.probability !== undefined) {
@@ -402,93 +386,59 @@ async def dashboard():
                             <p><strong>Confidence:</strong> ${(data.probability * 100).toFixed(1)}%</p>
                             <p><strong>Signal:</strong> <span class="${data.signal === 1 ? 'signal-buy' : data.signal === -1 ? 'signal-sell' : 'signal-hold'}">${data.signal === 1 ? 'BUY' : data.signal === -1 ? 'SELL' : 'HOLD'}</span></p>
                         `;
-                        console.log('Signals updated');
-                    } else {
-                        document.getElementById('signals').innerHTML = '<p>Signals loading...</p>';
-                        console.log('Signals set to loading');
                     }
                     
                     console.log('BTC data loaded successfully');
                 } catch (error) {
                     console.error('Error loading BTC data:', error);
                     document.getElementById('btc-price').innerHTML = 'Error loading data';
-                    document.getElementById('btc-info').innerHTML = '<p>Error loading market data</p>';
-                    document.getElementById('btc-news').innerHTML = 'Error loading news';
-                    document.getElementById('signals').innerHTML = '<p>Error loading signals</p>';
                 }
             }
             
-            async function buyBTC() {
+            function buyBTC() {
                 const amount = document.getElementById('trade-amount').value;
-                alert(`Buy BTC: $${amount} - This would execute a buy order`);
-                console.log('Buy BTC called with amount:', amount);
+                alert(`Buy BTC: $${amount}`);
+                console.log('Buy BTC:', amount);
                 
-                // Add to trade log
                 const log = document.getElementById('trade-log');
                 const timestamp = new Date().toLocaleTimeString();
-                log.innerHTML += `<div>[${timestamp}] BUY: $${amount} worth of BTC</div>`;
-                log.scrollTop = log.scrollHeight;
+                log.innerHTML += `<div>[${timestamp}] BUY: $${amount}</div>`;
             }
             
-            async function sellBTC() {
+            function sellBTC() {
                 const amount = document.getElementById('trade-amount').value;
-                alert(`Sell BTC: $${amount} - This would execute a sell order`);
-                console.log('Sell BTC called with amount:', amount);
+                alert(`Sell BTC: $${amount}`);
+                console.log('Sell BTC:', amount);
                 
-                // Add to trade log
                 const log = document.getElementById('trade-log');
                 const timestamp = new Date().toLocaleTimeString();
-                log.innerHTML += `<div>[${timestamp}] SELL: $${amount} worth of BTC</div>`;
-                log.scrollTop = log.scrollHeight;
+                log.innerHTML += `<div>[${timestamp}] SELL: $${amount}</div>`;
             }
             
-                        async function autoTrade() {
+            async function autoTrade() {
+                console.log('Auto trade started');
+                document.getElementById('trading-status').innerHTML = '<div class="status status-success">🤖 AI analyzing...</div>';
+                
                 try {
-                    console.log('🤖 Auto Trade started...');
-                    
-                    // Show loading state
-                    document.getElementById('trading-status').innerHTML = '<div class="status status-success">🤖 AI analyzing market conditions...</div>';
-                    
-                    // Call the auto trade endpoint without authentication for demo
                     const response = await fetch('/auto_trade_demo', {
                         method: 'POST',
                         headers: {'Content-Type': 'application/json'}
                     });
                     
-                    console.log('Auto trade response status:', response.status);
-                    
-                    if (!response.ok) {
-                        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-                    }
-                    
                     const data = await response.json();
                     console.log('Auto trade response:', data);
                     
-                    // Display the results
-                    let message = `🤖 AI Analysis Complete!\n\n`;
+                    let message = '🤖 AI Analysis Complete!\n';
                     if (data.signal) {
-                        message += `Sentiment: ${data.signal.sentiment}\n`;
-                        message += `Confidence: ${(data.signal.confidence * 100).toFixed(1)}%\n`;
                         message += `Action: ${data.signal.action.toUpperCase()}\n`;
-                        message += `Reason: ${data.signal.reason}\n\n`;
-                        
-                        if (data.trade_executed) {
-                            message += `✅ Trade executed: $${data.signal.position_size} ${data.signal.action}`;
-                        } else {
-                            message += `⏸️ No trade executed: ${data.signal.reason}`;
-                        }
-                    } else {
-                        message += `Analysis completed but no signal generated.`;
+                        message += `Reason: ${data.signal.reason}`;
                     }
                     
                     document.getElementById('trading-status').innerHTML = `<div class="status status-success">${message.replace(/\n/g, '<br>')}</div>`;
                     
-                    // Add to trade log
                     const log = document.getElementById('trade-log');
                     const timestamp = new Date().toLocaleTimeString();
-                    log.innerHTML += `<div>[${timestamp}] 🤖 AUTO TRADE: ${data.signal ? data.signal.action.toUpperCase() : 'Analysis'} - ${data.signal ? data.signal.reason : 'Completed'}</div>`;
-                    log.scrollTop = log.scrollHeight;
-                    
+                    log.innerHTML += `<div>[${timestamp}] 🤖 AUTO TRADE: ${data.signal ? data.signal.action.toUpperCase() : 'Analysis'}</div>`;
                 } catch (error) {
                     console.error('Auto trade error:', error);
                     document.getElementById('trading-status').innerHTML = `<div class="status status-error">Error: ${error.message}</div>`;
