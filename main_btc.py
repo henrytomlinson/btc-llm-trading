@@ -338,7 +338,6 @@ async def dashboard():
         </div>
         
         <script>
-            alert('JavaScript is loading!');
             console.log('JavaScript starting...');
             
             let jwtToken = localStorage.getItem('jwt_token');
@@ -351,14 +350,12 @@ async def dashboard():
             
             // Simple data loading function
             function loadBTCData() {
-                alert('Loading BTC data...');
                 console.log('loadBTCData called');
                 
                 fetch('/btc_data')
                     .then(response => response.json())
                     .then(data => {
                         console.log('Data received:', data);
-                        alert('Data loaded: $' + data.price);
                         
                         // Update price
                         document.getElementById('btc-price').innerHTML = '$' + data.price.toLocaleString();
@@ -384,7 +381,6 @@ async def dashboard():
                     })
                     .catch(error => {
                         console.error('Error:', error);
-                        alert('Error loading data: ' + error.message);
                         document.getElementById('btc-price').innerHTML = 'Error loading data';
                     });
             }
@@ -481,7 +477,6 @@ async def dashboard():
             };
             
             // Load data immediately when page loads
-            alert('Page loaded, calling loadBTCData...');
             console.log('Page loaded, loading BTC data...');
             loadBTCData();
             
