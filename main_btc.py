@@ -724,6 +724,12 @@ async def test_apis():
     
     return results
 
+@app.get("/test")
+async def test_page():
+    """Serve the test HTML page"""
+    with open('test.html', 'r') as f:
+        return HTMLResponse(content=f.read())
+
 @app.post("/auto_trade")
 async def auto_trade(token: str = Form(...)):
     """Execute automated trading based on LLM analysis"""
