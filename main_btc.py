@@ -340,6 +340,13 @@ async def dashboard():
         <script>
             let jwtToken = localStorage.getItem('jwt_token');
             
+            // Simple test function
+            function testJS() {
+                alert('JavaScript is working!');
+                console.log('Test function called');
+            }
+            
+            // Simple data loading function
             async function loadBTCData() {
                 try {
                     console.log('Loading BTC data...');
@@ -350,14 +357,8 @@ async def dashboard():
                     document.getElementById('btc-news').innerHTML = 'Loading news...';
                     document.getElementById('signals').innerHTML = '<p>Loading signals...</p>';
                     
-                    const response = await fetch('/btc_data' + (jwtToken ? `?token=${jwtToken}` : ''), {
-                        method: 'GET',
-                        headers: {
-                            'Accept': 'application/json',
-                            'Content-Type': 'application/json'
-                        }
-                    });
-                    
+                    // Simple fetch without complex headers
+                    const response = await fetch('/btc_data');
                     console.log('Response status:', response.status);
                     
                     if (!response.ok) {
@@ -368,44 +369,34 @@ async def dashboard():
                     console.log('BTC data received:', data);
                     
                     // Update price
-                    if (data.price !== undefined) {
+                    if (data.price) {
                         document.getElementById('btc-price').innerHTML = `$${data.price.toLocaleString()}`;
-                    } else {
-                        document.getElementById('btc-price').innerHTML = 'Price unavailable';
                     }
                     
                     // Update market info
-                    if (data.change_24h !== undefined && data.volume !== undefined && data.signal !== undefined) {
+                    if (data.change_24h !== undefined && data.volume !== undefined) {
                         document.getElementById('btc-info').innerHTML = `
                             <p><strong>24h Change:</strong> <span class="${data.change_24h >= 0 ? 'signal-buy' : 'signal-sell'}">${data.change_24h > 0 ? '+' : ''}${data.change_24h.toFixed(2)}%</span></p>
                             <p><strong>Volume:</strong> $${data.volume.toLocaleString()}</p>
-                            <p><strong>Signal:</strong> <span class="${getSignalClass(data.signal)}">${getSignalText(data.signal)}</span></p>
                         `;
-                    } else {
-                        document.getElementById('btc-info').innerHTML = '<p>Market data unavailable</p>';
                     }
                     
                     // Update news
                     if (data.news) {
                         document.getElementById('btc-news').innerHTML = data.news;
-                    } else {
-                        document.getElementById('btc-news').innerHTML = 'News unavailable';
                     }
                     
                     // Update signals
                     if (data.sentiment !== undefined && data.probability !== undefined) {
                         document.getElementById('signals').innerHTML = `
-                            <p><strong>Sentiment:</strong> <span class="${getSentimentClass(data.sentiment)}">${getSentimentText(data.sentiment)}</span></p>
+                            <p><strong>Sentiment:</strong> <span class="${data.sentiment > 0 ? 'signal-buy' : data.sentiment < 0 ? 'signal-sell' : 'signal-hold'}">${data.sentiment > 0 ? 'Positive' : data.sentiment < 0 ? 'Negative' : 'Neutral'}</span></p>
                             <p><strong>Confidence:</strong> ${(data.probability * 100).toFixed(1)}%</p>
                         `;
-                    } else {
-                        document.getElementById('signals').innerHTML = '<p>Signals unavailable</p>';
                     }
                     
                     console.log('BTC data loaded successfully');
                 } catch (error) {
                     console.error('Error loading BTC data:', error);
-                    // Show error in UI
                     document.getElementById('btc-price').innerHTML = 'Error loading data';
                     document.getElementById('btc-info').innerHTML = '<p>Error loading market data</p>';
                     document.getElementById('btc-news').innerHTML = 'Error loading news';
@@ -415,120 +406,19 @@ async def dashboard():
             
             async function buyBTC() {
                 const amount = document.getElementById('trade-amount').value;
-                if (!jwtToken) {
-                    alert('Please login first');
-                    return;
-                }
-                
-                try {
-                    const response = await fetch('/buy_btc', {
-                        method: 'POST',
-                        headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-                        body: `amount=${amount}&token=${jwtToken}`
-                    });
-                    
-                    if (!response.ok) {
-                        if (response.status === 401) {
-                            alert('Session expired. Please login again.');
-                            window.location.href = '/login';
-                            return;
-                        }
-                        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-                    }
-                    
-                    const data = await response.json();
-                    const message = data.message || 'Trade executed successfully';
-                    addTradeLog(`BUY: $${amount} worth of BTC - ${message}`);
-                    document.getElementById('trading-status').innerHTML = `<div class="status status-success">${message}</div>`;
-                } catch (error) {
-                    console.error('Buy error:', error);
-                    const errorMessage = error.message || 'Unknown error occurred';
-                    addTradeLog(`BUY: $${amount} worth of BTC - Error: ${errorMessage}`);
-                    document.getElementById('trading-status').innerHTML = `<div class="status status-error">Error: ${errorMessage}</div>`;
-                }
+                alert(`Buy BTC: $${amount} - This would execute a buy order`);
+                console.log('Buy BTC called with amount:', amount);
             }
             
             async function sellBTC() {
                 const amount = document.getElementById('trade-amount').value;
-                if (!jwtToken) {
-                    alert('Please login first');
-                    return;
-                }
-                
-                try {
-                    const response = await fetch('/sell_btc', {
-                        method: 'POST',
-                        headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-                        body: `amount=${amount}&token=${jwtToken}`
-                    });
-                    
-                    if (!response.ok) {
-                        if (response.status === 401) {
-                            alert('Session expired. Please login again.');
-                            window.location.href = '/login';
-                            return;
-                        }
-                        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-                    }
-                    
-                    const data = await response.json();
-                    const message = data.message || 'Trade executed successfully';
-                    addTradeLog(`SELL: $${amount} worth of BTC - ${message}`);
-                    document.getElementById('trading-status').innerHTML = `<div class="status status-success">${message}</div>`;
-                } catch (error) {
-                    console.error('Sell error:', error);
-                    const errorMessage = error.message || 'Unknown error occurred';
-                    addTradeLog(`SELL: $${amount} worth of BTC - Error: ${errorMessage}`);
-                    document.getElementById('trading-status').innerHTML = `<div class="status status-error">Error: ${errorMessage}</div>`;
-                }
+                alert(`Sell BTC: $${amount} - This would execute a sell order`);
+                console.log('Sell BTC called with amount:', amount);
             }
             
-            async function autoTrade() {
-                if (!jwtToken) {
-                    alert('Please login first');
-                    return;
-                }
-                
-                try {
-                    document.getElementById('trading-status').innerHTML = `<div class="status status-success">🤖 AI analyzing market conditions...</div>`;
-                    
-                    const response = await fetch('/auto_trade', {
-                        method: 'POST',
-                        headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-                        body: `token=${jwtToken}`
-                    });
-                    
-                    if (!response.ok) {
-                        if (response.status === 401) {
-                            alert('Session expired. Please login again.');
-                            window.location.href = '/login';
-                            return;
-                        }
-                        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-                    }
-                    
-                    const data = await response.json();
-                    const signal = data.signal;
-                    
-                    let message = `🤖 AI Analysis: ${signal.sentiment} sentiment (${(signal.confidence * 100).toFixed(1)}% confidence)\n`;
-                    message += `Action: ${signal.action.toUpperCase()}\n`;
-                    message += `Reason: ${signal.reason}\n`;
-                    
-                    if (signal.trade_executed) {
-                        message += `✅ Trade executed: $${signal.position_size} ${signal.action}`;
-                        addTradeLog(`🤖 AUTO: ${signal.action.toUpperCase()} $${signal.position_size} - ${signal.reason}`);
-                    } else {
-                        message += `⏸️ No trade executed: ${signal.reason}`;
-                        addTradeLog(`🤖 AUTO: ${signal.action.toUpperCase()} - ${signal.reason}`);
-                    }
-                    
-                    document.getElementById('trading-status').innerHTML = `<div class="status status-success">${message.replace(/\n/g, '<br>')}</div>`;
-                } catch (error) {
-                    console.error('Auto trade error:', error);
-                    const errorMessage = error.message || 'Unknown error occurred';
-                    addTradeLog(`🤖 AUTO: Error - ${errorMessage}`);
-                    document.getElementById('trading-status').innerHTML = `<div class="status status-error">Error: ${errorMessage}</div>`;
-                }
+                        async function autoTrade() {
+                alert('🤖 Auto Trade: AI analysis would be performed here');
+                console.log('Auto Trade called');
             }
             
             function refreshData() {
