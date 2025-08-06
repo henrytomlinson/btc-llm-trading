@@ -42,8 +42,15 @@ class AlpacaTradingBot:
         self.stop_loss_pct = float(os.getenv('STOP_LOSS_PCT', '0.05'))  # 5% stop loss
         self.take_profit_pct = float(os.getenv('TAKE_PROFIT_PCT', '0.10'))  # 10% take profit
         
-        # Bitcoin-specific settings
-        self.btc_symbol = "BTC/USD"  # Bitcoin trading pair
+        # Bitcoin-related symbols for paper trading
+        # Using Bitcoin-related stocks/ETFs that are available on Alpaca
+        self.btc_symbols = {
+            "GBTC": "Grayscale Bitcoin Trust",  # Bitcoin ETF
+            "BITO": "ProShares Bitcoin Strategy ETF",  # Bitcoin futures ETF
+            "ARKB": "ARK 21Shares Bitcoin ETF",  # Bitcoin ETF
+            "IBIT": "iShares Bitcoin Trust"  # Bitcoin ETF
+        }
+        self.primary_btc_symbol = "GBTC"  # Default to GBTC
         self.min_trade_amount = 10.0  # Minimum trade amount in USD
         
         logger.info("Bitcoin Alpaca trading bot initialized successfully")
@@ -83,10 +90,10 @@ class AlpacaTradingBot:
             logger.error(f"Error getting positions: {e}")
             return {}
     
-    def get_market_data(self, symbol: str = "BTC/USD", bars: int = 1) -> Optional[Dict]:
-        """Get Bitcoin market data"""
+    def get_market_data(self, symbol: str = "GBTC", bars: int = 1) -> Optional[Dict]:
+        """Get Bitcoin-related stock market data"""
         try:
-            # Get recent bars for Bitcoin
+            # Get recent bars for Bitcoin-related stock
             request_params = StockBarsRequest(
                 symbol_or_symbols=symbol,
                 timeframe=TimeFrame.Minute,
@@ -154,21 +161,39 @@ class AlpacaTradingBot:
             return 0
     
     def place_buy_order(self, symbol: str, dollar_amount: float, signal_strength: float = 1.0) -> Dict:
-        """Place a Bitcoin buy order"""
+        """Place a Bitcoin-related stock buy order"""
         try:
+            # Use GBTC as the default Bitcoin proxy
+            if symbol == "BTC/USD":
+                symbol = self.primary_btc_symbol
+            
             # Check if we already have a position
             positions = self.get_positions()
-            if "BTC" in positions:
+            if symbol in positions:
                 return {'status': 'skipped', 'reason': 'existing_position'}
             
             # Check position limits
             if len(positions) >= self.max_positions:
                 return {'status': 'skipped', 'reason': 'max_positions'}
             
-            # Calculate Bitcoin amount
-            btc_amount = self.calculate_position_size(dollar_amount, signal_strength)
-            if btc_amount == 0:
-                return {'status': 'error', 'reason': 'insufficient_funds'}
+            # Get current market price
+            market_data = self.get_market_data(symbol)
+            if not market_data:
+                return {'status': 'error', 'reason': 'unable_to_get_market_data'}
+            
+            current_price = market_data['close']
+            
+            # Calculate shares to buy
+            shares_to_buy = dollar_amount / current_price
+            
+            # Ensure minimum order value (Alpaca requires at least $1)
+            # Also ensure we have at least 1 share
+            if shares_to_buy < 1.0:
+                shares_to_buy = 1.0
+                dollar_amount = shares_to_buy * current_price
+            
+            # Round to 2 decimal places for shares
+            shares_to_buy = round(shares_to_buy, 2)
             
             # Get account info to check available cash
             account_info = self.get_account_info()
@@ -177,30 +202,28 @@ class AlpacaTradingBot:
             if dollar_amount > available_cash:
                 return {'status': 'error', 'reason': 'insufficient_cash'}
             
-            # Create market order for Bitcoin
+            # Create market order for Bitcoin-related stock
             order_data = MarketOrderRequest(
                 symbol=symbol,
-                qty=btc_amount,
+                qty=shares_to_buy,
                 side=OrderSide.BUY,
                 time_in_force=TimeInForce.DAY
             )
             
             order = self.trading_client.submit_order(order_data)
             
-            # Calculate actual dollar amount spent
-            actual_amount = btc_amount * self.get_market_data(symbol)['close'] if self.get_market_data(symbol) else dollar_amount
-            
-            logger.info(f"Bitcoin buy order placed for ${dollar_amount:.2f} ({btc_amount:.6f} BTC)")
+            logger.info(f"Bitcoin proxy buy order placed for ${dollar_amount:.2f} ({shares_to_buy:.2f} shares of {symbol})")
             
             return {
                 'status': 'success',
                 'order_id': order.id,
                 'symbol': symbol,
-                'quantity': btc_amount,
+                'quantity': shares_to_buy,
                 'dollar_amount': dollar_amount,
-                'actual_amount': actual_amount,
+                'actual_amount': shares_to_buy * current_price,
                 'side': 'buy',
-                'timestamp': datetime.now().isoformat()
+                'timestamp': datetime.now().isoformat(),
+                'price_per_share': current_price
             }
             
         except Exception as e:
@@ -208,45 +231,49 @@ class AlpacaTradingBot:
             return {'status': 'error', 'reason': str(e)}
     
     def place_sell_order(self, symbol: str, dollar_amount: float) -> Dict:
-        """Place a Bitcoin sell order"""
+        """Place a Bitcoin-related stock sell order"""
         try:
+            # Use GBTC as the default Bitcoin proxy
+            if symbol == "BTC/USD":
+                symbol = self.primary_btc_symbol
+            
             # Check if we have a position to sell
             positions = self.get_positions()
-            if "BTC" not in positions:
+            if symbol not in positions:
                 return {'status': 'error', 'reason': 'no_position'}
             
-            btc_position = positions["BTC"]
-            available_btc = btc_position['quantity']
+            position = positions[symbol]
+            available_shares = position['quantity']
             
-            # Calculate Bitcoin amount to sell
+            # Calculate shares to sell
             market_data = self.get_market_data(symbol)
-            current_price = market_data['close'] if market_data else 45000.0
-            btc_to_sell = dollar_amount / current_price
+            current_price = market_data['close'] if market_data else 50.0
+            shares_to_sell = dollar_amount / current_price
             
             # Ensure we don't sell more than we have
-            if btc_to_sell > available_btc:
-                btc_to_sell = available_btc
+            if shares_to_sell > available_shares:
+                shares_to_sell = available_shares
             
-            if btc_to_sell <= 0:
-                return {'status': 'error', 'reason': 'insufficient_btc'}
+            if shares_to_sell <= 0:
+                return {'status': 'error', 'reason': 'insufficient_shares'}
             
-            # Create market order for Bitcoin
+            # Create market order for Bitcoin-related stock
             order_data = MarketOrderRequest(
                 symbol=symbol,
-                qty=btc_to_sell,
+                qty=shares_to_sell,
                 side=OrderSide.SELL,
                 time_in_force=TimeInForce.DAY
             )
             
             order = self.trading_client.submit_order(order_data)
             
-            logger.info(f"Bitcoin sell order placed for ${dollar_amount:.2f} ({btc_to_sell:.6f} BTC)")
+            logger.info(f"Bitcoin proxy sell order placed for ${dollar_amount:.2f} ({shares_to_sell:.2f} shares of {symbol})")
             
             return {
                 'status': 'success',
                 'order_id': order.id,
                 'symbol': symbol,
-                'quantity': btc_to_sell,
+                'quantity': shares_to_sell,
                 'dollar_amount': dollar_amount,
                 'side': 'sell',
                 'timestamp': datetime.now().isoformat()

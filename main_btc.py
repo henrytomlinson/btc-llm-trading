@@ -512,20 +512,24 @@ async def buy_btc(amount: float = Form(...), token: str = Form(...)):
         raise HTTPException(status_code=401, detail="Authentication required")
     
     if not alpaca_available:
-        return {"message": "Alpaca trading not available - using demo mode"}
+        return {"message": "Alpaca trading not available"}
     
     try:
-        # For now, simulate the trade since Alpaca doesn't support BTC/USD
-        # In a real implementation, you'd use a crypto exchange API
+        # Execute buy order through Alpaca using Bitcoin proxy (GBTC)
+        result = alpaca_bot.place_buy_order("BTC/USD", amount, 1.0)
+        
         trade_log.append({
             "action": "BUY",
             "symbol": "BTC",
             "amount": amount,
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "result": {"status": "success", "message": "Demo trade executed"}
+            "result": result
         })
         
-        return {"message": f"Demo: Bought ${amount:.2f} worth of Bitcoin (simulated)", "result": {"status": "success"}}
+        if result['status'] == 'success':
+            return {"message": f"Bought ${amount:.2f} worth of Bitcoin (via {result['symbol']})", "result": result}
+        else:
+            return {"message": f"Buy order failed: {result.get('reason', 'Unknown error')}", "result": result}
             
     except Exception as e:
         return {"message": f"Error buying Bitcoin: {str(e)}"}
@@ -542,20 +546,24 @@ async def sell_btc(amount: float = Form(...), token: str = Form(...)):
         raise HTTPException(status_code=401, detail="Authentication required")
     
     if not alpaca_available:
-        return {"message": "Alpaca trading not available - using demo mode"}
+        return {"message": "Alpaca trading not available"}
     
     try:
-        # For now, simulate the trade since Alpaca doesn't support BTC/USD
-        # In a real implementation, you'd use a crypto exchange API
+        # Execute sell order through Alpaca using Bitcoin proxy (GBTC)
+        result = alpaca_bot.place_sell_order("BTC/USD", amount)
+        
         trade_log.append({
             "action": "SELL",
             "symbol": "BTC",
             "amount": amount,
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "result": {"status": "success", "message": "Demo trade executed"}
+            "result": result
         })
         
-        return {"message": f"Demo: Sold ${amount:.2f} worth of Bitcoin (simulated)", "result": {"status": "success"}}
+        if result['status'] == 'success':
+            return {"message": f"Sold ${amount:.2f} worth of Bitcoin (via {result['symbol']})", "result": result}
+        else:
+            return {"message": f"Sell order failed: {result.get('reason', 'Unknown error')}", "result": result}
             
     except Exception as e:
         return {"message": f"Error selling Bitcoin: {str(e)}"}
