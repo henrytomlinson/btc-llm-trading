@@ -348,11 +348,25 @@ async def dashboard():
                         headers: {'Content-Type': 'application/x-www-form-urlencoded'},
                         body: `amount=${amount}&token=${jwtToken}`
                     });
+                    
+                    if (!response.ok) {
+                        if (response.status === 401) {
+                            alert('Session expired. Please login again.');
+                            window.location.href = '/login';
+                            return;
+                        }
+                        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+                    }
+                    
                     const data = await response.json();
-                    addTradeLog(`BUY: $${amount} worth of BTC - ${data.message}`);
-                    document.getElementById('trading-status').innerHTML = `<div class="status status-success">${data.message}</div>`;
+                    const message = data.message || 'Trade executed successfully';
+                    addTradeLog(`BUY: $${amount} worth of BTC - ${message}`);
+                    document.getElementById('trading-status').innerHTML = `<div class="status status-success">${message}</div>`;
                 } catch (error) {
-                    document.getElementById('trading-status').innerHTML = `<div class="status status-error">Error: ${error.message}</div>`;
+                    console.error('Buy error:', error);
+                    const errorMessage = error.message || 'Unknown error occurred';
+                    addTradeLog(`BUY: $${amount} worth of BTC - Error: ${errorMessage}`);
+                    document.getElementById('trading-status').innerHTML = `<div class="status status-error">Error: ${errorMessage}</div>`;
                 }
             }
             
@@ -369,11 +383,25 @@ async def dashboard():
                         headers: {'Content-Type': 'application/x-www-form-urlencoded'},
                         body: `amount=${amount}&token=${jwtToken}`
                     });
+                    
+                    if (!response.ok) {
+                        if (response.status === 401) {
+                            alert('Session expired. Please login again.');
+                            window.location.href = '/login';
+                            return;
+                        }
+                        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+                    }
+                    
                     const data = await response.json();
-                    addTradeLog(`SELL: $${amount} worth of BTC - ${data.message}`);
-                    document.getElementById('trading-status').innerHTML = `<div class="status status-success">${data.message}</div>`;
+                    const message = data.message || 'Trade executed successfully';
+                    addTradeLog(`SELL: $${amount} worth of BTC - ${message}`);
+                    document.getElementById('trading-status').innerHTML = `<div class="status status-success">${message}</div>`;
                 } catch (error) {
-                    document.getElementById('trading-status').innerHTML = `<div class="status status-error">Error: ${error.message}</div>`;
+                    console.error('Sell error:', error);
+                    const errorMessage = error.message || 'Unknown error occurred';
+                    addTradeLog(`SELL: $${amount} worth of BTC - Error: ${errorMessage}`);
+                    document.getElementById('trading-status').innerHTML = `<div class="status status-error">Error: ${errorMessage}</div>`;
                 }
             }
             
