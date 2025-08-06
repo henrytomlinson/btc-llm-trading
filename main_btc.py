@@ -63,6 +63,15 @@ except Exception as e:
     logger.error(f"Failed to initialize Alpaca trading bot: {e}")
     alpaca_bot = None
 
+# Initialize LLM Trading Strategy
+try:
+    from llm_trading_strategy import LLMTradingStrategy
+    llm_strategy = LLMTradingStrategy()
+    logger.info("LLM trading strategy initialized successfully")
+except Exception as e:
+    logger.error(f"Failed to initialize LLM trading strategy: {e}")
+    llm_strategy = None
+
 # News cache for BTC
 btc_news_cache = {}
 btc_news_cache_timestamp = {}
@@ -295,6 +304,7 @@ async def dashboard():
                     <button class="btn btn-buy" onclick="buyBTC()">Buy BTC</button>
                     <button class="btn btn-sell" onclick="sellBTC()">Sell BTC</button>
                     <button class="btn btn-hold" onclick="refreshData()">Refresh</button>
+                    <button class="btn btn-buy" onclick="autoTrade()" style="background: #17a2b8;">🤖 Auto Trade</button>
                 </div>
                 
                 <div id="trading-status"></div>
@@ -401,6 +411,54 @@ async def dashboard():
                     console.error('Sell error:', error);
                     const errorMessage = error.message || 'Unknown error occurred';
                     addTradeLog(`SELL: $${amount} worth of BTC - Error: ${errorMessage}`);
+                    document.getElementById('trading-status').innerHTML = `<div class="status status-error">Error: ${errorMessage}</div>`;
+                }
+            }
+            
+            async function autoTrade() {
+                if (!jwtToken) {
+                    alert('Please login first');
+                    return;
+                }
+                
+                try {
+                    document.getElementById('trading-status').innerHTML = `<div class="status status-success">🤖 AI analyzing market conditions...</div>`;
+                    
+                    const response = await fetch('/auto_trade', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+                        body: `token=${jwtToken}`
+                    });
+                    
+                    if (!response.ok) {
+                        if (response.status === 401) {
+                            alert('Session expired. Please login again.');
+                            window.location.href = '/login';
+                            return;
+                        }
+                        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+                    }
+                    
+                    const data = await response.json();
+                    const signal = data.signal;
+                    
+                    let message = `🤖 AI Analysis: ${signal.sentiment} sentiment (${(signal.confidence * 100).toFixed(1)}% confidence)\n`;
+                    message += `Action: ${signal.action.toUpperCase()}\n`;
+                    message += `Reason: ${signal.reason}\n`;
+                    
+                    if (signal.trade_executed) {
+                        message += `✅ Trade executed: $${signal.position_size} ${signal.action}`;
+                        addTradeLog(`🤖 AUTO: ${signal.action.toUpperCase()} $${signal.position_size} - ${signal.reason}`);
+                    } else {
+                        message += `⏸️ No trade executed: ${signal.reason}`;
+                        addTradeLog(`🤖 AUTO: ${signal.action.toUpperCase()} - ${signal.reason}`);
+                    }
+                    
+                    document.getElementById('trading-status').innerHTML = `<div class="status status-success">${message.replace(/\n/g, '<br>')}</div>`;
+                } catch (error) {
+                    console.error('Auto trade error:', error);
+                    const errorMessage = error.message || 'Unknown error occurred';
+                    addTradeLog(`🤖 AUTO: Error - ${errorMessage}`);
                     document.getElementById('trading-status').innerHTML = `<div class="status status-error">Error: ${errorMessage}</div>`;
                 }
             }
@@ -679,6 +737,73 @@ async def test_apis():
         results["cohere"] = f"❌ Error: {str(e)}"
     
     return results
+
+@app.post("/auto_trade")
+async def auto_trade(token: str = Form(...)):
+    """Execute automated trading based on LLM analysis"""
+    if not token:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    
+    try:
+        username = verify_jwt_token(token)
+    except:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    
+    if not alpaca_available or not alpaca_bot:
+        return {"message": "Alpaca trading not available"}
+    
+    if not llm_strategy:
+        return {"message": "LLM strategy not available"}
+    
+    try:
+        # Get current market data
+        market_data = get_btc_market_data()
+        if not market_data:
+            return {"message": "Unable to get market data"}
+        
+        current_price = market_data.get('close', 45000.0)
+        price_change_24h = market_data.get('change_24h', 0.0)
+        volume_24h = market_data.get('volume', 1000000.0)
+        
+        # Get news sentiment
+        news_text = get_btc_news()
+        sentiment, probability = analyze_btc_sentiment(news_text)
+        news_sentiment = "positive" if sentiment > 0 else "negative" if sentiment < 0 else "neutral"
+        
+        # Generate LLM trading signal
+        signal = llm_strategy.generate_trading_signal(
+            current_price=current_price,
+            price_change_24h=price_change_24h,
+            volume_24h=volume_24h,
+            news_sentiment=news_sentiment
+        )
+        
+        # Execute trade if recommended
+        trade_result = None
+        if signal['should_trade'] and signal['position_size']:
+            if signal['action'] == 'buy':
+                trade_result = alpaca_bot.place_buy_order("BTC/USD", signal['position_size'], 1.0)
+            elif signal['action'] == 'sell':
+                trade_result = alpaca_bot.place_sell_order("BTC/USD", signal['position_size'])
+        
+        # Log the automated trade
+        trade_log.append({
+            "action": "AUTO_TRADE",
+            "signal": signal,
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "trade_result": trade_result
+        })
+        
+        return {
+            "message": f"Automated trading analysis complete",
+            "signal": signal,
+            "trade_executed": trade_result is not None,
+            "trade_result": trade_result
+        }
+        
+    except Exception as e:
+        logger.error(f"Error in automated trading: {e}")
+        return {"message": f"Error in automated trading: {str(e)}"}
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000) 
