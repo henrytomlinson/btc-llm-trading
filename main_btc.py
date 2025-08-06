@@ -384,14 +384,22 @@ async def dashboard():
                     // Update news
                     if (data.news) {
                         document.getElementById('btc-news').innerHTML = data.news;
+                    } else {
+                        document.getElementById('btc-news').innerHTML = 'Real-time Bitcoin data';
                     }
                     
                     // Update signals
                     if (data.sentiment !== undefined && data.probability !== undefined) {
+                        const sentimentText = data.sentiment > 0 ? 'Positive' : data.sentiment < 0 ? 'Negative' : 'Neutral';
+                        const sentimentClass = data.sentiment > 0 ? 'signal-buy' : data.sentiment < 0 ? 'signal-sell' : 'signal-hold';
+                        
                         document.getElementById('signals').innerHTML = `
-                            <p><strong>Sentiment:</strong> <span class="${data.sentiment > 0 ? 'signal-buy' : data.sentiment < 0 ? 'signal-sell' : 'signal-hold'}">${data.sentiment > 0 ? 'Positive' : data.sentiment < 0 ? 'Negative' : 'Neutral'}</span></p>
+                            <p><strong>Sentiment:</strong> <span class="${sentimentClass}">${sentimentText}</span></p>
                             <p><strong>Confidence:</strong> ${(data.probability * 100).toFixed(1)}%</p>
+                            <p><strong>Signal:</strong> <span class="${data.signal === 1 ? 'signal-buy' : data.signal === -1 ? 'signal-sell' : 'signal-hold'}">${data.signal === 1 ? 'BUY' : data.signal === -1 ? 'SELL' : 'HOLD'}</span></p>
                         `;
+                    } else {
+                        document.getElementById('signals').innerHTML = '<p>Signals loading...</p>';
                     }
                     
                     console.log('BTC data loaded successfully');
@@ -423,11 +431,10 @@ async def dashboard():
                     // Show loading state
                     document.getElementById('trading-status').innerHTML = '<div class="status status-success">🤖 AI analyzing market conditions...</div>';
                     
-                    // Call the auto trade endpoint
-                    const response = await fetch('/auto_trade', {
+                    // Call the auto trade endpoint without authentication for demo
+                    const response = await fetch('/auto_trade_demo', {
                         method: 'POST',
-                        headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-                        body: 'token=demo'
+                        headers: {'Content-Type': 'application/json'}
                     });
                     
                     console.log('Auto trade response status:', response.status);
@@ -843,6 +850,71 @@ async def auto_trade(token: str = Form(...)):
     except Exception as e:
         logger.error(f"❌ Error in automated trading: {e}")
         return {"message": f"Error in automated trading: {str(e)}"}
+
+@app.post("/auto_trade_demo")
+async def auto_trade_demo():
+    """Demo endpoint for automated trading without authentication"""
+    logger.info("🤖 Auto Trade Demo endpoint called")
+    
+    if not llm_strategy:
+        logger.warning("LLM strategy not available for auto trade demo")
+        return {"message": "LLM strategy not available"}
+
+    try:
+        logger.info("🤖 Starting LLM market analysis (demo)...")
+        
+        # Get current market data
+        market_data = get_btc_market_data()
+        if not market_data:
+            logger.error("Unable to get market data for auto trade demo")
+            return {"message": "Unable to get market data"}
+
+        current_price = market_data.get('close', 45000.0)
+        price_change_24h = market_data.get('change_24h', 0.0)
+        volume_24h = market_data.get('volume', 1000000.0)
+        
+        logger.info(f"📊 Market Data: Price=${current_price:,.2f}, Change={price_change_24h:+.2f}%, Volume=${volume_24h:,.0f}")
+
+        # Get news sentiment
+        news_text = get_btc_news()
+        sentiment, probability = analyze_btc_sentiment(news_text)
+        news_sentiment = "positive" if sentiment > 0 else "negative" if sentiment < 0 else "neutral"
+        
+        logger.info(f"📰 News Sentiment: {news_sentiment} (score: {sentiment}, probability: {probability:.2f})")
+
+        # Generate LLM trading signal
+        logger.info("🧠 Generating LLM trading signal (demo)...")
+        signal = llm_strategy.generate_trading_signal(
+            current_price=current_price,
+            price_change_24h=price_change_24h,
+            volume_24h=volume_24h,
+            news_sentiment=news_sentiment
+        )
+        
+        logger.info(f"🎯 LLM Signal: {signal['action'].upper()} - {signal['reason']} (confidence: {signal['confidence']:.2f})")
+
+        # For demo, we don't execute actual trades
+        logger.info("⏸️ Demo mode - no actual trades executed")
+
+        # Log the automated trade
+        trade_log.append({
+            "action": "AUTO_TRADE_DEMO",
+            "signal": signal,
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "trade_result": None
+        })
+
+        logger.info("🤖 Auto trade demo analysis completed successfully")
+        return {
+            "message": f"Demo automated trading analysis complete",
+            "signal": signal,
+            "trade_executed": False,
+            "trade_result": None
+        }
+
+    except Exception as e:
+        logger.error(f"❌ Error in automated trading demo: {e}")
+        return {"message": f"Error in automated trading demo: {str(e)}"}
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000) 
