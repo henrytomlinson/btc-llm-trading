@@ -417,8 +417,57 @@ async def dashboard():
             }
             
                         async function autoTrade() {
-                alert('🤖 Auto Trade: AI analysis would be performed here');
-                console.log('Auto Trade called');
+                try {
+                    console.log('🤖 Auto Trade started...');
+                    
+                    // Show loading state
+                    document.getElementById('trading-status').innerHTML = '<div class="status status-success">🤖 AI analyzing market conditions...</div>';
+                    
+                    // Call the auto trade endpoint
+                    const response = await fetch('/auto_trade', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+                        body: 'token=demo'
+                    });
+                    
+                    console.log('Auto trade response status:', response.status);
+                    
+                    if (!response.ok) {
+                        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+                    }
+                    
+                    const data = await response.json();
+                    console.log('Auto trade response:', data);
+                    
+                    // Display the results
+                    let message = `🤖 AI Analysis Complete!\n\n`;
+                    if (data.signal) {
+                        message += `Sentiment: ${data.signal.sentiment}\n`;
+                        message += `Confidence: ${(data.signal.confidence * 100).toFixed(1)}%\n`;
+                        message += `Action: ${data.signal.action.toUpperCase()}\n`;
+                        message += `Reason: ${data.signal.reason}\n\n`;
+                        
+                        if (data.trade_executed) {
+                            message += `✅ Trade executed: $${data.signal.position_size} ${data.signal.action}`;
+                        } else {
+                            message += `⏸️ No trade executed: ${data.signal.reason}`;
+                        }
+                    } else {
+                        message += `Analysis completed but no signal generated.`;
+                    }
+                    
+                    document.getElementById('trading-status').innerHTML = `<div class="status status-success">${message.replace(/\n/g, '<br>')}</div>`;
+                    
+                    // Add to trade log
+                    const log = document.getElementById('trade-log');
+                    const timestamp = new Date().toLocaleTimeString();
+                    log.innerHTML += `<div>[${timestamp}] 🤖 AUTO TRADE: ${data.signal ? data.signal.action.toUpperCase() : 'Analysis'} - ${data.signal ? data.signal.reason : 'Completed'}</div>`;
+                    log.scrollTop = log.scrollHeight;
+                    
+                } catch (error) {
+                    console.error('Auto trade error:', error);
+                    document.getElementById('trading-status').innerHTML = `<div class="status status-error">Error: ${error.message}</div>`;
+                }
             }
             
             function refreshData() {
@@ -709,36 +758,51 @@ async def test_apis():
 @app.post("/auto_trade")
 async def auto_trade(token: str = Form(...)):
     """Execute automated trading based on LLM analysis"""
-    if not token:
-        raise HTTPException(status_code=401, detail="Authentication required")
+    logger.info("🤖 Auto Trade endpoint called")
     
+    if not token:
+        logger.warning("No token provided for auto trade")
+        raise HTTPException(status_code=401, detail="Authentication required")
+
     try:
         username = verify_jwt_token(token)
+        logger.info(f"Auto trade requested by user: {username}")
     except:
+        logger.warning("Invalid token for auto trade")
         raise HTTPException(status_code=401, detail="Authentication required")
-    
+
     if not alpaca_available or not alpaca_bot:
+        logger.warning("Alpaca trading not available for auto trade")
         return {"message": "Alpaca trading not available"}
-    
+
     if not llm_strategy:
+        logger.warning("LLM strategy not available for auto trade")
         return {"message": "LLM strategy not available"}
-    
+
     try:
+        logger.info("🤖 Starting LLM market analysis...")
+        
         # Get current market data
         market_data = get_btc_market_data()
         if not market_data:
+            logger.error("Unable to get market data for auto trade")
             return {"message": "Unable to get market data"}
-        
+
         current_price = market_data.get('close', 45000.0)
         price_change_24h = market_data.get('change_24h', 0.0)
         volume_24h = market_data.get('volume', 1000000.0)
         
+        logger.info(f"📊 Market Data: Price=${current_price:,.2f}, Change={price_change_24h:+.2f}%, Volume=${volume_24h:,.0f}")
+
         # Get news sentiment
         news_text = get_btc_news()
         sentiment, probability = analyze_btc_sentiment(news_text)
         news_sentiment = "positive" if sentiment > 0 else "negative" if sentiment < 0 else "neutral"
         
+        logger.info(f"📰 News Sentiment: {news_sentiment} (score: {sentiment}, probability: {probability:.2f})")
+
         # Generate LLM trading signal
+        logger.info("🧠 Generating LLM trading signal...")
         signal = llm_strategy.generate_trading_signal(
             current_price=current_price,
             price_change_24h=price_change_24h,
@@ -746,14 +810,20 @@ async def auto_trade(token: str = Form(...)):
             news_sentiment=news_sentiment
         )
         
+        logger.info(f"🎯 LLM Signal: {signal['action'].upper()} - {signal['reason']} (confidence: {signal['confidence']:.2f})")
+
         # Execute trade if recommended
         trade_result = None
         if signal['should_trade'] and signal['position_size']:
+            logger.info(f"💰 Executing trade: {signal['action'].upper()} ${signal['position_size']}")
             if signal['action'] == 'buy':
                 trade_result = alpaca_bot.place_buy_order("BTC/USD", signal['position_size'], 1.0)
             elif signal['action'] == 'sell':
                 trade_result = alpaca_bot.place_sell_order("BTC/USD", signal['position_size'])
-        
+            logger.info(f"✅ Trade result: {trade_result}")
+        else:
+            logger.info("⏸️ No trade executed - conditions not met")
+
         # Log the automated trade
         trade_log.append({
             "action": "AUTO_TRADE",
@@ -761,16 +831,17 @@ async def auto_trade(token: str = Form(...)):
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "trade_result": trade_result
         })
-        
+
+        logger.info("🤖 Auto trade analysis completed successfully")
         return {
             "message": f"Automated trading analysis complete",
             "signal": signal,
             "trade_executed": trade_result is not None,
             "trade_result": trade_result
         }
-        
+
     except Exception as e:
-        logger.error(f"Error in automated trading: {e}")
+        logger.error(f"❌ Error in automated trading: {e}")
         return {"message": f"Error in automated trading: {str(e)}"}
 
 if __name__ == "__main__":
