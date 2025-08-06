@@ -338,6 +338,9 @@ async def dashboard():
         </div>
         
         <script>
+            alert('JavaScript is loading!');
+            console.log('JavaScript starting...');
+            
             let jwtToken = localStorage.getItem('jwt_token');
             
             // Simple test function
@@ -347,37 +350,29 @@ async def dashboard():
             }
             
             // Simple data loading function
-            async function loadBTCData() {
+            function loadBTCData() {
+                alert('Loading BTC data...');
                 console.log('loadBTCData called');
-                try {
-                    const response = await fetch('/btc_data');
-                    console.log('Response status:', response.status);
-                    
-                    if (!response.ok) {
-                        throw new Error(`HTTP ${response.status}`);
-                    }
-                    
-                    const data = await response.json();
-                    console.log('BTC data received:', data);
-                    
-                    // Update price
-                    if (data.price) {
-                        document.getElementById('btc-price').innerHTML = `$${data.price.toLocaleString()}`;
-                    }
-                    
-                    // Update market info
-                    if (data.change_24h !== undefined && data.volume !== undefined) {
+                
+                fetch('/btc_data')
+                    .then(response => response.json())
+                    .then(data => {
+                        console.log('Data received:', data);
+                        alert('Data loaded: $' + data.price);
+                        
+                        // Update price
+                        document.getElementById('btc-price').innerHTML = '$' + data.price.toLocaleString();
+                        
+                        // Update market info
                         document.getElementById('btc-info').innerHTML = `
                             <p><strong>24h Change:</strong> <span class="${data.change_24h >= 0 ? 'signal-buy' : 'signal-sell'}">${data.change_24h > 0 ? '+' : ''}${data.change_24h.toFixed(2)}%</span></p>
                             <p><strong>Volume:</strong> $${data.volume.toLocaleString()}</p>
                         `;
-                    }
-                    
-                    // Update news
-                    document.getElementById('btc-news').innerHTML = data.news || 'Real-time Bitcoin data';
-                    
-                    // Update signals
-                    if (data.sentiment !== undefined && data.probability !== undefined) {
+                        
+                        // Update news
+                        document.getElementById('btc-news').innerHTML = data.news || 'Real-time Bitcoin data';
+                        
+                        // Update signals
                         const sentimentText = data.sentiment > 0 ? 'Positive' : data.sentiment < 0 ? 'Negative' : 'Neutral';
                         const sentimentClass = data.sentiment > 0 ? 'signal-buy' : data.sentiment < 0 ? 'signal-sell' : 'signal-hold';
                         
@@ -386,13 +381,12 @@ async def dashboard():
                             <p><strong>Confidence:</strong> ${(data.probability * 100).toFixed(1)}%</p>
                             <p><strong>Signal:</strong> <span class="${data.signal === 1 ? 'signal-buy' : data.signal === -1 ? 'signal-sell' : 'signal-hold'}">${data.signal === 1 ? 'BUY' : data.signal === -1 ? 'SELL' : 'HOLD'}</span></p>
                         `;
-                    }
-                    
-                    console.log('BTC data loaded successfully');
-                } catch (error) {
-                    console.error('Error loading BTC data:', error);
-                    document.getElementById('btc-price').innerHTML = 'Error loading data';
-                }
+                    })
+                    .catch(error => {
+                        console.error('Error:', error);
+                        alert('Error loading data: ' + error.message);
+                        document.getElementById('btc-price').innerHTML = 'Error loading data';
+                    });
             }
             
             function buyBTC() {
@@ -487,11 +481,14 @@ async def dashboard():
             };
             
             // Load data immediately when page loads
+            alert('Page loaded, calling loadBTCData...');
             console.log('Page loaded, loading BTC data...');
             loadBTCData();
             
             // Auto-refresh every 30 seconds
             setInterval(loadBTCData, 30000);
+            
+            console.log('JavaScript loaded successfully');
         </script>
     </body>
     </html>
