@@ -371,6 +371,7 @@ async def dashboard():
                     // Update price
                     if (data.price) {
                         document.getElementById('btc-price').innerHTML = `$${data.price.toLocaleString()}`;
+                        console.log('Price updated:', data.price);
                     }
                     
                     // Update market info
@@ -379,13 +380,16 @@ async def dashboard():
                             <p><strong>24h Change:</strong> <span class="${data.change_24h >= 0 ? 'signal-buy' : 'signal-sell'}">${data.change_24h > 0 ? '+' : ''}${data.change_24h.toFixed(2)}%</span></p>
                             <p><strong>Volume:</strong> $${data.volume.toLocaleString()}</p>
                         `;
+                        console.log('Market info updated');
                     }
                     
                     // Update news
                     if (data.news) {
                         document.getElementById('btc-news').innerHTML = data.news;
+                        console.log('News updated:', data.news);
                     } else {
                         document.getElementById('btc-news').innerHTML = 'Real-time Bitcoin data';
+                        console.log('News set to default');
                     }
                     
                     // Update signals
@@ -398,8 +402,10 @@ async def dashboard():
                             <p><strong>Confidence:</strong> ${(data.probability * 100).toFixed(1)}%</p>
                             <p><strong>Signal:</strong> <span class="${data.signal === 1 ? 'signal-buy' : data.signal === -1 ? 'signal-sell' : 'signal-hold'}">${data.signal === 1 ? 'BUY' : data.signal === -1 ? 'SELL' : 'HOLD'}</span></p>
                         `;
+                        console.log('Signals updated');
                     } else {
                         document.getElementById('signals').innerHTML = '<p>Signals loading...</p>';
+                        console.log('Signals set to loading');
                     }
                     
                     console.log('BTC data loaded successfully');
@@ -416,12 +422,24 @@ async def dashboard():
                 const amount = document.getElementById('trade-amount').value;
                 alert(`Buy BTC: $${amount} - This would execute a buy order`);
                 console.log('Buy BTC called with amount:', amount);
+                
+                // Add to trade log
+                const log = document.getElementById('trade-log');
+                const timestamp = new Date().toLocaleTimeString();
+                log.innerHTML += `<div>[${timestamp}] BUY: $${amount} worth of BTC</div>`;
+                log.scrollTop = log.scrollHeight;
             }
             
             async function sellBTC() {
                 const amount = document.getElementById('trade-amount').value;
                 alert(`Sell BTC: $${amount} - This would execute a sell order`);
                 console.log('Sell BTC called with amount:', amount);
+                
+                // Add to trade log
+                const log = document.getElementById('trade-log');
+                const timestamp = new Date().toLocaleTimeString();
+                log.innerHTML += `<div>[${timestamp}] SELL: $${amount} worth of BTC</div>`;
+                log.scrollTop = log.scrollHeight;
             }
             
                         async function autoTrade() {
@@ -512,21 +530,18 @@ async def dashboard():
                 return 'signal-hold';
             }
             
-            // Auto-refresh every 30 seconds
-            setInterval(loadBTCData, 30000);
-            
-            // Load initial data with timeout
-            console.log('Setting up initial data load...');
-            setTimeout(() => {
-                console.log('Starting initial data load...');
-                loadBTCData();
-            }, 1000);
-            
             // Test function to check if JavaScript is working
             window.testJS = function() {
                 console.log('JavaScript is working!');
                 alert('JavaScript is working!');
             };
+            
+            // Load data immediately when page loads
+            console.log('Page loaded, loading BTC data...');
+            loadBTCData();
+            
+            // Auto-refresh every 30 seconds
+            setInterval(loadBTCData, 30000);
         </script>
     </body>
     </html>
