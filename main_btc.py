@@ -318,8 +318,9 @@ async def dashboard():
                     <input type="number" id="trade-amount" placeholder="Amount ($)" value="100" min="10" step="10">
                     <button class="btn btn-buy" onclick="buyBTC()">Buy BTC</button>
                     <button class="btn btn-sell" onclick="sellBTC()">Sell BTC</button>
-                    <button class="btn btn-hold" onclick="refreshData()">Refresh</button>
+                    <button class="btn btn-hold" onclick="loadBTCData()">Refresh</button>
                     <button class="btn btn-buy" onclick="autoTrade()" style="background: #17a2b8;">🤖 Auto Trade</button>
+                    <button class="btn btn-refresh" onclick="testJS()" style="background: #28a745;">Test JS</button>
                 </div>
                 
                 <div id="trading-status"></div>
@@ -342,7 +343,22 @@ async def dashboard():
             async function loadBTCData() {
                 try {
                     console.log('Loading BTC data...');
-                    const response = await fetch('/btc_data' + (jwtToken ? `?token=${jwtToken}` : ''));
+                    
+                    // Show loading state
+                    document.getElementById('btc-price').innerHTML = 'Loading...';
+                    document.getElementById('btc-info').innerHTML = '<p>Loading market data...</p>';
+                    document.getElementById('btc-news').innerHTML = 'Loading news...';
+                    document.getElementById('signals').innerHTML = '<p>Loading signals...</p>';
+                    
+                    const response = await fetch('/btc_data' + (jwtToken ? `?token=${jwtToken}` : ''), {
+                        method: 'GET',
+                        headers: {
+                            'Accept': 'application/json',
+                            'Content-Type': 'application/json'
+                        }
+                    });
+                    
+                    console.log('Response status:', response.status);
                     
                     if (!response.ok) {
                         throw new Error(`HTTP ${response.status}: ${response.statusText}`);
@@ -352,8 +368,10 @@ async def dashboard():
                     console.log('BTC data received:', data);
                     
                     // Update price
-                    if (data.price) {
+                    if (data.price !== undefined) {
                         document.getElementById('btc-price').innerHTML = `$${data.price.toLocaleString()}`;
+                    } else {
+                        document.getElementById('btc-price').innerHTML = 'Price unavailable';
                     }
                     
                     // Update market info
@@ -363,11 +381,15 @@ async def dashboard():
                             <p><strong>Volume:</strong> $${data.volume.toLocaleString()}</p>
                             <p><strong>Signal:</strong> <span class="${getSignalClass(data.signal)}">${getSignalText(data.signal)}</span></p>
                         `;
+                    } else {
+                        document.getElementById('btc-info').innerHTML = '<p>Market data unavailable</p>';
                     }
                     
                     // Update news
                     if (data.news) {
                         document.getElementById('btc-news').innerHTML = data.news;
+                    } else {
+                        document.getElementById('btc-news').innerHTML = 'News unavailable';
                     }
                     
                     // Update signals
@@ -376,6 +398,8 @@ async def dashboard():
                             <p><strong>Sentiment:</strong> <span class="${getSentimentClass(data.sentiment)}">${getSentimentText(data.sentiment)}</span></p>
                             <p><strong>Confidence:</strong> ${(data.probability * 100).toFixed(1)}%</p>
                         `;
+                    } else {
+                        document.getElementById('signals').innerHTML = '<p>Signals unavailable</p>';
                     }
                     
                     console.log('BTC data loaded successfully');
@@ -546,9 +570,17 @@ async def dashboard():
             setInterval(loadBTCData, 30000);
             
             // Load initial data with timeout
+            console.log('Setting up initial data load...');
             setTimeout(() => {
+                console.log('Starting initial data load...');
                 loadBTCData();
             }, 1000);
+            
+            // Test function to check if JavaScript is working
+            window.testJS = function() {
+                console.log('JavaScript is working!');
+                alert('JavaScript is working!');
+            };
         </script>
     </body>
     </html>
