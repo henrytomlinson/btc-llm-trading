@@ -11,21 +11,16 @@ from datetime import datetime, timedelta
 from typing import List, Dict, Optional
 import jwt
 import secrets
-from fastapi import FastAPI, HTTPException, Form, Depends
+from fastapi import FastAPI, HTTPException, Form, Depends, Request
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 import uvicorn
 import requests
-from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest
-from alpaca.trading.enums import OrderSide, TimeInForce
-from alpaca.data.historical import StockHistoricalDataClient
-from alpaca.data.requests import StockBarsRequest
-from alpaca.data.timeframe import TimeFrame
 import json
 from dotenv import load_dotenv
+import time
 
 # Load environment variables from .env file
 load_dotenv()
@@ -34,8 +29,64 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Security configuration
+ALLOWED_IPS = os.getenv('ALLOWED_IPS', '127.0.0.1').split(',')  # Comma-separated IPs
+RATE_LIMIT_REQUESTS = int(os.getenv('RATE_LIMIT_REQUESTS', '100'))  # Requests per hour
+RATE_LIMIT_WINDOW = int(os.getenv('RATE_LIMIT_WINDOW', '3600'))  # 1 hour in seconds
+
+# Admin credentials (use environment variables)
+ADMIN_USERNAME = os.getenv('ADMIN_USERNAME', 'admin')
+ADMIN_PASSWORD = os.getenv('ADMIN_PASSWORD', 'change_this_password_immediately')
+
+# Rate limiting storage (in production, use Redis)
+request_counts = {}
+
 # Initialize FastAPI app
 app = FastAPI(title="Bitcoin LLM Trading System", version="1.0.0")
+
+# Security middleware
+@app.middleware("http")
+async def security_middleware(request: Request, call_next):
+    """Security middleware for IP whitelisting and rate limiting"""
+    client_ip = request.client.host
+    
+    # IP whitelist check
+    if client_ip not in ALLOWED_IPS and '0.0.0.0' not in ALLOWED_IPS:
+        logger.warning(f"Blocked request from unauthorized IP: {client_ip}")
+        return JSONResponse(
+            status_code=403,
+            content={"error": "IP not authorized"}
+        )
+    
+    # Rate limiting
+    current_time = time.time()
+    
+    # Clean old entries
+    global request_counts
+    request_counts = {ip: (count, timestamp) for ip, (count, timestamp) in request_counts.items() 
+                     if current_time - timestamp < RATE_LIMIT_WINDOW}
+    
+    # Check rate limit
+    if client_ip in request_counts:
+        count, timestamp = request_counts[client_ip]
+        if current_time - timestamp < RATE_LIMIT_WINDOW and count >= RATE_LIMIT_REQUESTS:
+            logger.warning(f"Rate limit exceeded for IP: {client_ip}")
+            return JSONResponse(
+                status_code=429,
+                content={"error": "Rate limit exceeded"}
+            )
+        request_counts[client_ip] = (count + 1, timestamp)
+    else:
+        request_counts[client_ip] = (1, current_time)
+    
+    # Add security headers
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["X-XSS-Protection"] = "1; mode=block"
+    response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    
+    return response
 
 # Security
 security = HTTPBasic()
@@ -46,38 +97,80 @@ JWT_ALGORITHM = "HS256"
 JWT_EXPIRY_HOURS = 24
 
 # Load environment variables
-alpaca_api_key = os.getenv('ALPACA_API_KEY')
-alpaca_secret_key = os.getenv('ALPACA_SECRET_KEY')
+binance_api_key = os.getenv('BINANCE_API_KEY')
+binance_secret_key = os.getenv('BINANCE_SECRET_KEY')
+kraken_api_key = os.getenv('KRAKEN_API_KEY')
+kraken_secret_key = os.getenv('KRAKEN_PRIVATE_KEY')  # Updated to use KRAKEN_PRIVATE_KEY
 news_api_key = os.getenv('NEWS_API_KEY')
 cohere_key = os.getenv('COHERE_KEY')
 
-# Check if Alpaca is available
-alpaca_available = bool(alpaca_api_key and alpaca_secret_key)
+# Initialize Trading Bot (Priority: Kraken > Binance)
+trading_bot = None
+exchange_name = None
 
-# Initialize Alpaca Trading Bot
-try:
-    from alpaca_trading_btc import AlpacaTradingBot
-    alpaca_bot = AlpacaTradingBot() if alpaca_available else None
-    logger.info("Alpaca trading bot initialized successfully")
-except Exception as e:
-    logger.error(f"Failed to initialize Alpaca trading bot: {e}")
-    alpaca_bot = None
+# Check if Kraken has valid credentials first
+if kraken_api_key and kraken_secret_key:
+    try:
+        from kraken_trading_btc import KrakenTradingBot
+        trading_bot = KrakenTradingBot()
+        exchange_name = "kraken"
+        logger.info("✅ Kraken trading bot initialized successfully (Real Bitcoin trading)")
+    except Exception as e:
+        logger.warning(f"Kraken not available: {e}")
+        trading_bot = None
+
+# If Kraken not available, try Binance
+if not trading_bot:
+    try:
+        from binance_trading_btc import BinanceTradingBot
+        trading_bot = BinanceTradingBot()
+        exchange_name = "binance"
+        logger.info("✅ Binance trading bot initialized successfully (Bitcoin spot trading)")
+    except Exception as e:
+        logger.warning(f"Binance not available: {e}")
+        logger.error(f"❌ No trading bot available: {e}")
+        trading_bot = None
+        exchange_name = None
 
 # Initialize LLM Trading Strategy
 try:
     from llm_trading_strategy import LLMTradingStrategy
     llm_strategy = LLMTradingStrategy()
-    logger.info("LLM trading strategy initialized successfully")
+    logger.info("✅ LLM trading strategy initialized successfully")
 except Exception as e:
-    logger.error(f"Failed to initialize LLM trading strategy: {e}")
+    logger.error(f"❌ Failed to initialize LLM trading strategy: {e}")
     llm_strategy = None
+
+# Initialize Technical Analysis (if available)
+try:
+    from technical_analysis import TechnicalAnalyzer
+    technical_analyzer = TechnicalAnalyzer()
+    logger.info("✅ Technical analyzer initialized successfully")
+except Exception as e:
+    logger.warning(f"Technical analyzer not available: {e}")
+    technical_analyzer = None
+
+# Initialize trade log for tracking automated trades
+trade_log = []
+
+# Initialize Risk Management (if available)
+try:
+    from risk_management import RiskManager
+    risk_manager = RiskManager()
+    logger.info("✅ Risk manager initialized successfully")
+except Exception as e:
+    logger.warning(f"Risk manager not available: {e}")
+    risk_manager = None
 
 # News cache for BTC
 btc_news_cache = {}
 btc_news_cache_timestamp = {}
 
+# Sentiment cache for BTC (to reduce Cohere calls)
+btc_sentiment_cache = {}
+btc_sentiment_cache_timestamp = {}
+
 # Global variables
-trade_log = []  # Store trade logs
 
 class BTCTradingData(BaseModel):
     symbol: str = "BTC"
@@ -135,25 +228,74 @@ def get_btc_news() -> str:
         return "Real-time Bitcoin data"
 
 def analyze_btc_sentiment(news_text: str) -> tuple:
-    """Analyze Bitcoin sentiment using compact LLM approach"""
+    """Analyze Bitcoin sentiment using LLM strategy"""
+    # 15-minute cache to reduce LLM calls triggered by dashboard/health checks
+    current_time = datetime.now()
+    last_ts = btc_sentiment_cache_timestamp.get('BTC')
+    if last_ts and (current_time - last_ts).seconds < 900:
+        logger.info("Using cached sentiment analysis")
+        return btc_sentiment_cache['BTC']
+
     try:
-        # Simple sentiment analysis based on keywords
-        positive_keywords = ['bullish', 'surge', 'rally', 'breakout', 'adoption', 'institutional']
-        negative_keywords = ['bearish', 'crash', 'dump', 'sell-off', 'regulation', 'ban']
+        # Try to use LLM strategy if available
+        if llm_strategy:
+            try:
+                # Get current market data for context
+                market_data = get_btc_market_data()
+                if market_data:
+                    current_price = market_data.get('close', 45000.0)
+                    change_24h = market_data.get('change_24h', 0.0)
+                    volume = market_data.get('volume', 1000000.0)
+                    
+                    # Use LLM strategy for analysis
+                    analysis = llm_strategy.analyze_market_conditions(
+                        current_price=current_price,
+                        price_change_24h=change_24h,
+                        volume_24h=volume,
+                        news_sentiment=news_text[:200],  # Limit news text
+                        technical_indicators=None
+                    )
+                    
+                    # Convert sentiment to numeric
+                    if analysis.sentiment == "bullish":
+                        sentiment = 1
+                    elif analysis.sentiment == "bearish":
+                        sentiment = -1
+                    else:
+                        sentiment = 0
+                    
+                    btc_sentiment_cache['BTC'] = (sentiment, analysis.confidence)
+                    btc_sentiment_cache_timestamp['BTC'] = current_time
+                    return sentiment, analysis.confidence
+                    
+            except Exception as e:
+                logger.warning(f"LLM strategy failed, using fallback: {e}")
+        
+        # Fallback to simple keyword analysis
+        positive_keywords = ['bullish', 'surge', 'rally', 'breakout', 'adoption', 'institutional', 'positive']
+        negative_keywords = ['bearish', 'crash', 'dump', 'sell-off', 'regulation', 'ban', 'negative']
         
         text_lower = news_text.lower()
         positive_score = sum(1 for word in positive_keywords if word in text_lower)
         negative_score = sum(1 for word in negative_keywords if word in text_lower)
         
         if positive_score > negative_score:
+            btc_sentiment_cache['BTC'] = (1, 0.7)
+            btc_sentiment_cache_timestamp['BTC'] = current_time
             return 1, 0.7  # Positive sentiment
         elif negative_score > positive_score:
+            btc_sentiment_cache['BTC'] = (-1, 0.7)
+            btc_sentiment_cache_timestamp['BTC'] = current_time
             return -1, 0.7  # Negative sentiment
         else:
+            btc_sentiment_cache['BTC'] = (0, 0.5)
+            btc_sentiment_cache_timestamp['BTC'] = current_time
             return 0, 0.5  # Neutral sentiment
             
     except Exception as e:
         logger.error(f"Error in sentiment analysis: {e}")
+        btc_sentiment_cache['BTC'] = (0, 0.5)
+        btc_sentiment_cache_timestamp['BTC'] = datetime.now()
         return 0, 0.5
 
 def generate_trading_signal(price: float, sentiment: int, volume: float, change_24h: float) -> int:
@@ -196,9 +338,22 @@ def generate_trading_signal(price: float, sentiment: int, volume: float, change_
         return 0
 
 def get_btc_market_data() -> Optional[Dict]:
-    """Get Bitcoin market data from CoinGecko API"""
+    """Get Bitcoin market data from trading bot or CoinGecko API"""
     try:
-        # Use CoinGecko API for real Bitcoin data
+        # Try to get data from trading bot first
+        if trading_bot:
+            try:
+                market_data = trading_bot.get_market_data()
+                if market_data and 'error' not in market_data:
+                    return {
+                        'close': market_data.get('close', 45000.0),
+                        'volume': market_data.get('volume', 1000000.0),
+                        'change_24h': market_data.get('change_24h', 0.0)
+                    }
+            except Exception as e:
+                logger.warning(f"Trading bot market data failed: {e}")
+        
+        # Fallback to CoinGecko API
         url = "https://api.coingecko.com/api/v3/simple/price"
         params = {
             'ids': 'bitcoin',
@@ -294,12 +449,25 @@ async def dashboard():
             .status-error { background: #f8d7da; color: #721c24; }
             .trade-log { background: #f8f9fa; padding: 15px; border-radius: 5px; max-height: 300px; overflow-y: auto; }
         </style>
+
     </head>
     <body>
         <div class="container">
             <div class="header">
                 <h1>🚀 Bitcoin LLM Trading System</h1>
                 <p>Automated Bitcoin trading with compact LLM analysis</p>
+                <div id="auth-status" style="margin-top: 10px;">
+                    <span id="login-status">Not logged in</span>
+                    <button id="login-btn" onclick="showLoginForm()" style="margin-left: 10px; padding: 5px 10px; background: #28a745; color: white; border: none; border-radius: 3px; cursor: pointer;">Login</button>
+                    <button id="logout-btn" onclick="logout()" style="margin-left: 10px; padding: 5px 10px; background: #dc3545; color: white; border: none; border-radius: 3px; cursor: pointer; display: none;">Logout</button>
+                </div>
+                <div id="login-form" style="display: none; margin-top: 10px; background: rgba(255,255,255,0.1); padding: 10px; border-radius: 5px;">
+                    <p style="margin: 0 0 10px 0; color: #fff; font-size: 12px;">Enter your credentials:</p>
+                    <input type="text" id="login-username" placeholder="Username" style="margin-right: 10px; padding: 5px;">
+                    <input type="password" id="login-password" placeholder="Password" style="margin-right: 10px; padding: 5px;">
+                    <button onclick="login()" style="padding: 5px 10px; background: #007bff; color: white; border: none; border-radius: 3px; cursor: pointer;">Login</button>
+                    <button onclick="hideLoginForm()" style="padding: 5px 10px; background: #6c757d; color: white; border: none; border-radius: 3px; cursor: pointer;">Cancel</button>
+                </div>
             </div>
             
             <div class="trading-card">
@@ -342,20 +510,90 @@ async def dashboard():
             
             let jwtToken = localStorage.getItem('jwt_token');
             
-            // Simple test function
+            // Test function to check if JavaScript is working
             function testJS() {
+                console.log('JavaScript is working!');
                 alert('JavaScript is working!');
-                console.log('Test function called');
             }
             
-            // Simple data loading function
+            // Function to handle login and store JWT token
+            async function loginUser(username, password) {
+                try {
+                    const formData = new FormData();
+                    formData.append('username', username);
+                    formData.append('password', password);
+                    
+                    const response = await fetch('/auth/login', {
+                        method: 'POST',
+                        body: formData
+                    });
+                    
+                    if (response.ok) {
+                        const data = await response.json();
+                        jwtToken = data.session_token;
+                        localStorage.setItem('jwt_token', jwtToken);
+                        return true;
+                    } else {
+                        return false;
+                    }
+                } catch (error) {
+                    console.error('Login error:', error);
+                    return false;
+                }
+            }
+            
+            // Show login form
+            function showLoginForm() {
+                document.getElementById('login-form').style.display = 'block';
+                document.getElementById('login-btn').style.display = 'none';
+            }
+            
+            // Hide login form
+            function hideLoginForm() {
+                document.getElementById('login-form').style.display = 'none';
+                document.getElementById('login-btn').style.display = 'inline-block';
+            }
+            
+            // Login function
+            async function login() {
+                const username = document.getElementById('login-username').value;
+                const password = document.getElementById('login-password').value;
+                
+                if (await loginUser(username, password)) {
+                    document.getElementById('login-status').textContent = 'Logged in as ' + username;
+                    document.getElementById('login-btn').style.display = 'none';
+                    document.getElementById('logout-btn').style.display = 'inline-block';
+                    document.getElementById('login-form').style.display = 'none';
+                    alert('Login successful!');
+                } else {
+                    alert('Login failed. Please check your credentials.');
+                }
+            }
+            
+            // Logout function
+            function logout() {
+                jwtToken = null;
+                localStorage.removeItem('jwt_token');
+                document.getElementById('login-status').textContent = 'Not logged in';
+                document.getElementById('login-btn').style.display = 'inline-block';
+                document.getElementById('logout-btn').style.display = 'none';
+                alert('Logged out successfully!');
+            }
+            
+            // Load Bitcoin data from API
             function loadBTCData() {
                 console.log('loadBTCData called');
                 
-                fetch('/btc_data')
+                fetch('/btc_data_public')
                     .then(response => response.json())
                     .then(data => {
                         console.log('Data received:', data);
+                        
+                        if (data.error) {
+                            document.getElementById('btc-price').innerHTML = 'Error loading data';
+                            document.getElementById('btc-info').innerHTML = '<p>Unable to fetch market data</p>';
+                            return;
+                        }
                         
                         // Update price
                         document.getElementById('btc-price').innerHTML = '$' + data.price.toLocaleString();
@@ -382,9 +620,11 @@ async def dashboard():
                     .catch(error => {
                         console.error('Error:', error);
                         document.getElementById('btc-price').innerHTML = 'Error loading data';
+                        document.getElementById('btc-info').innerHTML = '<p>Unable to fetch market data</p>';
                     });
             }
             
+            // Buy Bitcoin function
             function buyBTC() {
                 const amount = document.getElementById('trade-amount').value;
                 alert(`Buy BTC: $${amount}`);
@@ -395,6 +635,7 @@ async def dashboard():
                 log.innerHTML += `<div>[${timestamp}] BUY: $${amount}</div>`;
             }
             
+            // Sell Bitcoin function
             function sellBTC() {
                 const amount = document.getElementById('trade-amount').value;
                 alert(`Sell BTC: $${amount}`);
@@ -405,26 +646,41 @@ async def dashboard():
                 log.innerHTML += `<div>[${timestamp}] SELL: $${amount}</div>`;
             }
             
+            // Automated trading function
             async function autoTrade() {
                 console.log('Auto trade started');
                 document.getElementById('trading-status').innerHTML = '<div class="status status-success">🤖 AI analyzing...</div>';
                 
+                // Check if user is authenticated
+                if (!jwtToken) {
+                    document.getElementById('trading-status').innerHTML = '<div class="status status-error">Please log in to use auto-trade</div>';
+                    return;
+                }
+                
                 try {
-                    const response = await fetch('/auto_trade_demo', {
+                    const formData = new FormData();
+                    formData.append('token', jwtToken);
+                    
+                    const response = await fetch('/auto_trade', {
                         method: 'POST',
-                        headers: {'Content-Type': 'application/json'}
+                        body: formData
                     });
+                    
+                    if (response.status === 401) {
+                        document.getElementById('trading-status').innerHTML = '<div class="status status-error">Authentication required. Please log in again.</div>';
+                        return;
+                    }
                     
                     const data = await response.json();
                     console.log('Auto trade response:', data);
                     
-                    let message = '🤖 AI Analysis Complete!\n';
+                    let message = '🤖 AI Analysis Complete!';
                     if (data.signal) {
-                        message += `Action: ${data.signal.action.toUpperCase()}\n`;
-                        message += `Reason: ${data.signal.reason}`;
+                        message += '\\nAction: ' + data.signal.action.toUpperCase();
+                        message += '\\nReason: ' + data.signal.reason;
                     }
                     
-                    document.getElementById('trading-status').innerHTML = `<div class="status status-success">${message.replace(/\n/g, '<br>')}</div>`;
+                    document.getElementById('trading-status').innerHTML = `<div class="status status-success">${message.replace(/\\\\n/g, '<br>')}</div>`;
                     
                     const log = document.getElementById('trade-log');
                     const timestamp = new Date().toLocaleTimeString();
@@ -435,63 +691,87 @@ async def dashboard():
                 }
             }
             
-            function refreshData() {
+            // Check login status on page load
+            function checkLoginStatus() {
+                if (jwtToken) {
+                    document.getElementById('login-status').textContent = 'Logged in as admin';
+                    document.getElementById('login-btn').style.display = 'none';
+                    document.getElementById('logout-btn').style.display = 'inline-block';
+                } else {
+                    document.getElementById('login-status').textContent = 'Not logged in';
+                    document.getElementById('login-btn').style.display = 'inline-block';
+                    document.getElementById('logout-btn').style.display = 'none';
+                }
+            }
+            
+            // Load data when page loads
+            window.addEventListener('load', function() {
+                console.log('Page loaded, loading BTC data...');
                 loadBTCData();
-            }
-            
-            function addTradeLog(message) {
-                const log = document.getElementById('trade-log');
-                const timestamp = new Date().toLocaleTimeString();
-                log.innerHTML += `<div>[${timestamp}] ${message}</div>`;
-                log.scrollTop = log.scrollHeight;
-            }
-            
-            function getSignalText(signal) {
-                if (signal === 1) return 'BUY';
-                if (signal === -1) return 'SELL';
-                return 'HOLD';
-            }
-            
-            function getSignalClass(signal) {
-                if (signal === 1) return 'signal-buy';
-                if (signal === -1) return 'signal-sell';
-                return 'signal-hold';
-            }
-            
-            function getSentimentText(sentiment) {
-                if (sentiment > 0) return 'Positive';
-                if (sentiment < 0) return 'Negative';
-                return 'Neutral';
-            }
-            
-            function getSentimentClass(sentiment) {
-                if (sentiment > 0) return 'signal-buy';
-                if (sentiment < 0) return 'signal-sell';
-                return 'signal-hold';
-            }
-            
-            // Test function to check if JavaScript is working
-            window.testJS = function() {
-                console.log('JavaScript is working!');
-                alert('JavaScript is working!');
-            };
-            
-            // Load data immediately when page loads
-            console.log('Page loaded, loading BTC data...');
-            loadBTCData();
-            
-            // Auto-refresh every 30 seconds
-            setInterval(loadBTCData, 30000);
-            
-            console.log('JavaScript loaded successfully');
+                checkLoginStatus();
+                
+                // Auto-refresh every 30 seconds
+                setInterval(loadBTCData, 30000);
+                
+                console.log('JavaScript loaded successfully');
+            });
         </script>
     </body>
     </html>
     """
 
+@app.get("/btc_data_public")
+async def get_btc_data_public():
+    """Get basic Bitcoin market data (public endpoint)"""
+    try:
+        # Get market data
+        market_data = get_btc_market_data()
+        
+        if market_data:
+            price = market_data.get('close', 45000.0)
+            volume = market_data.get('volume', 1000000.0)
+            change_24h = market_data.get('change_24h', 0.0)
+        else:
+            # Fallback data
+            price = 45000.0
+            volume = 1000000.0
+            change_24h = 2.5
+        
+        # Get news and sentiment
+        news_text = get_btc_news()
+        sentiment, probability = analyze_btc_sentiment(news_text)
+        
+        # Generate trading signal
+        signal = generate_trading_signal(price, sentiment, volume, change_24h)
+        
+        return BTCTradingData(
+            symbol="BTC",
+            price=price,
+            time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            news=news_text[:200] + "..." if len(news_text) > 200 else news_text,
+            sentiment=sentiment,
+            probability=probability,
+            signal=signal,
+            volume=volume,
+            change_24h=change_24h
+        )
+    except Exception as e:
+        logger.error(f"Error getting BTC data: {e}")
+        return {"error": "Unable to fetch market data"}
+
 @app.get("/btc_data")
 async def get_btc_data(token: str = None):
-    """Get Bitcoin market data and analysis"""
+    """Get Bitcoin market data and analysis (authenticated)"""
+    # Require authentication for sensitive data
+    if not token:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    
+    try:
+        username = verify_jwt_token(token)
+        logger.info(f"BTC data requested by user: {username}")
+    except:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    
     try:
         # Get market data
         market_data = get_btc_market_data()
@@ -550,12 +830,12 @@ async def buy_btc(amount: float = Form(...), token: str = Form(...)):
     except:
         raise HTTPException(status_code=401, detail="Authentication required")
     
-    if not alpaca_available:
-        return {"message": "Alpaca trading not available"}
+    if not trading_bot:
+        return {"message": "No trading bot available"}
     
     try:
-        # Execute buy order through Alpaca using Bitcoin proxy (GBTC)
-        result = alpaca_bot.place_buy_order("BTC/USD", amount, 1.0)
+        # Execute buy order through the trading bot
+        result = trading_bot.place_buy_order("BTC/USD", amount, 1.0)
         
         trade_log.append({
             "action": "BUY",
@@ -566,7 +846,7 @@ async def buy_btc(amount: float = Form(...), token: str = Form(...)):
         })
         
         if result['status'] == 'success':
-            return {"message": f"Bought ${amount:.2f} worth of Bitcoin (via {result['symbol']})", "result": result}
+            return {"message": f"Bought ${amount:.2f} worth of Bitcoin (via {exchange_name})", "result": result}
         else:
             return {"message": f"Buy order failed: {result.get('reason', 'Unknown error')}", "result": result}
             
@@ -584,12 +864,12 @@ async def sell_btc(amount: float = Form(...), token: str = Form(...)):
     except:
         raise HTTPException(status_code=401, detail="Authentication required")
     
-    if not alpaca_available:
-        return {"message": "Alpaca trading not available"}
+    if not trading_bot:
+        return {"message": "No trading bot available"}
     
     try:
-        # Execute sell order through Alpaca using Bitcoin proxy (GBTC)
-        result = alpaca_bot.place_sell_order("BTC/USD", amount)
+        # Execute sell order through the trading bot
+        result = trading_bot.place_sell_order("BTC/USD", amount)
         
         trade_log.append({
             "action": "SELL",
@@ -600,7 +880,7 @@ async def sell_btc(amount: float = Form(...), token: str = Form(...)):
         })
         
         if result['status'] == 'success':
-            return {"message": f"Sold ${amount:.2f} worth of Bitcoin (via {result['symbol']})", "result": result}
+            return {"message": f"Sold ${amount:.2f} worth of Bitcoin (via {exchange_name})", "result": result}
         else:
             return {"message": f"Sell order failed: {result.get('reason', 'Unknown error')}", "result": result}
             
@@ -639,7 +919,7 @@ async def login_page():
                 </div>
                 <div class="form-group">
                     <label for="password">Password:</label>
-                    <input type="password" id="password" name="password" value="trading123" required>
+                    <input type="password" id="password" name="password" value="SecureTrading2024!" required>
                 </div>
                 <button type="submit" class="btn">Login</button>
             </form>
@@ -679,7 +959,7 @@ async def login_page():
 @app.post("/auth/login")
 async def login(username: str = Form(...), password: str = Form(...)):
     """Handle login"""
-    if username == "admin" and password == "trading123":
+    if username == ADMIN_USERNAME and password == ADMIN_PASSWORD:
         token = create_jwt_token(username)
         return {"session_token": token, "message": "Login successful"}
     else:
@@ -690,14 +970,20 @@ async def test_apis():
     """Test API connectivity"""
     results = {}
     
-    # Test Alpaca
-    try:
-        if alpaca_available:
-            results["alpaca"] = "✅ Connected successfully"
-        else:
-            results["alpaca"] = "❌ Not configured"
-    except Exception as e:
-        results["alpaca"] = f"❌ Error: {str(e)}"
+    # Test Binance
+    if trading_bot and exchange_name == "binance":
+        results["binance"] = "✅ Connected successfully"
+    else:
+        results["binance"] = "❌ Not configured"
+    
+    # Test Kraken
+    if trading_bot and exchange_name == "kraken":
+        results["kraken"] = "✅ Connected successfully"
+    else:
+        results["kraken"] = "❌ Not configured"
+    
+    # Test Alpaca (if available)
+    # Removed Alpaca test as it's no longer used
     
     # Test News API
     try:
@@ -741,9 +1027,9 @@ async def auto_trade(token: str = Form(...)):
         logger.warning("Invalid token for auto trade")
         raise HTTPException(status_code=401, detail="Authentication required")
 
-    if not alpaca_available or not alpaca_bot:
-        logger.warning("Alpaca trading not available for auto trade")
-        return {"message": "Alpaca trading not available"}
+    if not trading_bot:
+        logger.warning("No trading bot available for auto trade")
+        return {"message": "No trading bot available"}
 
     if not llm_strategy:
         logger.warning("LLM strategy not available for auto trade")
@@ -773,23 +1059,80 @@ async def auto_trade(token: str = Form(...)):
 
         # Generate LLM trading signal
         logger.info("🧠 Generating LLM trading signal...")
-        signal = llm_strategy.generate_trading_signal(
-            current_price=current_price,
-            price_change_24h=price_change_24h,
-            volume_24h=volume_24h,
-            news_sentiment=news_sentiment
-        )
-        
-        logger.info(f"🎯 LLM Signal: {signal['action'].upper()} - {signal['reason']} (confidence: {signal['confidence']:.2f})")
+        try:
+            signal = llm_strategy.generate_trading_signal(
+                current_price=current_price,
+                price_change_24h=price_change_24h,
+                volume_24h=volume_24h,
+                news_sentiment=news_sentiment
+            )
+            
+            logger.info(f"🎯 LLM Signal: {signal['action'].upper()} - {signal['reason']} (confidence: {signal['confidence']:.2f})")
+            
+        except Exception as llm_error:
+            logger.error(f"❌ LLM signal generation failed: {llm_error}")
+            # Create fallback signal
+            signal = {
+                'action': 'hold',
+                'should_trade': False,
+                'reason': f'LLM analysis failed: {str(llm_error)}',
+                'confidence': 0.5,
+                'risk_level': 'medium',
+                'position_size': None,
+                'price_target': None,
+                'stop_loss': None,
+                'analysis': f'LLM Error: {str(llm_error)}',
+                'timestamp': datetime.now().isoformat()
+            }
+            logger.info(f"🔄 Using fallback signal: {signal['action'].upper()}")
 
-        # Execute trade if recommended
+        # Check account balance before executing trade
+        account_balance = trading_bot.get_account_info()
+        logger.info(f"💰 Account Balance: {account_balance}")
+        
+        # Calculate appropriate position size based on available funds
+        available_funds = 0.0
+        btc_balance = 0.0
+        
+        if account_balance and 'balances' in account_balance:
+            balances = account_balance['balances']
+            # Check GBP balance
+            gbp_balance = float(balances.get('ZGBP', '0.0'))
+            # Check USD balance  
+            usd_balance = float(balances.get('ZUSD', '0.0'))
+            # Check BTC balance
+            btc_balance = float(balances.get('XXBT', '0.0'))
+            
+            available_funds = gbp_balance + usd_balance
+            logger.info(f"💵 Available funds: £{gbp_balance:.2f} + ${usd_balance:.2f} = ${available_funds:.2f}")
+            logger.info(f"₿ BTC balance: {btc_balance:.8f}")
+        
+        # Execute trade if recommended and funds available
         trade_result = None
         if signal['should_trade'] and signal['position_size']:
-            logger.info(f"💰 Executing trade: {signal['action'].upper()} ${signal['position_size']}")
+            # Adjust position size based on available funds
+            requested_size = signal['position_size']
+            max_buy_size = available_funds * 0.95  # Use 95% of available funds
+            max_sell_size = btc_balance * current_price * 0.95  # Use 95% of BTC balance
+            
             if signal['action'] == 'buy':
-                trade_result = alpaca_bot.place_buy_order("BTC/USD", signal['position_size'], 1.0)
+                if max_buy_size < 10.0:  # Minimum $10 trade
+                    logger.info(f"⏸️ Insufficient funds for buy: ${max_buy_size:.2f} available, ${requested_size:.2f} requested")
+                    trade_result = {"status": "error", "reason": ["Insufficient funds for buy"]}
+                else:
+                    actual_size = min(requested_size, max_buy_size)
+                    logger.info(f"💰 Executing buy: ${actual_size:.2f} (requested: ${requested_size:.2f}, available: ${max_buy_size:.2f})")
+                    trade_result = trading_bot.place_buy_order("BTC/USD", actual_size, 1.0)
+                    
             elif signal['action'] == 'sell':
-                trade_result = alpaca_bot.place_sell_order("BTC/USD", signal['position_size'])
+                if max_sell_size < 10.0:  # Minimum $10 trade
+                    logger.info(f"⏸️ Insufficient BTC for sell: ${max_sell_size:.2f} available, ${requested_size:.2f} requested")
+                    trade_result = {"status": "error", "reason": ["Insufficient BTC for sell"]}
+                else:
+                    actual_size = min(requested_size, max_sell_size)
+                    logger.info(f"💰 Executing sell: ${actual_size:.2f} (requested: ${requested_size:.2f}, available: ${max_sell_size:.2f})")
+                    trade_result = trading_bot.place_sell_order("BTC/USD", actual_size)
+                    
             logger.info(f"✅ Trade result: {trade_result}")
         else:
             logger.info("⏸️ No trade executed - conditions not met")
@@ -814,23 +1157,30 @@ async def auto_trade(token: str = Form(...)):
         logger.error(f"❌ Error in automated trading: {e}")
         return {"message": f"Error in automated trading: {str(e)}"}
 
-@app.post("/auto_trade_demo")
-async def auto_trade_demo():
-    """Demo endpoint for automated trading without authentication"""
-    logger.info("🤖 Auto Trade Demo endpoint called")
+# REMOVED: /auto_trade_demo endpoint for security reasons
+# This endpoint was allowing unauthorized access to trading functionality
+
+@app.post("/auto_trade_scheduled")
+async def auto_trade_scheduled():
+    """Execute automated trading without authentication (for scheduled runs)"""
+    logger.info("🤖 Scheduled Auto Trade endpoint called")
     
+    if not trading_bot:
+        logger.warning("No trading bot available for scheduled auto trade")
+        return {"status": "error", "message": "No trading bot available"}
+
     if not llm_strategy:
-        logger.warning("LLM strategy not available for auto trade demo")
-        return {"message": "LLM strategy not available"}
+        logger.warning("LLM strategy not available for scheduled auto trade")
+        return {"status": "error", "message": "LLM strategy not available"}
 
     try:
-        logger.info("🤖 Starting LLM market analysis (demo)...")
+        logger.info("🤖 Starting scheduled LLM market analysis...")
         
         # Get current market data
         market_data = get_btc_market_data()
         if not market_data:
-            logger.error("Unable to get market data for auto trade demo")
-            return {"message": "Unable to get market data"}
+            logger.error("Unable to get market data for scheduled auto trade")
+            return {"status": "error", "message": "Unable to get market data"}
 
         current_price = market_data.get('close', 45000.0)
         price_change_24h = market_data.get('change_24h', 0.0)
@@ -846,38 +1196,208 @@ async def auto_trade_demo():
         logger.info(f"📰 News Sentiment: {news_sentiment} (score: {sentiment}, probability: {probability:.2f})")
 
         # Generate LLM trading signal
-        logger.info("🧠 Generating LLM trading signal (demo)...")
-        signal = llm_strategy.generate_trading_signal(
-            current_price=current_price,
-            price_change_24h=price_change_24h,
-            volume_24h=volume_24h,
-            news_sentiment=news_sentiment
-        )
-        
-        logger.info(f"🎯 LLM Signal: {signal['action'].upper()} - {signal['reason']} (confidence: {signal['confidence']:.2f})")
+        logger.info("🧠 Generating LLM trading signal...")
+        try:
+            signal = llm_strategy.generate_trading_signal(
+                current_price=current_price,
+                price_change_24h=price_change_24h,
+                volume_24h=volume_24h,
+                news_sentiment=news_sentiment
+            )
+            
+            logger.info(f"🎯 LLM Signal: {signal['action'].upper()} - {signal['reason']} (confidence: {signal['confidence']:.2f})")
+            
+        except Exception as llm_error:
+            logger.error(f"❌ LLM signal generation failed: {llm_error}")
+            # Create fallback signal
+            signal = {
+                'action': 'hold',
+                'should_trade': False,
+                'reason': f'LLM analysis failed: {str(llm_error)}',
+                'confidence': 0.5,
+                'risk_level': 'medium',
+                'position_size': None,
+                'price_target': None,
+                'stop_loss': None,
+                'analysis': f'LLM Error: {str(llm_error)}',
+                'timestamp': datetime.now().isoformat()
+            }
+            logger.info(f"🔄 Using fallback signal: {signal['action'].upper()}")
 
-        # For demo, we don't execute actual trades
-        logger.info("⏸️ Demo mode - no actual trades executed")
+        # Check account balance before executing trade
+        account_balance = trading_bot.get_account_info()
+        logger.info(f"💰 Account Balance: {account_balance}")
+        
+        # Calculate appropriate position size based on available funds
+        available_funds = 0.0
+        btc_balance = 0.0
+        
+        if account_balance and 'balances' in account_balance:
+            balances = account_balance['balances']
+            # Check GBP balance
+            gbp_balance = float(balances.get('ZGBP', '0.0'))
+            # Check USD balance  
+            usd_balance = float(balances.get('ZUSD', '0.0'))
+            # Check BTC balance
+            btc_balance = float(balances.get('XXBT', '0.0'))
+            
+            available_funds = gbp_balance + usd_balance
+            logger.info(f"💵 Available funds: £{gbp_balance:.2f} + ${usd_balance:.2f} = ${available_funds:.2f}")
+            logger.info(f"₿ BTC balance: {btc_balance:.8f}")
+        
+        # Execute trade if recommended and funds available
+        trade_result = None
+        if signal['should_trade'] and signal['position_size']:
+            # Adjust position size based on available funds
+            requested_size = signal['position_size']
+            max_buy_size = available_funds * 0.95  # Use 95% of available funds
+            max_sell_size = btc_balance * current_price * 0.95  # Use 95% of BTC balance
+            
+            if signal['action'] == 'buy':
+                if max_buy_size < 10.0:  # Minimum $10 trade
+                    logger.info(f"⏸️ Insufficient funds for buy: ${max_buy_size:.2f} available, ${requested_size:.2f} requested")
+                    trade_result = {"status": "error", "reason": ["Insufficient funds for buy"]}
+                else:
+                    actual_size = min(requested_size, max_buy_size)
+                    logger.info(f"💰 Executing buy: ${actual_size:.2f} (requested: ${requested_size:.2f}, available: ${max_buy_size:.2f})")
+                    trade_result = trading_bot.place_buy_order("BTC/USD", actual_size, 1.0)
+                    
+            elif signal['action'] == 'sell':
+                if max_sell_size < 10.0:  # Minimum $10 trade
+                    logger.info(f"⏸️ Insufficient BTC for sell: ${max_sell_size:.2f} available, ${requested_size:.2f} requested")
+                    trade_result = {"status": "error", "reason": ["Insufficient BTC for sell"]}
+                else:
+                    actual_size = min(requested_size, max_sell_size)
+                    logger.info(f"💰 Executing sell: ${actual_size:.2f} (requested: ${requested_size:.2f}, available: ${max_sell_size:.2f})")
+                    trade_result = trading_bot.place_sell_order("BTC/USD", actual_size)
+                    
+            logger.info(f"✅ Scheduled trade result: {trade_result}")
+        else:
+            logger.info("⏸️ No scheduled trade executed - conditions not met")
 
         # Log the automated trade
         trade_log.append({
-            "action": "AUTO_TRADE_DEMO",
+            "action": "SCHEDULED_AUTO_TRADE",
             "signal": signal,
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "trade_result": None
+            "trade_result": trade_result
         })
 
-        logger.info("🤖 Auto trade demo analysis completed successfully")
+        logger.info("🤖 Scheduled auto trade analysis completed successfully")
         return {
-            "message": f"Demo automated trading analysis complete",
+            "status": "success",
+            "message": f"Scheduled automated trading analysis complete",
             "signal": signal,
-            "trade_executed": False,
-            "trade_result": None
+            "trade_executed": trade_result is not None,
+            "trade_result": trade_result
         }
 
     except Exception as e:
-        logger.error(f"❌ Error in automated trading demo: {e}")
-        return {"message": f"Error in automated trading demo: {str(e)}"}
+        logger.error(f"❌ Error in scheduled automated trading: {e}")
+        return {"status": "error", "message": f"Error in scheduled automated trading: {str(e)}"}
+
+@app.get("/account_balance")
+async def get_account_balance(token: str = None):
+    """Get current account balance and positions"""
+    logger.info("💰 Account balance requested")
+    
+    if not token:
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    try:
+        username = verify_jwt_token(token)
+    except:
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    if not trading_bot:
+        return {"message": "No trading bot available", "balance": None}
+    
+    try:
+        # Get account information
+        account_info = trading_bot.get_account_info()
+        positions = trading_bot.get_positions()
+        
+        return {
+            "account": account_info,
+            "positions": positions,
+            "timestamp": datetime.now().isoformat()
+        }
+    except Exception as e:
+        logger.error(f"Error getting account balance: {e}")
+        return {"message": f"Error getting account balance: {str(e)}", "balance": None}
+
+@app.get("/trade_history")
+async def get_trade_history(token: str = None, limit: int = 50):
+    """Get recent trade history"""
+    logger.info(f"📋 Trade history requested (limit: {limit})")
+    
+    if not token:
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    try:
+        username = verify_jwt_token(token)
+    except:
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    try:
+        # Get recent trades from the trade log
+        recent_trades = trade_log[-limit:] if len(trade_log) > limit else trade_log
+        
+        return {
+            "trades": recent_trades,
+            "total_trades": len(trade_log),
+            "timestamp": datetime.now().isoformat()
+        }
+    except Exception as e:
+        logger.error(f"Error getting trade history: {e}")
+        return {"message": f"Error getting trade history: {str(e)}", "trades": []}
+
+@app.get("/trading_summary")
+async def get_trading_summary(token: str = None):
+    """Get comprehensive trading summary including balance, positions, and recent activity"""
+    logger.info("📊 Trading summary requested")
+    
+    if not token:
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    try:
+        username = verify_jwt_token(token)
+    except:
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    if not trading_bot:
+        return {"message": "No trading bot available", "summary": None}
+    
+    try:
+        # Get account information
+        account_info = trading_bot.get_account_info()
+        positions = trading_bot.get_positions()
+        
+        # Get recent trades
+        recent_trades = trade_log[-10:] if len(trade_log) > 10 else trade_log
+        
+        # Calculate basic statistics
+        total_trades = len(trade_log)
+        auto_trades = len([t for t in trade_log if t.get('action') == 'AUTO_TRADE' or t.get('action') == 'AUTO_TRADE_DEMO'])
+        manual_trades = total_trades - auto_trades
+        
+        summary = {
+            "account": account_info,
+            "positions": positions,
+            "recent_trades": recent_trades,
+            "statistics": {
+                "total_trades": total_trades,
+                "auto_trades": auto_trades,
+                "manual_trades": manual_trades,
+                "last_trade": trade_log[-1] if trade_log else None
+            },
+            "timestamp": datetime.now().isoformat()
+        }
+        
+        return summary
+    except Exception as e:
+        logger.error(f"Error getting trading summary: {e}")
+        return {"message": f"Error getting trading summary: {str(e)}", "summary": None}
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000) 
