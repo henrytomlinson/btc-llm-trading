@@ -121,7 +121,8 @@ You are a professional Bitcoin trading analyst. Analyze the following market dat
 
 {market_context}
 
-Please provide your analysis in the following JSON format:
+IMPORTANT: Respond ONLY with valid JSON in the exact format below. Do not include any additional text, explanations, or formatting outside the JSON object.
+
 {{
     "sentiment": "bullish|bearish|neutral",
     "confidence": 0.0-1.0,
@@ -141,6 +142,8 @@ Consider:
 6. Market volatility
 
 Focus on Bitcoin's unique characteristics as a digital asset and cryptocurrency market dynamics.
+
+Remember: Return ONLY the JSON object, nothing else.
 """
     
     def _query_llm(self, prompt: str) -> str:
@@ -177,15 +180,34 @@ Focus on Bitcoin's unique characteristics as a digital asset and cryptocurrency 
         """Parse LLM response into MarketAnalysis object"""
         
         try:
+            # Clean the response by removing control characters and extra whitespace
+            cleaned_response = response.strip()
+            
+            # Remove common control characters that can break JSON parsing
+            import re
+            cleaned_response = re.sub(r'[\x00-\x1f\x7f-\x9f]', '', cleaned_response)
+            
             # Extract JSON from response
-            json_start = response.find('{')
-            json_end = response.rfind('}') + 1
+            json_start = cleaned_response.find('{')
+            json_end = cleaned_response.rfind('}') + 1
             
             if json_start == -1 or json_end == 0:
                 raise ValueError("No JSON found in response")
             
-            json_str = response[json_start:json_end]
-            data = json.loads(json_str)
+            json_str = cleaned_response[json_start:json_end]
+            
+            # Try to fix common JSON formatting issues
+            json_str = json_str.replace('\n', ' ').replace('\r', ' ')
+            json_str = re.sub(r'\s+', ' ', json_str)  # Normalize whitespace
+            
+            # Attempt to parse the cleaned JSON
+            try:
+                data = json.loads(json_str)
+            except json.JSONDecodeError as json_error:
+                logger.warning(f"Initial JSON parsing failed: {json_error}")
+                
+                # Try to extract key-value pairs manually as fallback
+                data = self._extract_key_value_pairs(json_str)
             
             # Parse values with defaults
             sentiment = data.get('sentiment', 'neutral')
@@ -232,6 +254,57 @@ Focus on Bitcoin's unique characteristics as a digital asset and cryptocurrency 
                 recommended_action="hold",
                 risk_level="medium"
             )
+    
+    def _extract_key_value_pairs(self, text: str) -> Dict:
+        """Extract key-value pairs from malformed JSON text as fallback"""
+        try:
+            import re
+            
+            # Pattern to match key-value pairs
+            pattern = r'"([^"]+)"\s*:\s*"([^"]*)"'
+            matches = re.findall(pattern, text)
+            
+            # Also try to match numeric values
+            numeric_pattern = r'"([^"]+)"\s*:\s*([0-9.]+)'
+            numeric_matches = re.findall(numeric_pattern, text)
+            
+            data = {}
+            
+            # Add string matches
+            for key, value in matches:
+                data[key] = value
+            
+            # Add numeric matches
+            for key, value in numeric_matches:
+                try:
+                    data[key] = float(value)
+                except ValueError:
+                    data[key] = value
+            
+            # Set defaults for missing required fields
+            if 'sentiment' not in data:
+                data['sentiment'] = 'neutral'
+            if 'confidence' not in data:
+                data['confidence'] = 0.5
+            if 'reasoning' not in data:
+                data['reasoning'] = 'Extracted from malformed response'
+            if 'recommended_action' not in data:
+                data['recommended_action'] = 'hold'
+            if 'risk_level' not in data:
+                data['risk_level'] = 'medium'
+            
+            logger.info(f"Extracted key-value pairs: {data}")
+            return data
+            
+        except Exception as e:
+            logger.error(f"Error extracting key-value pairs: {e}")
+            return {
+                'sentiment': 'neutral',
+                'confidence': 0.5,
+                'reasoning': 'Failed to extract data',
+                'recommended_action': 'hold',
+                'risk_level': 'medium'
+            }
     
     def should_execute_trade(self, analysis: MarketAnalysis) -> Tuple[bool, str]:
         """Determine if a trade should be executed based on LLM analysis"""

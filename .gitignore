@@ -72,3 +72,14 @@ logs/
 *.pem
 *.p12
 *.pfx 
+# Local overrides
+.env
+.env.*
+*.log
+__pycache__/
+*.pyc
+.venv/
+venv/
+.DS_Store
+.idea/
+.vscode/
