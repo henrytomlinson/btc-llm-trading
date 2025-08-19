@@ -118,6 +118,90 @@ Default: execute only if confidence ≥ 0.7.
 
 ---
 
+## Decision Logic: Buy / Sell / Hold (details)
+- **Inputs combined**
+  - **Market**: current price, 24h % change, 24h volume (from Kraken or CoinGecko fallback)
+  - **News/Sentiment**: latest headline turned into a sentiment label (positive/neutral/negative)
+  - **Optional TA**: placeholders for RSI/MACD/MAs/Bollinger; not required for execution
+
+- **LLM-driven decision (used for live trading via `/auto_trade` and the scheduler)**
+  - Build a compact market context and prompt Cohere for a strict-JSON response including `sentiment`, `recommended_action` (buy/sell/hold), `confidence` \/ `risk_level`, and optional `price_target` \/ `stop_loss`.
+  - A trade is considered only when ALL are true:
+    - **Confidence ≥ 0.7** and **risk_level ≤ medium**
+    - `recommended_action` is `buy` or `sell` (if `hold`, no trade)
+  - Position size: start from a **$1000 base**, then scale by risk and confidence
+    - Risk multipliers: low = 1.0, medium = 0.7, high = 0.5
+    - Final size = base × risk_multiplier × confidence, with a **$10 minimum**
+  - Execution guardrails (per order):
+    - Buys use up to **95% of available USD+GBP** funds; sells use up to **95% of BTC value**
+    - Enforce **minimum $10** notional for both buy and sell
+
+- **Dashboard signal (display-only)**
+  - A lightweight, explainable score is shown on `/btc_data_public` and the UI:
+    - Sentiment 40% + momentum (24h change) 30% + volume 20% + price level 10%
+    - Thresholds: score > 0.3 → BUY, score < -0.3 → SELL, otherwise HOLD
+  - This display signal does not place orders when the LLM strategy is available.
+
+- **Fallbacks and cost control**
+  - If the LLM call fails or returns malformed JSON, the system defaults to a neutral HOLD.
+  - Sentiment is cached for **15 minutes** to limit LLM usage triggered by page refreshes and health checks.
+
+- **Where to tune**
+  - Confidence threshold, risk cap, and sizing multipliers: see `llm_trading_strategy.py`
+  - Display signal weights and thresholds: see `generate_trading_signal` in `main_btc.py`
+  - Base order sizing for LLM decisions: `$1000` inside `LLMTradingStrategy.generate_trading_signal`
+
+References:
+```149:180:llm_trading_strategy.py
+    def _query_llm(self, prompt: str) -> str:
+        """Query the LLM with the given prompt"""
+        
+        headers = {
+            "Authorization": f"Bearer {self.cohere_key}",
+            "Content-Type": "application/json"
+        }
+        
+        data = {
+            "model": self.model,
+            "prompt": prompt,
+            "max_tokens": 500,
+            "temperature": 0.3,
+            "k": 0,
+            "stop_sequences": [],
+            "return_likelihoods": "NONE"
+        }
+```
+
+```309:350:llm_trading_strategy.py
+    def should_execute_trade(self, analysis: MarketAnalysis) -> Tuple[bool, str]:
+        """Determine if a trade should be executed based on LLM analysis"""
+        
+        # Check confidence threshold
+        if analysis.confidence < self.min_confidence:
+            return False, f"Confidence too low: {analysis.confidence:.2f} < {self.min_confidence}"
+        
+        # Check risk level
+        risk_levels = {"low": 1, "medium": 2, "high": 3}
+        max_risk = risk_levels.get(self.max_risk_level, 2)
+        current_risk = risk_levels.get(analysis.risk_level, 2)
+        
+        if current_risk > max_risk:
+            return False, f"Risk level too high: {analysis.risk_level}"
+        
+        # Don't execute if recommendation is "hold"
+        if analysis.recommended_action == "hold":
+            return False, "LLM recommends holding"
+```
+
+```301:334:main_btc.py
+def generate_trading_signal(price: float, sentiment: int, volume: float, change_24h: float) -> int:
+    # Sentiment factor (40% weight)
+    # Price momentum factor (30% weight)
+    # Volume factor (20% weight)
+    # Price level factor (10% weight)
+    # score > 0.3 → BUY, score < -0.3 → SELL, else HOLD
+```
+
 ## Cost Controls (Cohere)
 - Hourly schedule ≈ 24 calls/day
 - 15‑minute cache prevents dashboard-triggered extra calls
