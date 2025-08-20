@@ -7,7 +7,7 @@ A focused Bitcoin trading application with compact LLM for automated trading dec
 import os
 import asyncio
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Optional
 import jwt
 import secrets
@@ -188,6 +188,17 @@ btc_sentiment_cache = {}
 btc_sentiment_cache_timestamp = {}
 
 # Global variables
+
+# Last good snapshot for graceful degradation
+_LAST_SNAPSHOT = {"price": None, "change": None, "volume": None, "ts": None}
+
+class PublicBTC(BaseModel):
+    status: str                 # "ok" | "degraded"
+    price: float | None
+    change_24h: float | None
+    volume_24h: float | None
+    last_update: str            # ISO timestamp
+    message: str | None = None
 
 class BTCTradingData(BaseModel):
     symbol: str = "BTC"
@@ -841,7 +852,33 @@ async def dashboard():
             async function login(){ const u=document.getElementById('login-username').value; const p=document.getElementById('login-password').value; if (await loginUser(u,p)){ /* UI already updated */ } else { alert('Login failed.'); } }
             function logout(){ jwtToken=null; localStorage.removeItem('jwt_token'); setAuthUi(false); }
 
-            function loadBTCData(){ fetch('/btc_data_public').then(r=>r.json()).then(data=>{ if (data.error){ document.getElementById('btc-price').innerHTML='Error loading data'; document.getElementById('btc-info').innerHTML='<p>Unable to fetch market data</p>'; return; } document.getElementById('btc-price').innerHTML='$'+data.price.toLocaleString(); document.getElementById('btc-info').innerHTML=`<p><strong>24h Change:</strong> <span class="${data.change_24h >= 0 ? 'signal-buy' : 'signal-sell'}">${data.change_24h > 0 ? '+' : ''}${data.change_24h.toFixed(2)}%</span></p><p><strong>Volume:</strong> $${data.volume.toLocaleString()}</p>`; document.getElementById('btc-news').innerHTML=data.news||'Real-time Bitcoin data'; const sentimentText=data.sentiment>0?'Positive':data.sentiment<0?'Negative':'Neutral'; const sentimentClass=data.sentiment>0?'signal-buy':data.sentiment<0?'signal-sell':'signal-hold'; document.getElementById('signals').innerHTML=`<p><strong>Sentiment:</strong> <span class="${sentimentClass}">${sentimentText}</span></p><p><strong>Confidence:</strong> ${(data.probability*100).toFixed(1)}%</p><p><strong>Signal:</strong> <span class="${data.signal===1?'signal-buy':data.signal===-1?'signal-sell':'signal-hold'}">${data.signal===1?'BUY':data.signal===-1?'SELL':'HOLD'}</span></p>`; }).catch(()=>{ document.getElementById('btc-price').innerHTML='Error loading data'; document.getElementById('btc-info').innerHTML='<p>Unable to fetch market data</p>'; }); }
+            function loadBTCData(){ fetch('/btc_data_public').then(r=>r.json()).then(data=>{ 
+                // Handle graceful degradation
+                if (data.status === 'degraded') {
+                    document.getElementById('btc-price').innerHTML = data.price ? '$'+data.price.toLocaleString() : 'Data unavailable';
+                    document.getElementById('btc-info').innerHTML = `<p><strong>Status:</strong> <span class="signal-hold">Degraded</span></p><p><strong>Last Update:</strong> ${data.last_update}</p>${data.message ? '<p><strong>Message:</strong> '+data.message+'</p>' : ''}`;
+                    document.getElementById('btc-news').innerHTML = 'Real-time Bitcoin data (degraded mode)';
+                    document.getElementById('signals').innerHTML = '<p><strong>Sentiment:</strong> <span class="signal-hold">Unavailable</span></p><p><strong>Signal:</strong> <span class="signal-hold">HOLD</span></p>';
+                    return;
+                }
+                
+                // Handle normal response
+                if (data.status === 'ok') {
+                    document.getElementById('btc-price').innerHTML = '$'+data.price.toLocaleString();
+                    document.getElementById('btc-info').innerHTML = `<p><strong>24h Change:</strong> <span class="${data.change_24h >= 0 ? 'signal-buy' : 'signal-sell'}">${data.change_24h > 0 ? '+' : ''}${data.change_24h.toFixed(2)}%</span></p><p><strong>Volume:</strong> $${data.volume_24h.toLocaleString()}</p><p><strong>Last Update:</strong> ${data.last_update}</p>`;
+                    document.getElementById('btc-news').innerHTML = 'Real-time Bitcoin data';
+                    document.getElementById('signals').innerHTML = '<p><strong>Sentiment:</strong> <span class="signal-hold">Loading...</span></p><p><strong>Signal:</strong> <span class="signal-hold">HOLD</span></p>';
+                } else {
+                    // Fallback for unexpected response format
+                    document.getElementById('btc-price').innerHTML = 'Data unavailable';
+                    document.getElementById('btc-info').innerHTML = '<p>Unable to fetch market data</p>';
+                    document.getElementById('btc-news').innerHTML = 'Real-time Bitcoin data';
+                    document.getElementById('signals').innerHTML = '<p><strong>Sentiment:</strong> <span class="signal-hold">Unavailable</span></p><p><strong>Signal:</strong> <span class="signal-hold">HOLD</span></p>';
+                }
+            }).catch(()=>{ 
+                document.getElementById('btc-price').innerHTML='Error loading data'; 
+                document.getElementById('btc-info').innerHTML='<p>Unable to fetch market data</p>'; 
+            }); }
             
             async function refreshAll(){ await loadPnlHeader(); await loadPnl(); await loadEquityCharts(); }
             setInterval(refreshAll, 60000);
@@ -852,8 +889,8 @@ async def dashboard():
     """
 
 @app.get("/btc_data_public")
-async def get_btc_data_public():
-    """Get basic Bitcoin market data (public endpoint)"""
+def btc_data_public() -> PublicBTC:
+    """Get basic Bitcoin market data with graceful degradation (public endpoint)"""
     try:
         # Get market data
         market_data = get_btc_market_data()
@@ -868,27 +905,42 @@ async def get_btc_data_public():
             volume = 1000000.0
             change_24h = 2.5
         
-        # Get news and sentiment
-        news_text = get_btc_news()
-        sentiment, probability = analyze_btc_sentiment(news_text)
+        # Update last good snapshot
+        _LAST_SNAPSHOT.update({
+            "price": price,
+            "change": change_24h,
+            "volume": volume,
+            "ts": datetime.now(timezone.utc).isoformat()
+        })
         
-        # Generate trading signal
-        signal = generate_trading_signal(price, sentiment, volume, change_24h)
-        
-        return BTCTradingData(
-            symbol="BTC",
+        return PublicBTC(
+            status="ok",
             price=price,
-            time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            news=news_text[:200] + "..." if len(news_text) > 200 else news_text,
-            sentiment=sentiment,
-            probability=probability,
-            signal=signal,
-            volume=volume,
-            change_24h=change_24h
+            change_24h=change_24h,
+            volume_24h=volume,
+            last_update=_LAST_SNAPSHOT["ts"]
         )
     except Exception as e:
-        logger.error(f"Error getting BTC data: {e}")
-        return {"error": "Unable to fetch market data"}
+        # Degrade gracefully but don't 500
+        logger.warning(f"BTC data fetch failed, using fallback: {e}")
+        if _LAST_SNAPSHOT["price"] is not None:
+            return PublicBTC(
+                status="degraded",
+                price=_LAST_SNAPSHOT["price"],
+                change_24h=_LAST_SNAPSHOT["change"],
+                volume_24h=_LAST_SNAPSHOT["volume"],
+                last_update=_LAST_SNAPSHOT["ts"],
+                message=f"fallback: {type(e).__name__}"
+            )
+        # Absolutely last resort
+        return PublicBTC(
+            status="degraded",
+            price=None,
+            change_24h=None,
+            volume_24h=None,
+            last_update=datetime.now(timezone.utc).isoformat(),
+            message="no data"
+        )
 
 @app.get("/btc_data")
 async def get_btc_data(token: str = None):
@@ -904,7 +956,7 @@ async def get_btc_data(token: str = None):
         raise HTTPException(status_code=401, detail="Authentication required")
     
     try:
-        # Get market data
+        # Get market data with graceful degradation
         market_data = get_btc_market_data()
         
         if market_data:
@@ -917,12 +969,30 @@ async def get_btc_data(token: str = None):
             volume = 1000000.0
             change_24h = 2.5
         
-        # Get news and sentiment
-        news_text = get_btc_news()
-        sentiment, probability = analyze_btc_sentiment(news_text)
+        # Update last good snapshot
+        _LAST_SNAPSHOT.update({
+            "price": price,
+            "change": change_24h,
+            "volume": volume,
+            "ts": datetime.now(timezone.utc).isoformat()
+        })
         
-        # Generate trading signal
-        signal = generate_trading_signal(price, sentiment, volume, change_24h)
+        # Get news and sentiment (with graceful degradation)
+        try:
+            news_text = get_btc_news()
+            sentiment, probability = analyze_btc_sentiment(news_text)
+        except Exception as e:
+            logger.warning(f"News/sentiment analysis failed: {e}")
+            news_text = "Real-time Bitcoin data"
+            sentiment = 0
+            probability = 0.5
+        
+        # Generate trading signal (with graceful degradation)
+        try:
+            signal = generate_trading_signal(price, sentiment, volume, change_24h)
+        except Exception as e:
+            logger.warning(f"Trading signal generation failed: {e}")
+            signal = 0
         
         return BTCTradingData(
             symbol="BTC",
@@ -938,6 +1008,20 @@ async def get_btc_data(token: str = None):
         
     except Exception as e:
         logger.error(f"Error getting BTC data: {e}")
+        # Use last good snapshot if available
+        if _LAST_SNAPSHOT["price"] is not None:
+            return BTCTradingData(
+                symbol="BTC",
+                price=_LAST_SNAPSHOT["price"],
+                time=_LAST_SNAPSHOT["ts"],
+                news="Real-time Bitcoin data (degraded)",
+                sentiment=0,
+                probability=0.5,
+                signal=0,
+                volume=_LAST_SNAPSHOT["volume"],
+                change_24h=_LAST_SNAPSHOT["change"]
+            )
+        # Absolute fallback
         return BTCTradingData(
             symbol="BTC",
             price=45000.0,
