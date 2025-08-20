@@ -1,0 +1,259 @@
+#!/usr/bin/env python3
+"""
+Lightweight trading ledger and PnL accounting using SQLite.
+
+Tables
+- orders: one row per submitted order (assumes immediate/full fill for market orders)
+- fills: optional granular fills per order (not used by default, but available)
+- positions: rolling average cost and open quantity per symbol
+- equity_curve: optional snapshots of equity over time (for charts)
+
+This module is intentionally dependency-light, relying only on Python's sqlite3.
+"""
+
+import os
+import json
+import sqlite3
+from contextlib import contextmanager
+from datetime import datetime
+from typing import Dict, Optional, Tuple
+
+
+DB_PATH = os.getenv("TRADING_DB_PATH", "/opt/btc-trading/trades.db")
+os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+
+
+@contextmanager
+def _connect():
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    try:
+        yield conn
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def init_db() -> None:
+    """Create tables if they don't exist."""
+    with _connect() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS orders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                exchange_order_id TEXT,
+                symbol TEXT NOT NULL,
+                side TEXT NOT NULL CHECK(side IN ('buy','sell')),
+                qty_btc REAL NOT NULL,
+                notional_usd REAL NOT NULL,
+                price REAL NOT NULL,
+                fee REAL NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'filled',
+                demo_mode INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                metadata TEXT
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS fills (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                order_id INTEGER NOT NULL,
+                qty_btc REAL NOT NULL,
+                price REAL NOT NULL,
+                fee REAL NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(order_id) REFERENCES orders(id)
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS positions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol TEXT NOT NULL UNIQUE,
+                qty_btc REAL NOT NULL DEFAULT 0,
+                avg_cost REAL NOT NULL DEFAULT 0,
+                realized_pnl REAL NOT NULL DEFAULT 0,
+                fees REAL NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS equity_curve (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                equity REAL NOT NULL
+            )
+            """
+        )
+
+
+def _upsert_position(conn: sqlite3.Connection, symbol: str) -> None:
+    cur = conn.cursor()
+    cur.execute("SELECT 1 FROM positions WHERE symbol=?", (symbol,))
+    if cur.fetchone() is None:
+        cur.execute(
+            "INSERT INTO positions(symbol, qty_btc, avg_cost, realized_pnl, fees, updated_at) VALUES(?,?,?,?,?,?)",
+            (symbol, 0.0, 0.0, 0.0, 0.0, datetime.utcnow().isoformat()),
+        )
+
+
+def record_order(symbol: str, side: str, qty_btc: float, notional_usd: float, price: float, demo_mode: bool, exchange_order_id: Optional[str] = None, fee: float = 0.0, metadata: Optional[Dict] = None) -> int:
+    """Persist an order, update position book, and return the order row id.
+
+    The position book uses average-cost accounting:
+    - Buy: new_avg_cost = (old_qty*old_avg_cost + qty*price + fee) / (old_qty + qty)
+    - Sell: realized = (price - avg_cost)*qty - fee; qty decreases; avg_cost unchanged unless qty becomes 0
+    """
+    created_at = datetime.utcnow().isoformat()
+    with _connect() as conn:
+        _upsert_position(conn, symbol)
+
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO orders(exchange_order_id, symbol, side, qty_btc, notional_usd, price, fee, status, demo_mode, created_at, metadata)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                exchange_order_id,
+                symbol,
+                side,
+                float(qty_btc),
+                float(notional_usd),
+                float(price),
+                float(fee),
+                "filled",
+                1 if demo_mode else 0,
+                created_at,
+                json.dumps(metadata or {}),
+            ),
+        )
+        order_id = cur.lastrowid
+
+        # Update position
+        cur.execute("SELECT qty_btc, avg_cost, realized_pnl, fees FROM positions WHERE symbol=?", (symbol,))
+        row = cur.fetchone()
+        qty = float(row[0])
+        avg_cost = float(row[1])
+        realized = float(row[2])
+        fees_accum = float(row[3])
+
+        if side == "buy":
+            new_qty = qty + qty_btc
+            if new_qty <= 0:
+                new_avg_cost = 0.0
+            else:
+                new_avg_cost = (qty * avg_cost + qty_btc * price + fee) / new_qty
+            realized_delta = 0.0
+            qty_after = new_qty
+            avg_cost_after = new_avg_cost
+        else:  # sell
+            qty_to_close = min(qty_btc, qty)
+            realized_delta = (price - avg_cost) * qty_to_close - fee
+            qty_after = max(0.0, qty - qty_btc)
+            avg_cost_after = 0.0 if qty_after == 0 else avg_cost
+
+        cur.execute(
+            """
+            UPDATE positions
+            SET qty_btc=?, avg_cost=?, realized_pnl=realized_pnl+?, fees=fees+?, updated_at=?
+            WHERE symbol=?
+            """,
+            (
+                qty_after,
+                avg_cost_after,
+                realized_delta,
+                fee,
+                datetime.utcnow().isoformat(),
+                symbol,
+            ),
+        )
+
+        return order_id
+
+
+def snapshot_equity(equity_value: float) -> None:
+    with _connect() as conn:
+        conn.execute(
+            "INSERT INTO equity_curve(timestamp, equity) VALUES(?,?)",
+            (datetime.utcnow().isoformat(), float(equity_value)),
+        )
+
+
+def get_positions() -> Dict:
+    with _connect() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT symbol, qty_btc, avg_cost, realized_pnl, fees FROM positions")
+        rows = cur.fetchall()
+        return {
+            r[0]: {
+                "qty_btc": float(r[1]),
+                "avg_cost": float(r[2]),
+                "realized_pnl": float(r[3]),
+                "fees": float(r[4]),
+            }
+            for r in rows
+        }
+
+
+def compute_pnl(current_price: float) -> Dict:
+    """Return realized/unrealized pnl, fees, and open exposure for BTC."""
+    pos = get_positions().get("BTC", {"qty_btc": 0.0, "avg_cost": 0.0, "realized_pnl": 0.0, "fees": 0.0})
+    qty = pos["qty_btc"]
+    avg_cost = pos["avg_cost"]
+    realized = pos["realized_pnl"]
+    fees = pos["fees"]
+    unrealized = (current_price - avg_cost) * qty if qty > 0 else 0.0
+    exposure_usd = qty * current_price
+    return {
+        "symbol": "BTC",
+        "qty_btc": qty,
+        "avg_cost": avg_cost,
+        "realized_pnl": realized,
+        "unrealized_pnl": unrealized,
+        "fees": fees,
+        "exposure_usd": exposure_usd,
+    }
+
+
+def get_hodl_benchmark(current_price: float) -> Tuple[float, float]:
+    """Compute a simple HODL benchmark based on net invested capital.
+
+    Logic: If you had taken the same net USD cash flow (buys minus sells) at the time of
+    the first trade and bought BTC then, held to now, what is it worth?
+    Returns (hodl_value_usd, hodl_pnl_usd).
+    """
+    with _connect() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT created_at, side, notional_usd FROM orders ORDER BY created_at ASC")
+        rows = cur.fetchall()
+        if not rows:
+            return 0.0, 0.0
+
+        first_ts = rows[0][0]
+        # Find an approximate first price from the first order row
+        cur.execute("SELECT price FROM orders WHERE created_at=? LIMIT 1", (first_ts,))
+        r = cur.fetchone()
+        if not r:
+            return 0.0, 0.0
+        first_price = float(r[0])
+
+        # Net invested USD (buys positive, sells negative)
+        net_invested = 0.0
+        for row in rows:
+            side = row[1]
+            notional = float(row[2])
+            net_invested += notional if side == "buy" else -notional
+
+        btc_if_hodl = (net_invested / first_price) if first_price > 0 else 0.0
+        hodl_value = btc_if_hodl * current_price
+        hodl_pnl = hodl_value - net_invested
+        return hodl_value, hodl_pnl
+
+

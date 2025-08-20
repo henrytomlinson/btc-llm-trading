@@ -22,6 +22,21 @@ import json
 from dotenv import load_dotenv
 import time
 
+# Ledger for persistent PnL and orders
+try:
+    from db import (
+        init_db as ledger_init_db,
+        record_order as ledger_record_order,
+        compute_pnl as ledger_compute_pnl,
+        get_hodl_benchmark as ledger_get_hodl_benchmark,
+        snapshot_equity as ledger_snapshot_equity,
+    )
+    ledger_init_db()
+    LEDGER_AVAILABLE = True
+except Exception as _ledger_err:
+    LEDGER_AVAILABLE = False
+    logging.getLogger(__name__).warning(f"Ledger not available: {_ledger_err}")
+
 # Load environment variables from .env file
 load_dotenv()
 
@@ -182,6 +197,19 @@ class BTCTradingData(BaseModel):
     signal: int
     volume: float
     change_24h: float
+
+class PnlSummary(BaseModel):
+    symbol: str
+    equity: float
+    realized_pnl: float
+    unrealized_pnl: float
+    total_fees: float
+    exposure_usd: float
+    exposure_pct: float
+    hodl_value: float
+    hodl_pnl: float
+    qty_btc: float
+    avg_cost: float
 
 def get_btc_news() -> str:
     """Get latest Bitcoin news from News API"""
@@ -500,6 +528,11 @@ async def dashboard():
             </div>
             
             <div class="trading-card">
+                <h3>💹 PnL Summary</h3>
+                <div id="pnl">Login to view PnL</div>
+            </div>
+            
+            <div class="trading-card">
                 <h3>📋 Trade Log</h3>
                 <div class="trade-log" id="trade-log">No trades yet...</div>
             </div>
@@ -514,6 +547,25 @@ async def dashboard():
             function testJS() {
                 console.log('JavaScript is working!');
                 alert('JavaScript is working!');
+            }
+            
+            async function loadPnl() {
+                const container = document.getElementById('pnl');
+                if (!jwtToken) { container.textContent = 'Login to view PnL'; return; }
+                try {
+                    const res = await fetch('/pnl_summary?token=' + encodeURIComponent(jwtToken));
+                    if (!res.ok) { container.textContent = 'PnL unavailable'; return; }
+                    const d = await res.json();
+                    container.innerHTML = `
+                        <p><strong>Equity:</strong> $${d.equity.toLocaleString(undefined,{maximumFractionDigits:2})}</p>
+                        <p><strong>Realized PnL:</strong> $${d.realized_pnl.toLocaleString(undefined,{maximumFractionDigits:2})}</p>
+                        <p><strong>Unrealized PnL:</strong> $${d.unrealized_pnl.toLocaleString(undefined,{maximumFractionDigits:2})}</p>
+                        <p><strong>Total Fees:</strong> $${d.total_fees.toLocaleString(undefined,{maximumFractionDigits:2})}</p>
+                        <p><strong>Exposure:</strong> $${d.exposure_usd.toLocaleString(undefined,{maximumFractionDigits:2})} (${(d.exposure_pct*100).toFixed(1)}%)</p>
+                        <p><strong>HODL Value:</strong> $${d.hodl_value.toLocaleString(undefined,{maximumFractionDigits:2})} (PnL: $${d.hodl_pnl.toLocaleString(undefined,{maximumFractionDigits:2})})</p>
+                        <p><strong>Position:</strong> ${d.qty_btc.toFixed(8)} BTC @ $${d.avg_cost.toLocaleString(undefined,{maximumFractionDigits:2})}</p>
+                    `;
+                } catch (e) { container.textContent = 'PnL error'; }
             }
             
             // Function to handle login and store JWT token
@@ -708,10 +760,11 @@ async def dashboard():
             window.addEventListener('load', function() {
                 console.log('Page loaded, loading BTC data...');
                 loadBTCData();
+                loadPnl();
                 checkLoginStatus();
                 
                 // Auto-refresh every 30 seconds
-                setInterval(loadBTCData, 30000);
+                setInterval(() => { loadBTCData(); loadPnl(); }, 30000);
                 
                 console.log('JavaScript loaded successfully');
             });
@@ -846,6 +899,26 @@ async def buy_btc(amount: float = Form(...), token: str = Form(...)):
         })
         
         if result['status'] == 'success':
+            # Record in ledger (best-effort)
+            try:
+                if LEDGER_AVAILABLE:
+                    qty_btc = float(result.get('quantity', 0.0))
+                    price = float(result.get('price_per_btc', 0.0)) if result.get('price_per_btc') is not None else (qty_btc and amount/qty_btc or 0.0)
+                    fee = float(result.get('fee', 0.0)) if result.get('fee') is not None else 0.0
+                    from db import record_order as _rec
+                    _rec(
+                        symbol="BTC",
+                        side="buy",
+                        qty_btc=qty_btc,
+                        notional_usd=float(amount),
+                        price=price,
+                        demo_mode=bool(result.get('demo_mode', False)),
+                        exchange_order_id=result.get('order_id'),
+                        fee=fee,
+                        metadata=result,
+                    )
+            except Exception as e:
+                logger.warning(f"Ledger write failed (buy): {e}")
             return {"message": f"Bought ${amount:.2f} worth of Bitcoin (via {exchange_name})", "result": result}
         else:
             return {"message": f"Buy order failed: {result.get('reason', 'Unknown error')}", "result": result}
@@ -880,6 +953,26 @@ async def sell_btc(amount: float = Form(...), token: str = Form(...)):
         })
         
         if result['status'] == 'success':
+            # Record in ledger (best-effort)
+            try:
+                if LEDGER_AVAILABLE:
+                    qty_btc = float(result.get('quantity', 0.0))
+                    price = float(result.get('price_per_btc', 0.0)) if result.get('price_per_btc') is not None else (qty_btc and amount/qty_btc or 0.0)
+                    fee = float(result.get('fee', 0.0)) if result.get('fee') is not None else 0.0
+                    from db import record_order as _rec
+                    _rec(
+                        symbol="BTC",
+                        side="sell",
+                        qty_btc=qty_btc,
+                        notional_usd=float(amount),
+                        price=price,
+                        demo_mode=bool(result.get('demo_mode', False)),
+                        exchange_order_id=result.get('order_id'),
+                        fee=fee,
+                        metadata=result,
+                    )
+            except Exception as e:
+                logger.warning(f"Ledger write failed (sell): {e}")
             return {"message": f"Sold ${amount:.2f} worth of Bitcoin (via {exchange_name})", "result": result}
         else:
             return {"message": f"Sell order failed: {result.get('reason', 'Unknown error')}", "result": result}
@@ -1123,6 +1216,25 @@ async def auto_trade(token: str = Form(...)):
                     actual_size = min(requested_size, max_buy_size)
                     logger.info(f"💰 Executing buy: ${actual_size:.2f} (requested: ${requested_size:.2f}, available: ${max_buy_size:.2f})")
                     trade_result = trading_bot.place_buy_order("BTC/USD", actual_size, 1.0)
+                    # Persist trade to ledger (best-effort)
+                    try:
+                        if LEDGER_AVAILABLE and isinstance(trade_result, dict) and trade_result.get('status') == 'success':
+                            qty_btc = float(trade_result.get('quantity', 0.0))
+                            price = float(trade_result.get('price_per_btc', 0.0)) if trade_result.get('price_per_btc') is not None else (qty_btc and actual_size/qty_btc or 0.0)
+                            fee = float(trade_result.get('fee', 0.0)) if trade_result.get('fee') is not None else 0.0
+                            ledger_record_order(
+                                symbol="BTC",
+                                side="buy",
+                                qty_btc=qty_btc,
+                                notional_usd=float(actual_size),
+                                price=price,
+                                demo_mode=bool(trade_result.get('demo_mode', False)),
+                                exchange_order_id=trade_result.get('order_id'),
+                                fee=fee,
+                                metadata=trade_result,
+                            )
+                    except Exception as e:
+                        logger.warning(f"Ledger write failed (auto buy): {e}")
                     
             elif signal['action'] == 'sell':
                 if max_sell_size < 10.0:  # Minimum $10 trade
@@ -1132,6 +1244,25 @@ async def auto_trade(token: str = Form(...)):
                     actual_size = min(requested_size, max_sell_size)
                     logger.info(f"💰 Executing sell: ${actual_size:.2f} (requested: ${requested_size:.2f}, available: ${max_sell_size:.2f})")
                     trade_result = trading_bot.place_sell_order("BTC/USD", actual_size)
+                    # Persist trade to ledger (best-effort)
+                    try:
+                        if LEDGER_AVAILABLE and isinstance(trade_result, dict) and trade_result.get('status') == 'success':
+                            qty_btc = float(trade_result.get('quantity', 0.0))
+                            price = float(trade_result.get('price_per_btc', 0.0)) if trade_result.get('price_per_btc') is not None else (qty_btc and actual_size/qty_btc or 0.0)
+                            fee = float(trade_result.get('fee', 0.0)) if trade_result.get('fee') is not None else 0.0
+                            ledger_record_order(
+                                symbol="BTC",
+                                side="sell",
+                                qty_btc=qty_btc,
+                                notional_usd=float(actual_size),
+                                price=price,
+                                demo_mode=bool(trade_result.get('demo_mode', False)),
+                                exchange_order_id=trade_result.get('order_id'),
+                                fee=fee,
+                                metadata=trade_result,
+                            )
+                    except Exception as e:
+                        logger.warning(f"Ledger write failed (auto sell): {e}")
                     
             logger.info(f"✅ Trade result: {trade_result}")
         else:
@@ -1144,6 +1275,16 @@ async def auto_trade(token: str = Form(...)):
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "trade_result": trade_result
         })
+
+        # Snapshot equity (best-effort)
+        try:
+            if LEDGER_AVAILABLE:
+                acct = trading_bot.get_account_info() if trading_bot else None
+                equity_val = float(acct.get('equity', 0.0)) if isinstance(acct, Dict) or isinstance(acct, dict) else 0.0
+                if equity_val:
+                    ledger_snapshot_equity(equity_val)
+        except Exception as e:
+            logger.warning(f"Equity snapshot failed: {e}")
 
         logger.info("🤖 Auto trade analysis completed successfully")
         return {
@@ -1283,6 +1424,16 @@ async def auto_trade_scheduled():
             "trade_result": trade_result
         })
 
+        # Snapshot equity (best-effort)
+        try:
+            if LEDGER_AVAILABLE:
+                acct = trading_bot.get_account_info() if trading_bot else None
+                equity_val = float(acct.get('equity', 0.0)) if isinstance(acct, Dict) or isinstance(acct, dict) else 0.0
+                if equity_val:
+                    ledger_snapshot_equity(equity_val)
+        except Exception as e:
+            logger.warning(f"Equity snapshot failed: {e}")
+
         logger.info("🤖 Scheduled auto trade analysis completed successfully")
         return {
             "status": "success",
@@ -1398,6 +1549,53 @@ async def get_trading_summary(token: str = None):
     except Exception as e:
         logger.error(f"Error getting trading summary: {e}")
         return {"message": f"Error getting trading summary: {str(e)}", "summary": None}
+
+@app.get("/pnl_summary")
+async def pnl_summary(token: str = None):
+    """Return realized/unrealized PnL, fees, exposure, equity, and HODL benchmark."""
+    if not token:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    try:
+        _ = verify_jwt_token(token)
+    except:
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    if not LEDGER_AVAILABLE:
+        return {"message": "Ledger not configured"}
+
+    market = get_btc_market_data() or {}
+    current_price = float(market.get('close', 45000.0))
+
+    pnl = ledger_compute_pnl(current_price)
+
+    # Determine equity from broker if available; otherwise approximate
+    equity = 0.0
+    try:
+        acct = trading_bot.get_account_info() if trading_bot else None
+        if isinstance(acct, dict) and acct.get('equity') is not None:
+            equity = float(acct.get('equity', 0.0))
+        else:
+            cash_usd = float(acct.get('cash', 0.0)) if isinstance(acct, dict) else 0.0
+            equity = cash_usd + pnl['exposure_usd']
+    except Exception:
+        equity = pnl['exposure_usd']
+
+    hodl_value, hodl_pnl = ledger_get_hodl_benchmark(current_price)
+    exposure_pct = (pnl['exposure_usd'] / equity) if equity > 0 else 0.0
+
+    return PnlSummary(
+        symbol=pnl['symbol'],
+        equity=equity,
+        realized_pnl=pnl['realized_pnl'],
+        unrealized_pnl=pnl['unrealized_pnl'],
+        total_fees=pnl['fees'],
+        exposure_usd=pnl['exposure_usd'],
+        exposure_pct=exposure_pct,
+        hodl_value=hodl_value,
+        hodl_pnl=hodl_pnl,
+        qty_btc=pnl['qty_btc'],
+        avg_cost=pnl['avg_cost']
+    )
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000) 
