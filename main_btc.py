@@ -13,7 +13,7 @@ import jwt
 import secrets
 from fastapi import FastAPI, HTTPException, Form, Depends, Request, Body
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
-from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 import uvicorn
@@ -1720,6 +1720,49 @@ async def snapshot_equity_endpoint(token: str = Form(...)):
         return {"status": "ok", "equity": eq}
     except Exception as e:
         return {"status": "error", "message": str(e)}
+
+# Prometheus metrics
+from prometheus_client import CollectorRegistry, Counter, Gauge, generate_latest, CONTENT_TYPE_LATEST
+
+metrics_registry = CollectorRegistry()
+metric_equity = Gauge('btc_equity_usd', 'Total equity in USD', registry=metrics_registry)
+metric_realized = Gauge('btc_realized_pnl_usd', 'Realized PnL USD', registry=metrics_registry)
+metric_unrealized = Gauge('btc_unrealized_pnl_usd', 'Unrealized PnL USD', registry=metrics_registry)
+metric_exposure = Gauge('btc_exposure_pct', 'Exposure percentage (0-1)', registry=metrics_registry)
+metric_last_trade_ts = Gauge('btc_last_trade_timestamp', 'Unix timestamp of last trade', registry=metrics_registry)
+metric_errors = Counter('btc_errors_total', 'Error count', registry=metrics_registry)
+
+# Simple file lock for scheduled task
+import fcntl
+from contextlib import contextmanager
+
+@contextmanager
+def exclusive_lock(lock_path: str):
+    os.makedirs(os.path.dirname(lock_path) or '.', exist_ok=True)
+    with open(lock_path, 'w') as lock_file:
+        try:
+            fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            yield
+        finally:
+            try:
+                fcntl.flock(lock_file, fcntl.LOCK_UN)
+            except Exception:
+                pass
+
+@app.get('/metrics')
+async def metrics():
+    try:
+        # Refresh metrics from current PnL snapshot if possible
+        if LEDGER_AVAILABLE and trading_bot:
+            try:
+                acct = trading_bot.get_account_info()
+                equity_val = float(acct.get('equity', 0.0)) if isinstance(acct, dict) else 0.0
+                metric_equity.set(equity_val)
+            except Exception:
+                pass
+        return PlainTextResponse(generate_latest(metrics_registry), media_type=CONTENT_TYPE_LATEST)
+    except Exception:
+        return PlainTextResponse(generate_latest(metrics_registry), media_type=CONTENT_TYPE_LATEST)
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000) 

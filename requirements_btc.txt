@@ -8,6 +8,7 @@ requests>=2.31.0
 alpaca-py>=0.13.0
 pydantic>=2.5.0
 python-dotenv>=1.0.0
+prometheus-client>=0.20.0
 
 # Technical Analysis and ML
 ta>=0.10.2
