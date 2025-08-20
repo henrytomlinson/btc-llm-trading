@@ -680,6 +680,52 @@ async def dashboard():
             let jwtToken = localStorage.getItem('jwt_token');
             let equityChart, pnlChart;
 
+            // Fallback simple canvas line/bar drawing if Chart.js not present
+            function drawLineFallback(canvasId, values, color){
+                const canvas = document.getElementById(canvasId);
+                if (!canvas || !canvas.getContext) return;
+                const ctx = canvas.getContext('2d');
+                const w = canvas.width = canvas.clientWidth || 800;
+                const h = canvas.height = canvas.clientHeight || 200;
+                ctx.clearRect(0,0,w,h);
+                if (!values || values.length === 0) return;
+                const minV = Math.min(...values);
+                const maxV = Math.max(...values);
+                const pad = 10;
+                const scale = (v)=>{
+                    if (maxV===minV) return h/2;
+                    return h - pad - ( (v-minV) / (maxV-minV) ) * (h-2*pad);
+                };
+                const step = (w-2*pad)/Math.max(values.length-1,1);
+                ctx.strokeStyle = color || '#17a2b8';
+                ctx.lineWidth = 2;
+                ctx.beginPath();
+                ctx.moveTo(pad, scale(values[0]));
+                for (let i=1;i<values.length;i++) ctx.lineTo(pad+i*step, scale(values[i]));
+                ctx.stroke();
+            }
+            function drawBarFallback(canvasId, values, color){
+                const canvas = document.getElementById(canvasId);
+                if (!canvas || !canvas.getContext) return;
+                const ctx = canvas.getContext('2d');
+                const w = canvas.width = canvas.clientWidth || 800;
+                const h = canvas.height = canvas.clientHeight || 200;
+                ctx.clearRect(0,0,w,h);
+                if (!values || values.length === 0) return;
+                const minV = Math.min(...values);
+                const maxV = Math.max(...values);
+                const pad = 10;
+                const step = (w-2*pad)/Math.max(values.length,1);
+                for (let i=0;i<values.length;i++){
+                    const v = values[i];
+                    const norm = (v - Math.min(0,minV)) / (Math.max(0,maxV) - Math.min(0,minV) || 1);
+                    const barH = norm * (h-2*pad);
+                    const y0 = h - pad - (v>=0? barH : ( (0 - minV) / ((maxV - minV)||1) )*(h-2*pad) );
+                    ctx.fillStyle = (v>=0 ? (color||'#4caf50') : '#dc3545');
+                    ctx.fillRect(pad + i*step, y0, Math.max(1, step*0.8), Math.abs(barH));
+                }
+            }
+
             function setAuthUi(loggedIn, username){
                 const loginBtn = document.getElementById('login-btn');
                 const logoutBtn = document.getElementById('logout-btn');
@@ -746,12 +792,20 @@ async def dashboard():
                 const labels = (js.equity_curve||[]).map(p => p.timestamp);
                 const equity = (js.equity_curve||[]).map(p => p.equity);
                 const hodl = (js.hodl_curve||[]).map(p => p.hodl_value);
-                const ctx = document.getElementById('equityChart') && document.getElementById('equityChart').getContext ? document.getElementById('equityChart').getContext('2d') : null;
-                if (ctx){ if (equityChart) equityChart.destroy(); equityChart = new Chart(ctx, { type: 'line', data: { labels, datasets:[ {label:'Equity', data: equity, borderColor:'#17a2b8', fill:false}, {label:'HODL', data: hodl, borderColor:'#6c757d', fill:false} ]}, options: { responsive: true, maintainAspectRatio: false } }); }
+                const hasChart = (typeof Chart !== 'undefined');
+                if (hasChart){
+                    const ctx = document.getElementById('equityChart')?.getContext?.('2d');
+                    if (ctx){ if (equityChart) equityChart.destroy(); equityChart = new Chart(ctx, { type: 'line', data: { labels, datasets:[ {label:'Equity', data: equity, borderColor:'#17a2b8', fill:false}, {label:'HODL', data: hodl, borderColor:'#6c757d', fill:false} ]}, options: { responsive: true, maintainAspectRatio: false } }); }
+                } else {
+                    drawLineFallback('equityChart', equity, '#17a2b8');
+                }
                 const pnl = []; for (let i=1;i<equity.length;i++){ pnl.push(equity[i]-equity[i-1]); }
-                const pnlLabels = labels.slice(1);
-                const ctx2 = document.getElementById('pnlChart') && document.getElementById('pnlChart').getContext ? document.getElementById('pnlChart').getContext('2d') : null;
-                if (ctx2){ if (pnlChart) pnlChart.destroy(); pnlChart = new Chart(ctx2, { type: 'bar', data: { labels: pnlLabels, datasets:[{label:'PnL (per bar)', data: pnl, backgroundColor:'#f7931a'}]}, options: { responsive: true, maintainAspectRatio: false } }); }
+                if (hasChart){
+                    const ctx2 = document.getElementById('pnlChart')?.getContext?.('2d');
+                    if (ctx2){ if (pnlChart) pnlChart.destroy(); pnlChart = new Chart(ctx2, { type: 'bar', data: { labels: labels.slice(1), datasets:[{label:'PnL (per bar)', data: pnl, backgroundColor:'#f7931a'}]}, options: { responsive: true, maintainAspectRatio: false } }); }
+                } else {
+                    drawBarFallback('pnlChart', pnl, '#f7931a');
+                }
             }
 
             async function loadPnl() {
