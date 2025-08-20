@@ -41,6 +41,10 @@ class KrakenTradingBot:
         self.btc_symbol = "XXBTZUSD"  # Bitcoin/USD pair on Kraken
         self.btc_gbp_symbol = "XXBTZGBP"  # Bitcoin/GBP pair on Kraken
         self.min_trade_amount = 10.0  # Minimum trade amount in USD
+        # Allocation logic parameters
+        self.rebalance_threshold_pct = float(os.getenv('REALLOC_THRESHOLD_PCT', '0.05'))  # 5%
+        self.trade_cooldown_hours = float(os.getenv('TRADE_COOLDOWN_HOURS', '3'))
+        self._last_trade_ts = 0.0
         
         # Check if credentials are available
         if not self.api_key or not self.secret_key:
@@ -269,6 +273,59 @@ class KrakenTradingBot:
         except Exception as e:
             logger.error(f"Error calculating position size: {e}")
             return 0.0
+
+    def get_current_exposure(self) -> Dict:
+        """Return current BTC exposure as fraction of equity in [0,1]."""
+        acct = self.get_account_info()
+        if isinstance(acct, dict) and 'equity' in acct:
+            equity = float(acct.get('equity') or 0.0)
+            mkt = self.get_market_data() or {}
+            price = float(mkt.get('close', 0.0) or 0.0)
+            balances = acct.get('balances', {}) or {}
+            btc_qty = float(balances.get('XXBT', '0') or 0.0)
+            exposure_usd = btc_qty * price
+            exposure_frac = (exposure_usd / equity) if equity > 0 else 0.0
+            return {"equity": equity, "btc_qty": btc_qty, "price": price, "exposure_frac": exposure_frac}
+        return {"equity": 0.0, "btc_qty": 0.0, "price": 0.0, "exposure_frac": 0.0}
+
+    def rebalance_to_target(self, target_exposure: float) -> Dict:
+        """Rebalance holdings to reach target exposure in [0,1].
+
+        - Applies a 5% (configurable) threshold on equity to skip small changes
+        - Enforces cooldown to avoid frequent trading
+        - Does not short: target < 0 means move towards cash
+        """
+        now = time.time()
+        if self._last_trade_ts and (now - self._last_trade_ts) < self.trade_cooldown_hours * 3600:
+            return {"status": "skipped", "reason": f"Cooldown active ({self.trade_cooldown_hours}h)"}
+
+        # Clamp to [0,1] for long-only spot
+        target_long = max(0.0, min(1.0, float(target_exposure)))
+        state = self.get_current_exposure()
+        equity = state["equity"]
+        price = state["price"]
+        current = state["exposure_frac"]
+        delta = target_long - current
+
+        threshold = self.rebalance_threshold_pct
+        if abs(delta) < threshold:
+            return {"status": "skipped", "reason": f"Delta {delta:.3f} < threshold {threshold:.3f}", "current": current, "target": target_long}
+
+        dollar_delta = abs(delta) * equity
+        if dollar_delta < self.min_trade_amount:
+            return {"status": "skipped", "reason": f"Notional ${dollar_delta:.2f} below min ${self.min_trade_amount:.2f}"}
+
+        # Decide buy or sell based on delta sign
+        if delta > 0:
+            # Need to buy BTC worth dollar_delta
+            result = self.place_buy_order("BTC/USD", dollar_delta)
+        else:
+            # Need to sell BTC worth dollar_delta
+            result = self.place_sell_order("BTC/USD", dollar_delta)
+
+        if isinstance(result, dict) and result.get('status') == 'success':
+            self._last_trade_ts = now
+        return {"status": "executed" if result.get('status') == 'success' else 'error', "order": result, "current": current, "target": target_long, "delta": delta}
     
     def place_buy_order(self, symbol: str, dollar_amount: float, signal_strength: float = 1.0) -> Dict:
         """Place a Bitcoin spot buy order"""

@@ -40,6 +40,7 @@ class LLMTradingStrategy:
         # Trading parameters
         self.min_confidence = 0.7  # Minimum confidence for trades
         self.max_risk_level = "medium"  # Maximum risk level to accept
+        self.max_exposure = float(os.getenv('MAX_EXPOSURE', '0.8'))  # cap allocation at 80% of equity
         self.position_size_multiplier = {
             "low": 1.0,
             "medium": 0.7,
@@ -366,12 +367,14 @@ Remember: Return ONLY the JSON object, nothing else.
             
             # Determine if trade should be executed
             should_trade, reason = self.should_execute_trade(analysis)
-            
-            # Calculate position size if trade should be executed
-            position_size = None
-            if should_trade and analysis.recommended_action in ["buy", "sell"]:
-                base_amount = 1000.0  # Base $1000 position
-                position_size = self.get_position_size(analysis, base_amount)
+
+            # Map to target allocation in [-max_exposure, +max_exposure]
+            # Negative values indicate desire to reduce to cash; we do not short.
+            target_exposure = 0.0
+            if analysis.recommended_action in ["buy", "sell"]:
+                conf = max(0.0, min(1.0, float(analysis.confidence)))
+                sign = 1.0 if analysis.recommended_action == "buy" else -1.0
+                target_exposure = self.max_exposure * conf * sign
             
             return {
                 "should_trade": should_trade,
@@ -380,7 +383,10 @@ Remember: Return ONLY the JSON object, nothing else.
                 "sentiment": analysis.sentiment,
                 "confidence": analysis.confidence,
                 "risk_level": analysis.risk_level,
-                "position_size": position_size,
+                # For legacy callers; not used by target allocation path
+                "position_size": None,
+                # New: target exposure [-max_exposure, +max_exposure]
+                "target_exposure": target_exposure,
                 "price_target": analysis.price_target,
                 "stop_loss": analysis.stop_loss,
                 "analysis": analysis.reasoning,

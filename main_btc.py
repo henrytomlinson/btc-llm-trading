@@ -1200,9 +1200,16 @@ async def auto_trade(token: str = Form(...)):
             logger.info(f"💵 Available funds: £{gbp_balance:.2f} + ${usd_balance:.2f} = ${available_funds:.2f}")
             logger.info(f"₿ BTC balance: {btc_balance:.8f}")
         
-        # Execute trade if recommended and funds available
+        # Execute allocation change via target exposure if provided
         trade_result = None
-        if signal['should_trade'] and signal['position_size']:
+        if signal.get('target_exposure') is not None:
+            try:
+                target = float(signal.get('target_exposure'))
+                trade_result = trading_bot.rebalance_to_target(target)
+            except Exception as e:
+                logger.warning(f"Rebalance failed: {e}")
+                trade_result = {"status": "error", "reason": str(e)}
+        elif signal['should_trade'] and signal['position_size']:
             # Adjust position size based on available funds
             requested_size = signal['position_size']
             max_buy_size = available_funds * 0.95  # Use 95% of available funds
@@ -1386,9 +1393,16 @@ async def auto_trade_scheduled():
             logger.info(f"💵 Available funds: £{gbp_balance:.2f} + ${usd_balance:.2f} = ${available_funds:.2f}")
             logger.info(f"₿ BTC balance: {btc_balance:.8f}")
         
-        # Execute trade if recommended and funds available
+        # Execute allocation change via target exposure if provided
         trade_result = None
-        if signal['should_trade'] and signal['position_size']:
+        if signal.get('target_exposure') is not None:
+            try:
+                target = float(signal.get('target_exposure'))
+                trade_result = trading_bot.rebalance_to_target(target)
+            except Exception as e:
+                logger.warning(f"Rebalance failed: {e}")
+                trade_result = {"status": "error", "reason": str(e)}
+        elif signal['should_trade'] and signal['position_size']:
             # Adjust position size based on available funds
             requested_size = signal['position_size']
             max_buy_size = available_funds * 0.95  # Use 95% of available funds
