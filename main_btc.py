@@ -561,7 +561,6 @@ async def dashboard():
     <html>
     <head>
         <title>Bitcoin LLM Trading System</title>
-        <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
         <style>
             body { font-family: Arial, sans-serif; margin: 20px; background: #f5f5f5; }
             .container { max-width: 1200px; margin: 0 auto; }

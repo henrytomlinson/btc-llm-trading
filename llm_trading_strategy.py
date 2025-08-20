@@ -12,7 +12,8 @@ import re
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple, Literal
 from dataclasses import dataclass
-from pydantic import BaseModel, Field, validator, root_validator
+from pydantic import BaseModel, Field, validator
+from pydantic import model_validator
 from strategy_core import decide_target_allocation
 
 logger = logging.getLogger(__name__)
@@ -39,18 +40,16 @@ class LLMResponseSchema(BaseModel):
             raise ValueError('Price values must be positive')
         return v
     
-    @root_validator
-    def validate_action_consistency(cls, values):
-        sentiment = values.get('sentiment')
-        action = values.get('recommended_action')
-        
-        # Validate sentiment-action consistency
-        if sentiment == "bullish" and action == "sell":
+    @model_validator(mode="after")
+    def validate_action_consistency(self):
+        # If previous validations failed, skip
+        if not getattr(self, 'sentiment', None) or not getattr(self, 'recommended_action', None):
+            return self
+        if self.sentiment == "bullish" and self.recommended_action == "sell":
             raise ValueError("Bullish sentiment inconsistent with sell action")
-        if sentiment == "bearish" and action == "buy":
+        if self.sentiment == "bearish" and self.recommended_action == "buy":
             raise ValueError("Bearish sentiment inconsistent with buy action")
-        
-        return values
+        return self
 
 @dataclass
 class MarketAnalysis:
