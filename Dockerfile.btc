@@ -23,6 +23,7 @@ COPY risk_management.py .
 COPY enhanced_trading_system.py .
 COPY start_trading_system.py .
 COPY db.py .
+COPY strategy_core.py .
 
 # Create non-root user and writable data dir for SQLite
 RUN useradd -m -u 1000 appuser \

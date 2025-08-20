@@ -1411,6 +1411,22 @@ async def auto_trade_scheduled(token: str = Form(...)):
         logger.warning("Invalid token for scheduled auto trade")
         raise HTTPException(status_code=401, detail="Authentication required")
 
+    # Use file lock to ensure only one instance runs at a time
+    lock_path = "/data/auto_trade.lock"
+    try:
+        with exclusive_lock(lock_path):
+            logger.info("🔒 Acquired exclusive lock for scheduled auto trade")
+            return await _execute_auto_trade_scheduled()
+    except BlockingIOError:
+        logger.warning("⏸️ Another auto trade instance is already running")
+        return {"status": "skipped", "message": "Another auto trade instance is already running"}
+    except Exception as e:
+        logger.error(f"❌ Lock acquisition failed: {e}")
+        return {"status": "error", "message": f"Lock acquisition failed: {str(e)}"}
+
+async def _execute_auto_trade_scheduled():
+    """Internal function to execute the scheduled auto trade logic"""
+
     try:
         logger.info("🤖 Starting scheduled LLM market analysis...")
         
