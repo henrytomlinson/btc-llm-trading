@@ -16,7 +16,7 @@ import json
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, List
 
 
 DB_PATH = os.getenv("TRADING_DB_PATH", "/opt/btc-trading/trades.db")
@@ -200,6 +200,67 @@ def snapshot_equity(equity_value: float) -> None:
         )
 
 
+def get_equity_curve(limit: int = 1000) -> List[Dict]:
+    """Return the most recent equity snapshots (timestamp, equity)."""
+    with _connect() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT timestamp, equity FROM equity_curve ORDER BY id DESC LIMIT ?",
+            (int(limit),),
+        )
+        rows = cur.fetchall()
+        # Return in chronological order
+        rows = list(reversed(rows))
+        return [{"timestamp": r[0], "equity": float(r[1])} for r in rows]
+
+
+def get_hodl_curve(limit: int = 1000) -> List[Dict]:
+    """Return HODL benchmark series aligned to equity snapshots.
+
+    Assumes buying the cumulative net invested USD at the first trade's price and holding.
+    For each equity snapshot timestamp, compute net invested up to that timestamp.
+    """
+    with _connect() as conn:
+        cur = conn.cursor()
+        # Get first price
+        cur.execute("SELECT created_at, price FROM orders ORDER BY created_at ASC LIMIT 1")
+        first = cur.fetchone()
+        if not first:
+            return []
+        first_price = float(first[1]) or 0.0
+        if first_price <= 0:
+            return []
+        # Get equity snapshots (chronological)
+        cur.execute("SELECT timestamp FROM equity_curve ORDER BY id DESC LIMIT ?", (int(limit),))
+        snaps = [r[0] for r in reversed(cur.fetchall())]
+        if not snaps:
+            return []
+        res = []
+        net_invested = 0.0
+        order_idx = 0
+        # Load all orders ordered by created_at
+        cur.execute("SELECT created_at, side, notional_usd FROM orders ORDER BY created_at ASC")
+        orders = cur.fetchall()
+        for ts in snaps:
+            # accumulate orders up to timestamp ts
+            while order_idx < len(orders) and orders[order_idx][0] <= ts:
+                side = orders[order_idx][1]
+                notional = float(orders[order_idx][2])
+                net_invested += notional if side == "buy" else -notional
+                order_idx += 1
+            btc_hodl = (net_invested / first_price) if first_price > 0 else 0.0
+            value = btc_hodl * get_last_price(conn, default=first_price)
+            res.append({"timestamp": ts, "hodl_value": float(value)})
+        return res
+
+
+def get_last_price(conn: sqlite3.Connection, default: float = 0.0) -> float:
+    cur = conn.cursor()
+    cur.execute("SELECT price FROM orders ORDER BY id DESC LIMIT 1")
+    r = cur.fetchone()
+    return float(r[0]) if r else float(default)
+
+
 def get_positions() -> Dict:
     with _connect() as conn:
         cur = conn.cursor()
@@ -266,7 +327,7 @@ def get_hodl_benchmark(current_price: float) -> Tuple[float, float]:
             net_invested += notional if side == "buy" else -notional
 
         btc_if_hodl = (net_invested / first_price) if first_price > 0 else 0.0
-        hodl_value = btc_if_hodl * current_price
+        hodl_value = btc_if_hodl * get_last_price(conn, default=first_price)
         hodl_pnl = hodl_value - net_invested
         return hodl_value, hodl_pnl
 

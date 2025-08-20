@@ -30,6 +30,8 @@ try:
         compute_pnl as ledger_compute_pnl,
         get_hodl_benchmark as ledger_get_hodl_benchmark,
         snapshot_equity as ledger_snapshot_equity,
+        get_equity_curve as ledger_get_equity_curve,
+        get_hodl_curve as ledger_get_hodl_curve,
     )
     ledger_init_db()
     LEDGER_AVAILABLE = True
@@ -449,6 +451,99 @@ def get_current_user(token: str = None):
         raise HTTPException(status_code=401, detail="Authentication required")
     return verify_jwt_token(token)
 
+# Runtime settings and toggles
+AUTO_TRADE_ENABLED = True
+RUNTIME_SETTINGS = {
+    "min_confidence": float(os.getenv("MIN_CONFIDENCE", "0.7")),
+    "max_exposure": float(os.getenv("MAX_EXPOSURE", "0.8")),
+    "trade_cooldown_hours": float(os.getenv("TRADE_COOLDOWN_HOURS", "3")),
+}
+
+# After strategy and bot are initialized, sync runtime settings
+try:
+    if llm_strategy:
+        llm_strategy.min_confidence = RUNTIME_SETTINGS["min_confidence"]
+        llm_strategy.max_exposure = RUNTIME_SETTINGS["max_exposure"]
+    if trading_bot:
+        trading_bot.trade_cooldown_hours = RUNTIME_SETTINGS["trade_cooldown_hours"]
+except Exception:
+    pass
+
+@app.get("/settings")
+async def get_settings(token: str = None):
+    if not token:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    try:
+        verify_jwt_token(token)
+    except Exception:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    return {
+        "auto_trade_enabled": AUTO_TRADE_ENABLED,
+        "min_confidence": RUNTIME_SETTINGS["min_confidence"],
+        "max_exposure": RUNTIME_SETTINGS["max_exposure"],
+        "trade_cooldown_hours": RUNTIME_SETTINGS["trade_cooldown_hours"],
+    }
+
+@app.post("/settings")
+async def update_settings(
+    token: str = Form(...),
+    auto_trade_enabled: Optional[bool] = Form(None),
+    min_confidence: Optional[float] = Form(None),
+    max_exposure: Optional[float] = Form(None),
+    trade_cooldown_hours: Optional[float] = Form(None),
+):
+    global AUTO_TRADE_ENABLED
+    if not token:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    try:
+        verify_jwt_token(token)
+    except Exception:
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    if auto_trade_enabled is not None:
+        AUTO_TRADE_ENABLED = bool(str(auto_trade_enabled).lower() in ("true", "1", "on", "yes"))
+    if min_confidence is not None:
+        RUNTIME_SETTINGS["min_confidence"] = float(min_confidence)
+        try:
+            if llm_strategy:
+                llm_strategy.min_confidence = float(min_confidence)
+        except Exception:
+            pass
+    if max_exposure is not None:
+        RUNTIME_SETTINGS["max_exposure"] = float(max_exposure)
+        try:
+            if llm_strategy:
+                llm_strategy.max_exposure = float(max_exposure)
+        except Exception:
+            pass
+    if trade_cooldown_hours is not None:
+        RUNTIME_SETTINGS["trade_cooldown_hours"] = float(trade_cooldown_hours)
+        try:
+            if trading_bot:
+                trading_bot.trade_cooldown_hours = float(trade_cooldown_hours)
+        except Exception:
+            pass
+
+    return {"status": "ok", "settings": {
+        "auto_trade_enabled": AUTO_TRADE_ENABLED,
+        **RUNTIME_SETTINGS,
+    }}
+
+@app.get("/equity_series")
+async def equity_series(token: str = None, limit: int = 500):
+    if not token:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    try:
+        verify_jwt_token(token)
+    except Exception:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    try:
+        eq = ledger_get_equity_curve(limit=limit)
+        hodl = ledger_get_hodl_curve(limit=limit)
+        return {"equity_curve": eq, "hodl_curve": hodl}
+    except Exception as e:
+        return {"equity_curve": [], "hodl_curve": [], "error": str(e)}
+
 @app.get("/", response_class=HTMLResponse)
 async def dashboard():
     """Main Bitcoin trading dashboard"""
@@ -457,17 +552,20 @@ async def dashboard():
     <html>
     <head>
         <title>Bitcoin LLM Trading System</title>
+        <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
         <style>
             body { font-family: Arial, sans-serif; margin: 20px; background: #f5f5f5; }
             .container { max-width: 1200px; margin: 0 auto; }
             .header { background: #1a1a1a; color: white; padding: 20px; border-radius: 10px; margin-bottom: 20px; }
+            .grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 15px; }
+            .stat { background: #222; color: #fff; padding: 15px; border-radius: 8px; }
             .trading-card { background: white; padding: 20px; border-radius: 10px; margin-bottom: 20px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
             .btc-price { font-size: 2em; font-weight: bold; color: #f7931a; }
             .signal-buy { color: #28a745; font-weight: bold; }
             .signal-sell { color: #dc3545; font-weight: bold; }
             .signal-hold { color: #6c757d; font-weight: bold; }
             .news-section { background: #f8f9fa; padding: 15px; border-radius: 5px; margin: 10px 0; }
-            .trading-controls { display: flex; gap: 10px; margin: 15px 0; }
+            .trading-controls { display: flex; flex-wrap: wrap; gap: 10px; margin: 15px 0; }
             .btn { padding: 10px 20px; border: none; border-radius: 5px; cursor: pointer; font-weight: bold; }
             .btn-buy { background: #28a745; color: white; }
             .btn-sell { background: #dc3545; color: white; }
@@ -476,6 +574,9 @@ async def dashboard():
             .status-success { background: #d4edda; color: #155724; }
             .status-error { background: #f8d7da; color: #721c24; }
             .trade-log { background: #f8f9fa; padding: 15px; border-radius: 5px; max-height: 300px; overflow-y: auto; }
+            .settings-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; align-items: center; }
+            .settings-grid label { font-size: 12px; color: #333; }
+            .toggle-row { display: flex; align-items: center; gap: 8px; }
         </style>
 
     </head>
@@ -484,6 +585,12 @@ async def dashboard():
             <div class="header">
                 <h1>🚀 Bitcoin LLM Trading System</h1>
                 <p>Automated Bitcoin trading with compact LLM analysis</p>
+                <div class="grid" id="equity-stats">
+                    <div class="stat"><div>Equity</div><div id="stat-equity">$0</div></div>
+                    <div class="stat"><div>Realized PnL</div><div id="stat-realized">$0</div></div>
+                    <div class="stat"><div>Unrealized PnL</div><div id="stat-unrealized">$0</div></div>
+                    <div class="stat"><div>Exposure</div><div id="stat-exposure">0%</div></div>
+                </div>
                 <div id="auth-status" style="margin-top: 10px;">
                     <span id="login-status">Not logged in</span>
                     <button id="login-btn" onclick="showLoginForm()" style="margin-left: 10px; padding: 5px 10px; background: #28a745; color: white; border: none; border-radius: 3px; cursor: pointer;">Login</button>
@@ -499,32 +606,54 @@ async def dashboard():
             </div>
             
             <div class="trading-card">
+                <h2>📊 Equity & Benchmark</h2>
+                <canvas id="equityChart" height="120"></canvas>
+                <canvas id="pnlChart" height="120" style="margin-top:14px;"></canvas>
+            </div>
+
+            <div class="trading-card">
+                <h3>⚙️ Settings</h3>
+                <div class="settings-grid">
+                    <div class="toggle-row">
+                        <input type="checkbox" id="auto-toggle">
+                        <label for="auto-toggle">Auto-trade enabled</label>
+                    </div>
+                    <div>
+                        <label>Max Exposure</label>
+                        <input type="number" id="max-exposure" min="0" max="1" step="0.05" value="0.8">
+                    </div>
+                    <div>
+                        <label>Cooldown (hours)</label>
+                        <input type="number" id="cooldown" min="0" step="1" value="3">
+                    </div>
+                    <div>
+                        <label>LLM Min Confidence</label>
+                        <input type="number" id="min-confidence" min="0" max="1" step="0.05" value="0.7">
+                    </div>
+                    <div>
+                        <button class="btn btn-buy" onclick="saveSettings()">Save Settings</button>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="trading-card">
                 <h2>📊 Bitcoin Trading Dashboard</h2>
                 <div id="btc-data">
                     <div class="btc-price" id="btc-price">Loading...</div>
                     <div id="btc-info">Loading market data...</div>
                 </div>
-                
                 <div class="news-section">
                     <h3>📰 Latest Bitcoin News</h3>
                     <div id="btc-news">Loading news...</div>
                 </div>
-                
                 <div class="trading-controls">
                     <input type="number" id="trade-amount" placeholder="Amount ($)" value="100" min="10" step="10">
                     <button class="btn btn-buy" onclick="buyBTC()">Buy BTC</button>
                     <button class="btn btn-sell" onclick="sellBTC()">Sell BTC</button>
                     <button class="btn btn-hold" onclick="loadBTCData()">Refresh</button>
                     <button class="btn btn-buy" onclick="autoTrade()" style="background: #17a2b8;">🤖 Auto Trade</button>
-                    <button class="btn btn-refresh" onclick="testJS()" style="background: #28a745;">Test JS</button>
                 </div>
-                
                 <div id="trading-status"></div>
-            </div>
-            
-            <div class="trading-card">
-                <h3>📈 Trading Signals</h3>
-                <div id="signals">Loading signals...</div>
             </div>
             
             <div class="trading-card">
@@ -539,16 +668,76 @@ async def dashboard():
         </div>
         
         <script>
-            console.log('JavaScript starting...');
-            
             let jwtToken = localStorage.getItem('jwt_token');
-            
-            // Test function to check if JavaScript is working
-            function testJS() {
-                console.log('JavaScript is working!');
-                alert('JavaScript is working!');
+            let equityChart, pnlChart;
+
+            async function loadPnlHeader() {
+                if (!jwtToken) return;
+                try {
+                    const res = await fetch('/pnl_summary?token=' + encodeURIComponent(jwtToken));
+                    if (!res.ok) return;
+                    const d = await res.json();
+                    document.getElementById('stat-equity').textContent = '$' + d.equity.toLocaleString(undefined,{maximumFractionDigits:2});
+                    document.getElementById('stat-realized').textContent = '$' + d.realized_pnl.toLocaleString(undefined,{maximumFractionDigits:2});
+                    document.getElementById('stat-unrealized').textContent = '$' + d.unrealized_pnl.toLocaleString(undefined,{maximumFractionDigits:2});
+                    document.getElementById('stat-exposure').textContent = (d.exposure_pct*100).toFixed(1) + '%';
+                } catch (e) {}
             }
-            
+
+            async function loadSettings() {
+                if (!jwtToken) return;
+                const res = await fetch('/settings?token=' + encodeURIComponent(jwtToken));
+                if (!res.ok) return;
+                const s = await res.json();
+                document.getElementById('auto-toggle').checked = !!s.auto_trade_enabled;
+                document.getElementById('max-exposure').value = s.max_exposure;
+                document.getElementById('cooldown').value = s.trade_cooldown_hours;
+                document.getElementById('min-confidence').value = s.min_confidence;
+            }
+
+            async function saveSettings() {
+                if (!jwtToken) { alert('Login required'); return; }
+                const form = new FormData();
+                form.append('token', jwtToken);
+                form.append('auto_trade_enabled', document.getElementById('auto-toggle').checked);
+                form.append('max_exposure', document.getElementById('max-exposure').value);
+                form.append('trade_cooldown_hours', document.getElementById('cooldown').value);
+                form.append('min_confidence', document.getElementById('min-confidence').value);
+                const res = await fetch('/settings', { method: 'POST', body: form });
+                if (res.ok) { alert('Settings saved'); } else { alert('Failed to save settings'); }
+            }
+
+            async function loadEquityCharts() {
+                if (!jwtToken) return;
+                const res = await fetch('/equity_series?token=' + encodeURIComponent(jwtToken));
+                if (!res.ok) return;
+                const js = await res.json();
+                const labels = js.equity_curve.map(p => p.timestamp);
+                const equity = js.equity_curve.map(p => p.equity);
+                const hodl = (js.hodl_curve||[]).map(p => p.hodl_value);
+                const ctx = document.getElementById('equityChart').getContext('2d');
+                if (equityChart) equityChart.destroy();
+                equityChart = new Chart(ctx, {
+                    type: 'line',
+                    data: { labels, datasets:[
+                        {label:'Equity', data: equity, borderColor:'#17a2b8', fill:false},
+                        {label:'HODL', data: hodl, borderColor:'#6c757d', fill:false}
+                    ]},
+                    options: { responsive: true, maintainAspectRatio: false }
+                });
+                // Daily PnL series
+                const pnl = [];
+                for (let i=1;i<equity.length;i++){ pnl.push(equity[i]-equity[i-1]); }
+                const pnlLabels = labels.slice(1);
+                const ctx2 = document.getElementById('pnlChart').getContext('2d');
+                if (pnlChart) pnlChart.destroy();
+                pnlChart = new Chart(ctx2, {
+                    type: 'bar',
+                    data: { labels: pnlLabels, datasets:[{label:'PnL (per bar)', data: pnl, backgroundColor:'#f7931a'}]},
+                    options: { responsive: true, maintainAspectRatio: false }
+                });
+            }
+
             async function loadPnl() {
                 const container = document.getElementById('pnl');
                 if (!jwtToken) { container.textContent = 'Login to view PnL'; return; }
@@ -567,207 +756,34 @@ async def dashboard():
                     `;
                 } catch (e) { container.textContent = 'PnL error'; }
             }
-            
-            // Function to handle login and store JWT token
+
             async function loginUser(username, password) {
                 try {
                     const formData = new FormData();
                     formData.append('username', username);
                     formData.append('password', password);
-                    
-                    const response = await fetch('/auth/login', {
-                        method: 'POST',
-                        body: formData
-                    });
-                    
+                    const response = await fetch('/auth/login', { method: 'POST', body: formData });
                     if (response.ok) {
-                        const data = await response.json();
+                    const data = await response.json();
                         jwtToken = data.session_token;
                         localStorage.setItem('jwt_token', jwtToken);
+                        await loadSettings();
+                        await refreshAll();
                         return true;
-                    } else {
-                        return false;
-                    }
-                } catch (error) {
-                    console.error('Login error:', error);
-                    return false;
-                }
+                    } else { return false; }
+                } catch (error) { console.error('Login error:', error); return false; }
             }
+
+            function showLoginForm(){ document.getElementById('login-form').style.display='block'; document.getElementById('login-btn').style.display='none'; }
+            function hideLoginForm(){ document.getElementById('login-form').style.display='none'; document.getElementById('login-btn').style.display='inline-block'; }
+            async function login(){ const u=document.getElementById('login-username').value; const p=document.getElementById('login-password').value; if (await loginUser(u,p)){ document.getElementById('login-status').textContent='Logged in as '+u; document.getElementById('login-btn').style.display='none'; document.getElementById('logout-btn').style.display='inline-block'; alert('Login successful!'); } else { alert('Login failed.'); } }
+            function logout(){ jwtToken=null; localStorage.removeItem('jwt_token'); document.getElementById('login-status').textContent='Not logged in'; document.getElementById('login-btn').style.display='inline-block'; document.getElementById('logout-btn').style.display='none'; alert('Logged out successfully!'); }
+
+            function loadBTCData(){ fetch('/btc_data_public').then(r=>r.json()).then(data=>{ if (data.error){ document.getElementById('btc-price').innerHTML='Error loading data'; document.getElementById('btc-info').innerHTML='<p>Unable to fetch market data</p>'; return; } document.getElementById('btc-price').innerHTML='$'+data.price.toLocaleString(); document.getElementById('btc-info').innerHTML=`<p><strong>24h Change:</strong> <span class="${data.change_24h >= 0 ? 'signal-buy' : 'signal-sell'}">${data.change_24h > 0 ? '+' : ''}${data.change_24h.toFixed(2)}%</span></p><p><strong>Volume:</strong> $${data.volume.toLocaleString()}</p>`; document.getElementById('btc-news').innerHTML=data.news||'Real-time Bitcoin data'; const sentimentText=data.sentiment>0?'Positive':data.sentiment<0?'Negative':'Neutral'; const sentimentClass=data.sentiment>0?'signal-buy':data.sentiment<0?'signal-sell':'signal-hold'; document.getElementById('signals').innerHTML=`<p><strong>Sentiment:</strong> <span class="${sentimentClass}">${sentimentText}</span></p><p><strong>Confidence:</strong> ${(data.probability*100).toFixed(1)}%</p><p><strong>Signal:</strong> <span class="${data.signal===1?'signal-buy':data.signal===-1?'signal-sell':'signal-hold'}">${data.signal===1?'BUY':data.signal===-1?'SELL':'HOLD'}</span></p>`; }).catch(()=>{ document.getElementById('btc-price').innerHTML='Error loading data'; document.getElementById('btc-info').innerHTML='<p>Unable to fetch market data</p>'; }); }
             
-            // Show login form
-            function showLoginForm() {
-                document.getElementById('login-form').style.display = 'block';
-                document.getElementById('login-btn').style.display = 'none';
-            }
-            
-            // Hide login form
-            function hideLoginForm() {
-                document.getElementById('login-form').style.display = 'none';
-                document.getElementById('login-btn').style.display = 'inline-block';
-            }
-            
-            // Login function
-            async function login() {
-                const username = document.getElementById('login-username').value;
-                const password = document.getElementById('login-password').value;
-                
-                if (await loginUser(username, password)) {
-                    document.getElementById('login-status').textContent = 'Logged in as ' + username;
-                    document.getElementById('login-btn').style.display = 'none';
-                    document.getElementById('logout-btn').style.display = 'inline-block';
-                    document.getElementById('login-form').style.display = 'none';
-                    alert('Login successful!');
-                } else {
-                    alert('Login failed. Please check your credentials.');
-                }
-            }
-            
-            // Logout function
-            function logout() {
-                jwtToken = null;
-                localStorage.removeItem('jwt_token');
-                document.getElementById('login-status').textContent = 'Not logged in';
-                document.getElementById('login-btn').style.display = 'inline-block';
-                document.getElementById('logout-btn').style.display = 'none';
-                alert('Logged out successfully!');
-            }
-            
-            // Load Bitcoin data from API
-            function loadBTCData() {
-                console.log('loadBTCData called');
-                
-                fetch('/btc_data_public')
-                    .then(response => response.json())
-                    .then(data => {
-                        console.log('Data received:', data);
-                        
-                        if (data.error) {
-                            document.getElementById('btc-price').innerHTML = 'Error loading data';
-                            document.getElementById('btc-info').innerHTML = '<p>Unable to fetch market data</p>';
-                            return;
-                        }
-                        
-                        // Update price
-                        document.getElementById('btc-price').innerHTML = '$' + data.price.toLocaleString();
-                        
-                        // Update market info
-                        document.getElementById('btc-info').innerHTML = `
-                            <p><strong>24h Change:</strong> <span class="${data.change_24h >= 0 ? 'signal-buy' : 'signal-sell'}">${data.change_24h > 0 ? '+' : ''}${data.change_24h.toFixed(2)}%</span></p>
-                            <p><strong>Volume:</strong> $${data.volume.toLocaleString()}</p>
-                        `;
-                        
-                        // Update news
-                        document.getElementById('btc-news').innerHTML = data.news || 'Real-time Bitcoin data';
-                        
-                        // Update signals
-                        const sentimentText = data.sentiment > 0 ? 'Positive' : data.sentiment < 0 ? 'Negative' : 'Neutral';
-                        const sentimentClass = data.sentiment > 0 ? 'signal-buy' : data.sentiment < 0 ? 'signal-sell' : 'signal-hold';
-                        
-                        document.getElementById('signals').innerHTML = `
-                            <p><strong>Sentiment:</strong> <span class="${sentimentClass}">${sentimentText}</span></p>
-                            <p><strong>Confidence:</strong> ${(data.probability * 100).toFixed(1)}%</p>
-                            <p><strong>Signal:</strong> <span class="${data.signal === 1 ? 'signal-buy' : data.signal === -1 ? 'signal-sell' : 'signal-hold'}">${data.signal === 1 ? 'BUY' : data.signal === -1 ? 'SELL' : 'HOLD'}</span></p>
-                        `;
-                    })
-                    .catch(error => {
-                        console.error('Error:', error);
-                        document.getElementById('btc-price').innerHTML = 'Error loading data';
-                        document.getElementById('btc-info').innerHTML = '<p>Unable to fetch market data</p>';
-                    });
-            }
-            
-            // Buy Bitcoin function
-            function buyBTC() {
-                const amount = document.getElementById('trade-amount').value;
-                alert(`Buy BTC: $${amount}`);
-                console.log('Buy BTC:', amount);
-                
-                const log = document.getElementById('trade-log');
-                const timestamp = new Date().toLocaleTimeString();
-                log.innerHTML += `<div>[${timestamp}] BUY: $${amount}</div>`;
-            }
-            
-            // Sell Bitcoin function
-            function sellBTC() {
-                const amount = document.getElementById('trade-amount').value;
-                alert(`Sell BTC: $${amount}`);
-                console.log('Sell BTC:', amount);
-                
-                const log = document.getElementById('trade-log');
-                const timestamp = new Date().toLocaleTimeString();
-                log.innerHTML += `<div>[${timestamp}] SELL: $${amount}</div>`;
-            }
-            
-            // Automated trading function
-            async function autoTrade() {
-                console.log('Auto trade started');
-                document.getElementById('trading-status').innerHTML = '<div class="status status-success">🤖 AI analyzing...</div>';
-                
-                // Check if user is authenticated
-                if (!jwtToken) {
-                    document.getElementById('trading-status').innerHTML = '<div class="status status-error">Please log in to use auto-trade</div>';
-                    return;
-                }
-                
-                try {
-                    const formData = new FormData();
-                    formData.append('token', jwtToken);
-                    
-                    const response = await fetch('/auto_trade', {
-                        method: 'POST',
-                        body: formData
-                    });
-                    
-                    if (response.status === 401) {
-                        document.getElementById('trading-status').innerHTML = '<div class="status status-error">Authentication required. Please log in again.</div>';
-                        return;
-                    }
-                    
-                    const data = await response.json();
-                    console.log('Auto trade response:', data);
-                    
-                    let message = '🤖 AI Analysis Complete!';
-                    if (data.signal) {
-                        message += '\\nAction: ' + data.signal.action.toUpperCase();
-                        message += '\\nReason: ' + data.signal.reason;
-                    }
-                    
-                    document.getElementById('trading-status').innerHTML = `<div class="status status-success">${message.replace(/\\\\n/g, '<br>')}</div>`;
-                    
-                    const log = document.getElementById('trade-log');
-                    const timestamp = new Date().toLocaleTimeString();
-                    log.innerHTML += `<div>[${timestamp}] 🤖 AUTO TRADE: ${data.signal ? data.signal.action.toUpperCase() : 'Analysis'}</div>`;
-                } catch (error) {
-                    console.error('Auto trade error:', error);
-                    document.getElementById('trading-status').innerHTML = `<div class="status status-error">Error: ${error.message}</div>`;
-                }
-            }
-            
-            // Check login status on page load
-            function checkLoginStatus() {
-                if (jwtToken) {
-                    document.getElementById('login-status').textContent = 'Logged in as admin';
-                    document.getElementById('login-btn').style.display = 'none';
-                    document.getElementById('logout-btn').style.display = 'inline-block';
-                } else {
-                    document.getElementById('login-status').textContent = 'Not logged in';
-                    document.getElementById('login-btn').style.display = 'inline-block';
-                    document.getElementById('logout-btn').style.display = 'none';
-                }
-            }
-            
-            // Load data when page loads
-            window.addEventListener('load', function() {
-                console.log('Page loaded, loading BTC data...');
-                loadBTCData();
-                loadPnl();
-                checkLoginStatus();
-                
-                // Auto-refresh every 30 seconds
-                setInterval(() => { loadBTCData(); loadPnl(); }, 30000);
-                
-                console.log('JavaScript loaded successfully');
-            });
+            async function refreshAll(){ await loadPnlHeader(); await loadPnl(); await loadEquityCharts(); }
+            setInterval(refreshAll, 60000);
+            window.addEventListener('load', ()=>{ loadBTCData(); if (jwtToken){ loadSettings(); refreshAll(); } });
         </script>
     </body>
     </html>
@@ -1311,9 +1327,12 @@ async def auto_trade(token: str = Form(...)):
 # This endpoint was allowing unauthorized access to trading functionality
 
 @app.post("/auto_trade_scheduled")
-async def auto_trade_scheduled():
+async def auto_trade_scheduled(token: str = Form(...)):
     """Execute automated trading without authentication (for scheduled runs)"""
     logger.info("🤖 Scheduled Auto Trade endpoint called")
+    
+    if not AUTO_TRADE_ENABLED:
+        return {"status": "skipped", "message": "Auto-trade disabled"}
     
     if not trading_bot:
         logger.warning("No trading bot available for scheduled auto trade")
@@ -1322,6 +1341,13 @@ async def auto_trade_scheduled():
     if not llm_strategy:
         logger.warning("LLM strategy not available for scheduled auto trade")
         return {"status": "error", "message": "LLM strategy not available"}
+
+    try:
+        username = verify_jwt_token(token)
+        logger.info(f"Scheduled auto trade requested by user: {username}")
+    except:
+        logger.warning("Invalid token for scheduled auto trade")
+        raise HTTPException(status_code=401, detail="Authentication required")
 
     try:
         logger.info("🤖 Starting scheduled LLM market analysis...")
