@@ -671,6 +671,23 @@ async def dashboard():
             let jwtToken = localStorage.getItem('jwt_token');
             let equityChart, pnlChart;
 
+            function setAuthUi(loggedIn, username){
+                const loginBtn = document.getElementById('login-btn');
+                const logoutBtn = document.getElementById('logout-btn');
+                const statusEl = document.getElementById('login-status');
+                const formEl = document.getElementById('login-form');
+                if (loggedIn){
+                    statusEl.textContent = 'Logged in' + (username? (' as ' + username) : '');
+                    loginBtn.style.display = 'none';
+                    logoutBtn.style.display = 'inline-block';
+                    if (formEl) formEl.style.display = 'none';
+                } else {
+                    statusEl.textContent = 'Not logged in';
+                    loginBtn.style.display = 'inline-block';
+                    logoutBtn.style.display = 'none';
+                }
+            }
+
             async function loadPnlHeader() {
                 if (!jwtToken) return;
                 try {
@@ -751,10 +768,10 @@ async def dashboard():
                     formData.append('password', password);
                     const response = await fetch('/auth/login', { method: 'POST', body: formData });
                     if (response.ok) {
-                    const data = await response.json();
+                        const data = await response.json();
                         jwtToken = data.session_token;
                         localStorage.setItem('jwt_token', jwtToken);
-                        // Snapshot equity on first login to seed chart
+                        setAuthUi(true, username);
                         try { const f=new FormData(); f.append('token', jwtToken); await fetch('/snapshot_equity', {method:'POST', body:f}); } catch(_e){}
                         await loadSettings();
                         await refreshAll();
@@ -765,14 +782,14 @@ async def dashboard():
 
             function showLoginForm(){ document.getElementById('login-form').style.display='block'; document.getElementById('login-btn').style.display='none'; }
             function hideLoginForm(){ document.getElementById('login-form').style.display='none'; document.getElementById('login-btn').style.display='inline-block'; }
-            async function login(){ const u=document.getElementById('login-username').value; const p=document.getElementById('login-password').value; if (await loginUser(u,p)){ document.getElementById('login-status').textContent='Logged in as '+u; document.getElementById('login-btn').style.display='none'; document.getElementById('logout-btn').style.display='inline-block'; document.getElementById('login-form').style.display='none'; } else { alert('Login failed.'); } }
-            function logout(){ jwtToken=null; localStorage.removeItem('jwt_token'); document.getElementById('login-status').textContent='Not logged in'; document.getElementById('login-btn').style.display='inline-block'; document.getElementById('logout-btn').style.display='none'; }
+            async function login(){ const u=document.getElementById('login-username').value; const p=document.getElementById('login-password').value; if (await loginUser(u,p)){ /* UI already updated */ } else { alert('Login failed.'); } }
+            function logout(){ jwtToken=null; localStorage.removeItem('jwt_token'); setAuthUi(false); }
 
             function loadBTCData(){ fetch('/btc_data_public').then(r=>r.json()).then(data=>{ if (data.error){ document.getElementById('btc-price').innerHTML='Error loading data'; document.getElementById('btc-info').innerHTML='<p>Unable to fetch market data</p>'; return; } document.getElementById('btc-price').innerHTML='$'+data.price.toLocaleString(); document.getElementById('btc-info').innerHTML=`<p><strong>24h Change:</strong> <span class="${data.change_24h >= 0 ? 'signal-buy' : 'signal-sell'}">${data.change_24h > 0 ? '+' : ''}${data.change_24h.toFixed(2)}%</span></p><p><strong>Volume:</strong> $${data.volume.toLocaleString()}</p>`; document.getElementById('btc-news').innerHTML=data.news||'Real-time Bitcoin data'; const sentimentText=data.sentiment>0?'Positive':data.sentiment<0?'Negative':'Neutral'; const sentimentClass=data.sentiment>0?'signal-buy':data.sentiment<0?'signal-sell':'signal-hold'; document.getElementById('signals').innerHTML=`<p><strong>Sentiment:</strong> <span class="${sentimentClass}">${sentimentText}</span></p><p><strong>Confidence:</strong> ${(data.probability*100).toFixed(1)}%</p><p><strong>Signal:</strong> <span class="${data.signal===1?'signal-buy':data.signal===-1?'signal-sell':'signal-hold'}">${data.signal===1?'BUY':data.signal===-1?'SELL':'HOLD'}</span></p>`; }).catch(()=>{ document.getElementById('btc-price').innerHTML='Error loading data'; document.getElementById('btc-info').innerHTML='<p>Unable to fetch market data</p>'; }); }
             
             async function refreshAll(){ await loadPnlHeader(); await loadPnl(); await loadEquityCharts(); }
             setInterval(refreshAll, 60000);
-            window.addEventListener('load', ()=>{ loadBTCData(); if (jwtToken){ loadSettings(); refreshAll(); } });
+            window.addEventListener('load', ()=>{ if (jwtToken){ setAuthUi(true); loadSettings(); refreshAll(); } else { setAuthUi(false); } loadBTCData(); });
         </script>
     </body>
     </html>
