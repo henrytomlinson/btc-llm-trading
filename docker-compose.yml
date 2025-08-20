@@ -9,6 +9,8 @@ services:
     restart: unless-stopped
     ports:
       - "8000:8000"
+    volumes:
+      - btc-data:/data
     environment:
       - KRAKEN_API_KEY=${KRAKEN_API_KEY}
       - KRAKEN_PRIVATE_KEY=${KRAKEN_PRIVATE_KEY}
@@ -19,6 +21,7 @@ services:
       - RATE_LIMIT_WINDOW=${RATE_LIMIT_WINDOW}
       - ADMIN_USERNAME=${ADMIN_USERNAME}
       - ADMIN_PASSWORD=${ADMIN_PASSWORD}
+      - TRADING_DB_PATH=/data/trades.db
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/test_apis"]
       interval: 30s
@@ -47,3 +50,6 @@ services:
 networks:
   btc-network:
     driver: bridge
+
+volumes:
+  btc-data:
