@@ -793,22 +793,10 @@ async def dashboard():
                 const labels = (js.equity_curve||[]).map(p => p.timestamp);
                 const equity = (js.equity_curve||[]).map(p => p.equity);
                 const hodl = (js.hodl_curve||[]).map(p => p.hodl_value);
-                const hasChart = (typeof Chart !== 'undefined');
-                if (hasChart){
-                    var eqEl = document.getElementById('equityChart');
-                    var ctx = (eqEl && eqEl.getContext) ? eqEl.getContext('2d') : null;
-                    if (ctx){ if (equityChart) equityChart.destroy(); equityChart = new Chart(ctx, { type: 'line', data: { labels, datasets:[ {label:'Equity', data: equity, borderColor:'#17a2b8', fill:false}, {label:'HODL', data: hodl, borderColor:'#6c757d', fill:false} ]}, options: { responsive: true, maintainAspectRatio: false } }); }
-                } else {
-                    drawLineFallback('equityChart', equity, '#17a2b8');
-                }
+                // Force fallback renderer to avoid any CDN/compat issues
+                drawLineFallback('equityChart', equity, '#17a2b8');
                 const pnl = []; for (let i=1;i<equity.length;i++){ pnl.push(equity[i]-equity[i-1]); }
-                if (hasChart){
-                    var pnlEl = document.getElementById('pnlChart');
-                    var ctx2 = (pnlEl && pnlEl.getContext) ? pnlEl.getContext('2d') : null;
-                    if (ctx2){ if (pnlChart) pnlChart.destroy(); pnlChart = new Chart(ctx2, { type: 'bar', data: { labels: labels.slice(1), datasets:[{label:'PnL (per bar)', data: pnl, backgroundColor:'#f7931a'}]}, options: { responsive: true, maintainAspectRatio: false } }); }
-                } else {
-                    drawBarFallback('pnlChart', pnl, '#f7931a');
-                }
+                drawBarFallback('pnlChart', pnl, '#f7931a');
             }
 
             async function loadPnl() {
