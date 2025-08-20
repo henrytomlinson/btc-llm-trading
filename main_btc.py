@@ -1205,7 +1205,9 @@ async def auto_trade(token: str = Form(...)):
         if signal.get('target_exposure') is not None:
             try:
                 target = float(signal.get('target_exposure'))
-                trade_result = trading_bot.rebalance_to_target(target)
+                # Pass decision price for slippage checking
+                decision_price = current_price if current_price else None
+                trade_result = trading_bot.rebalance_to_target(target, decision_price)
             except Exception as e:
                 logger.warning(f"Rebalance failed: {e}")
                 trade_result = {"status": "error", "reason": str(e)}
@@ -1398,7 +1400,9 @@ async def auto_trade_scheduled():
         if signal.get('target_exposure') is not None:
             try:
                 target = float(signal.get('target_exposure'))
-                trade_result = trading_bot.rebalance_to_target(target)
+                # Pass decision price for slippage checking
+                decision_price = current_price if current_price else None
+                trade_result = trading_bot.rebalance_to_target(target, decision_price)
             except Exception as e:
                 logger.warning(f"Rebalance failed: {e}")
                 trade_result = {"status": "error", "reason": str(e)}

@@ -7,13 +7,15 @@ Specialized for Bitcoin trading with Kraken API (futures demo environment).
 import os
 import logging
 from datetime import datetime, timedelta
-from typing import Dict, Optional, List
+from typing import Dict, Optional, List, Tuple
 import requests
 import time
 import hmac
 import hashlib
 import base64
 import urllib.parse
+import uuid
+import random
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -40,11 +42,16 @@ class KrakenTradingBot:
         # Bitcoin spot trading symbol
         self.btc_symbol = "XXBTZUSD"  # Bitcoin/USD pair on Kraken
         self.btc_gbp_symbol = "XXBTZGBP"  # Bitcoin/GBP pair on Kraken
-        self.min_trade_amount = 10.0  # Minimum trade amount in USD
+        self.min_trade_amount = float(os.getenv('MIN_TRADE_AMOUNT_USD', '10.0'))  # Minimum trade amount in USD
+        self.max_slippage_pct = float(os.getenv('MAX_SLIPPAGE_PCT', '0.02'))  # 2% max slippage
+        self.max_retries = int(os.getenv('MAX_RETRIES', '3'))
+        self.retry_delay_base = float(os.getenv('RETRY_DELAY_BASE', '1.0'))  # Base delay in seconds
         # Allocation logic parameters
         self.rebalance_threshold_pct = float(os.getenv('REALLOC_THRESHOLD_PCT', '0.05'))  # 5%
         self.trade_cooldown_hours = float(os.getenv('TRADE_COOLDOWN_HOURS', '3'))
         self._last_trade_ts = 0.0
+        # Track executed orders to prevent duplicates
+        self._executed_orders = set()
         
         # Check if credentials are available
         if not self.api_key or not self.secret_key:
@@ -109,6 +116,74 @@ class KrakenTradingBot:
         except Exception as e:
             logger.error(f"Error making request to {endpoint}: {e}")
             return {"error": str(e)}
+
+    def _make_request_with_retry(self, method: str, endpoint: str, data: Dict = None, private: bool = False, signature_path: str = None) -> Dict:
+        """Make API request with exponential backoff retry logic"""
+        for attempt in range(self.max_retries + 1):
+            try:
+                result = self._make_request(method, endpoint, data, private, signature_path)
+                
+                # Check if it's a transient error that should be retried
+                if self._should_retry(result, attempt):
+                    if attempt < self.max_retries:
+                        delay = self.retry_delay_base * (2 ** attempt) + random.uniform(0, 0.1)
+                        logger.warning(f"Retry {attempt + 1}/{self.max_retries} after {delay:.2f}s for {endpoint}")
+                        time.sleep(delay)
+                        continue
+                
+                return result
+                
+            except Exception as e:
+                if attempt < self.max_retries:
+                    delay = self.retry_delay_base * (2 ** attempt) + random.uniform(0, 0.1)
+                    logger.warning(f"Retry {attempt + 1}/{self.max_retries} after {delay:.2f}s for {endpoint}: {e}")
+                    time.sleep(delay)
+                else:
+                    logger.error(f"Final attempt failed for {endpoint}: {e}")
+                    return {"error": str(e)}
+        
+        return {"error": "Max retries exceeded"}
+
+    def _should_retry(self, result: Dict, attempt: int) -> bool:
+        """Determine if a request should be retried based on the response"""
+        if 'error' in result and result['error']:
+            error_msg = str(result['error']).lower()
+            # Retry on rate limits, temporary server errors, network issues
+            retryable_errors = [
+                'rate limit', 'too many requests', 'temporary', 'timeout',
+                'connection', 'network', 'server error', 'service unavailable'
+            ]
+            return any(err in error_msg for err in retryable_errors)
+        return False
+
+    def _generate_client_order_id(self, side: str, amount: float) -> str:
+        """Generate a unique client order ID for idempotency"""
+        timestamp = int(time.time())
+        unique_id = str(uuid.uuid4())[:8]
+        return f"btc_{side}_{timestamp}_{unique_id}"
+
+    def _check_slippage(self, decision_price: float, current_price: float) -> Tuple[bool, float]:
+        """Check if slippage is within acceptable bounds"""
+        if decision_price <= 0:
+            return True, 0.0
+        
+        slippage_pct = abs(current_price - decision_price) / decision_price
+        is_acceptable = slippage_pct <= self.max_slippage_pct
+        
+        logger.info(f"Slippage check: decision=${decision_price:.2f}, current=${current_price:.2f}, slippage={slippage_pct:.3%}, acceptable={is_acceptable}")
+        return is_acceptable, slippage_pct
+
+    def _validate_order_size(self, dollar_amount: float, btc_amount: float, current_price: float) -> Tuple[bool, str]:
+        """Validate order size meets minimum requirements"""
+        if dollar_amount < self.min_trade_amount:
+            return False, f"Order size ${dollar_amount:.2f} below minimum ${self.min_trade_amount:.2f}"
+        
+        # Kraken minimum BTC order size (varies by pair)
+        min_btc_amount = 0.0001  # Kraken's typical minimum
+        if btc_amount < min_btc_amount:
+            return False, f"BTC amount {btc_amount:.6f} below minimum {min_btc_amount:.6f}"
+        
+        return True, "Order size valid"
     
     def get_account_info(self) -> Dict:
         """Get account information"""
@@ -125,7 +200,7 @@ class KrakenTradingBot:
             
             # Get real account info from Kraken
             endpoint = "/private/Balance"
-            result = self._make_request('POST', endpoint, {}, private=True, signature_path="/0/private/Balance")
+            result = self._make_request_with_retry('POST', endpoint, {}, private=True, signature_path="/0/private/Balance")
             
             if 'error' in result and result['error']:
                 return {"error": result['error']}
@@ -171,7 +246,7 @@ class KrakenTradingBot:
             
             # Get real positions from Kraken
             endpoint = "/private/OpenPositions"
-            result = self._make_request('POST', endpoint, {}, private=True)
+            result = self._make_request_with_retry('POST', endpoint, {}, private=True)
             
             if 'error' in result and result['error']:
                 return {"error": result['error']}
@@ -204,7 +279,7 @@ class KrakenTradingBot:
             # Get real market data from Kraken
             endpoint = "/public/Ticker"
             params = {'pair': symbol}
-            result = self._make_request('GET', endpoint, params, private=False)
+            result = self._make_request_with_retry('GET', endpoint, params, private=False)
             
             if 'error' in result and result['error']:
                 logger.error(f"Error getting market data: {result['error']}")
@@ -288,12 +363,13 @@ class KrakenTradingBot:
             return {"equity": equity, "btc_qty": btc_qty, "price": price, "exposure_frac": exposure_frac}
         return {"equity": 0.0, "btc_qty": 0.0, "price": 0.0, "exposure_frac": 0.0}
 
-    def rebalance_to_target(self, target_exposure: float) -> Dict:
+    def rebalance_to_target(self, target_exposure: float, decision_price: float = None) -> Dict:
         """Rebalance holdings to reach target exposure in [0,1].
 
         - Applies a 5% (configurable) threshold on equity to skip small changes
         - Enforces cooldown to avoid frequent trading
         - Does not short: target < 0 means move towards cash
+        - Includes slippage guards and client order ID tracking
         """
         now = time.time()
         if self._last_trade_ts and (now - self._last_trade_ts) < self.trade_cooldown_hours * 3600:
@@ -303,9 +379,15 @@ class KrakenTradingBot:
         target_long = max(0.0, min(1.0, float(target_exposure)))
         state = self.get_current_exposure()
         equity = state["equity"]
-        price = state["price"]
+        current_price = state["price"]
         current = state["exposure_frac"]
         delta = target_long - current
+
+        # Check slippage if decision price provided
+        if decision_price and decision_price > 0:
+            slippage_ok, slippage_pct = self._check_slippage(decision_price, current_price)
+            if not slippage_ok:
+                return {"status": "skipped", "reason": f"Slippage {slippage_pct:.3%} exceeds limit {self.max_slippage_pct:.3%}", "current": current, "target": target_long}
 
         threshold = self.rebalance_threshold_pct
         if abs(delta) < threshold:
@@ -314,6 +396,13 @@ class KrakenTradingBot:
         dollar_delta = abs(delta) * equity
         if dollar_delta < self.min_trade_amount:
             return {"status": "skipped", "reason": f"Notional ${dollar_delta:.2f} below min ${self.min_trade_amount:.2f}"}
+
+        # Generate client order ID for idempotency
+        client_order_id = self._generate_client_order_id('rebalance', dollar_delta)
+        
+        # Check if we've already executed this order
+        if client_order_id in self._executed_orders:
+            return {"status": "skipped", "reason": f"Order {client_order_id} already executed", "current": current, "target": target_long}
 
         # Decide buy or sell based on delta sign
         if delta > 0:
@@ -325,7 +414,12 @@ class KrakenTradingBot:
 
         if isinstance(result, dict) and result.get('status') == 'success':
             self._last_trade_ts = now
-        return {"status": "executed" if result.get('status') == 'success' else 'error', "order": result, "current": current, "target": target_long, "delta": delta}
+            self._executed_orders.add(client_order_id)
+            # Keep only last 1000 orders to prevent memory bloat
+            if len(self._executed_orders) > 1000:
+                self._executed_orders = set(list(self._executed_orders)[-1000:])
+                
+        return {"status": "executed" if result.get('status') == 'success' else 'error', "order": result, "current": current, "target": target_long, "delta": delta, "client_order_id": client_order_id}
     
     def place_buy_order(self, symbol: str, dollar_amount: float, signal_strength: float = 1.0) -> Dict:
         """Place a Bitcoin spot buy order"""
@@ -359,16 +453,25 @@ class KrakenTradingBot:
             current_price = market_data['close']
             btc_amount = dollar_amount / current_price
             
+            # Validate order size
+            is_valid, reason = self._validate_order_size(dollar_amount, btc_amount, current_price)
+            if not is_valid:
+                return {'status': 'error', 'reason': reason}
+
+            # Generate client order ID
+            client_order_id = self._generate_client_order_id('buy', dollar_amount)
+
             # Place real spot order using Kraken's AddOrder endpoint
             endpoint = "/private/AddOrder"
             order_data = {
                 'pair': self.btc_symbol,
                 'type': 'buy',
                 'ordertype': 'market',
-                'volume': str(btc_amount)  # Amount in BTC
+                'volume': str(btc_amount),  # Amount in BTC
+                'clientOrderId': client_order_id # Add client order ID
             }
             
-            result = self._make_request('POST', endpoint, data=order_data, private=True, signature_path="/0/private/AddOrder")
+            result = self._make_request_with_retry('POST', endpoint, data=order_data, private=True, signature_path="/0/private/AddOrder")
             
             if 'error' in result and result['error']:
                 return {'status': 'error', 'reason': result['error']}
@@ -424,16 +527,25 @@ class KrakenTradingBot:
             current_price = market_data['close']
             btc_amount = dollar_amount / current_price
             
+            # Validate order size
+            is_valid, reason = self._validate_order_size(dollar_amount, btc_amount, current_price)
+            if not is_valid:
+                return {'status': 'error', 'reason': reason}
+
+            # Generate client order ID
+            client_order_id = self._generate_client_order_id('sell', dollar_amount)
+
             # Place real spot order using Kraken's AddOrder endpoint
             endpoint = "/private/AddOrder"
             order_data = {
                 'pair': self.btc_symbol,
                 'type': 'sell',
                 'ordertype': 'market',
-                'volume': str(btc_amount)  # Amount in BTC
+                'volume': str(btc_amount),  # Amount in BTC
+                'clientOrderId': client_order_id # Add client order ID
             }
             
-            result = self._make_request('POST', endpoint, data=order_data, private=True, signature_path="/0/private/AddOrder")
+            result = self._make_request_with_retry('POST', endpoint, data=order_data, private=True, signature_path="/0/private/AddOrder")
             
             if 'error' in result and result['error']:
                 return {'status': 'error', 'reason': result['error']}
@@ -482,16 +594,25 @@ class KrakenTradingBot:
             current_price = market_data['close']
             btc_amount = gbp_amount / current_price
             
+            # Validate order size
+            is_valid, reason = self._validate_order_size(gbp_amount, btc_amount, current_price)
+            if not is_valid:
+                return {'status': 'error', 'reason': reason}
+
+            # Generate client order ID
+            client_order_id = self._generate_client_order_id('buy', gbp_amount)
+
             # Place real spot order using Kraken's AddOrder endpoint
             endpoint = "/private/AddOrder"
             order_data = {
                 'pair': self.btc_gbp_symbol,
                 'type': 'buy',
                 'ordertype': 'market',
-                'volume': str(btc_amount)  # Amount in BTC
+                'volume': str(btc_amount),  # Amount in BTC
+                'clientOrderId': client_order_id # Add client order ID
             }
             
-            result = self._make_request('POST', endpoint, data=order_data, private=True, signature_path="/0/private/AddOrder")
+            result = self._make_request_with_retry('POST', endpoint, data=order_data, private=True, signature_path="/0/private/AddOrder")
             
             if 'error' in result and result['error']:
                 return {'status': 'error', 'reason': result['error']}
