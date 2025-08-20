@@ -8,11 +8,48 @@ import os
 import logging
 import requests
 import json
+import re
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Literal
 from dataclasses import dataclass
+from pydantic import BaseModel, Field, validator, root_validator
 
 logger = logging.getLogger(__name__)
+
+class LLMResponseSchema(BaseModel):
+    """Strict Pydantic schema for LLM response validation"""
+    sentiment: Literal["bullish", "bearish", "neutral"] = Field(..., description="Market sentiment")
+    confidence: float = Field(..., ge=0.0, le=1.0, description="Confidence level 0.0-1.0")
+    reasoning: str = Field(..., min_length=10, max_length=1000, description="Detailed reasoning")
+    recommended_action: Literal["buy", "sell", "hold"] = Field(..., description="Trading recommendation")
+    risk_level: Literal["low", "medium", "high"] = Field(..., description="Risk assessment")
+    price_target: Optional[float] = Field(None, ge=0.0, description="Optional target price")
+    stop_loss: Optional[float] = Field(None, ge=0.0, description="Optional stop loss price")
+    
+    @validator('confidence')
+    def validate_confidence(cls, v):
+        if not 0.0 <= v <= 1.0:
+            raise ValueError('Confidence must be between 0.0 and 1.0')
+        return round(v, 3)  # Round to 3 decimal places
+    
+    @validator('price_target', 'stop_loss')
+    def validate_prices(cls, v):
+        if v is not None and v <= 0:
+            raise ValueError('Price values must be positive')
+        return v
+    
+    @root_validator
+    def validate_action_consistency(cls, values):
+        sentiment = values.get('sentiment')
+        action = values.get('recommended_action')
+        
+        # Validate sentiment-action consistency
+        if sentiment == "bullish" and action == "sell":
+            raise ValueError("Bullish sentiment inconsistent with sell action")
+        if sentiment == "bearish" and action == "buy":
+            raise ValueError("Bearish sentiment inconsistent with buy action")
+        
+        return values
 
 @dataclass
 class MarketAnalysis:
@@ -38,8 +75,8 @@ class LLMTradingStrategy:
         self.model = "command"  # Cohere's latest model
         
         # Trading parameters
-        self.min_confidence = 0.7  # Minimum confidence for trades
-        self.max_risk_level = "medium"  # Maximum risk level to accept
+        self.min_confidence = float(os.getenv('MIN_CONFIDENCE', '0.7'))  # Minimum confidence for trades
+        self.max_risk_level = os.getenv('MAX_RISK_LEVEL', 'medium')  # Maximum risk level to accept
         self.max_exposure = float(os.getenv('MAX_EXPOSURE', '0.8'))  # cap allocation at 80% of equity
         self.position_size_multiplier = {
             "low": 1.0,
@@ -47,7 +84,61 @@ class LLMTradingStrategy:
             "high": 0.5
         }
         
+        # Logging configuration
+        self.log_prompts = os.getenv('LOG_LLM_PROMPTS', 'true').lower() == 'true'
+        self.log_responses = os.getenv('LOG_LLM_RESPONSES', 'true').lower() == 'true'
+        
         logger.info("LLM trading strategy initialized successfully")
+        logger.info(f"Min confidence: {self.min_confidence}, Max risk level: {self.max_risk_level}")
+    
+    def _sanitize_for_logging(self, text: str) -> str:
+        """Sanitize text for logging by removing sensitive information"""
+        if not text:
+            return text
+        
+        # Remove API keys and other sensitive patterns
+        sanitized = text
+        
+        # Remove API keys (common patterns)
+        sanitized = re.sub(r'Bearer\s+[a-zA-Z0-9]{20,}', 'Bearer [REDACTED]', sanitized)
+        sanitized = re.sub(r'api[_-]?key["\']?\s*[:=]\s*["\']?[a-zA-Z0-9]{20,}["\']?', 'api_key=[REDACTED]', sanitized)
+        sanitized = re.sub(r'cohere[_-]?key["\']?\s*[:=]\s*["\']?[a-zA-Z0-9]{20,}["\']?', 'cohere_key=[REDACTED]', sanitized)
+        
+        # Remove other potential secrets
+        sanitized = re.sub(r'password["\']?\s*[:=]\s*["\']?[^"\']+["\']?', 'password=[REDACTED]', sanitized)
+        sanitized = re.sub(r'secret["\']?\s*[:=]\s*["\']?[^"\']+["\']?', 'secret=[REDACTED]', sanitized)
+        
+        return sanitized
+    
+    def _log_prompt(self, prompt: str, context: Dict = None):
+        """Log the prompt being sent to LLM"""
+        if not self.log_prompts:
+            return
+        
+        sanitized_prompt = self._sanitize_for_logging(prompt)
+        log_data = {
+            "timestamp": datetime.now().isoformat(),
+            "prompt_length": len(prompt),
+            "prompt_preview": sanitized_prompt[:500] + "..." if len(sanitized_prompt) > 500 else sanitized_prompt,
+            "context": context
+        }
+        
+        logger.info(f"LLM Prompt sent: {json.dumps(log_data, indent=2)}")
+    
+    def _log_response(self, response: str, validation_result: Dict = None):
+        """Log the response received from LLM"""
+        if not self.log_responses:
+            return
+        
+        sanitized_response = self._sanitize_for_logging(response)
+        log_data = {
+            "timestamp": datetime.now().isoformat(),
+            "response_length": len(response),
+            "response_preview": sanitized_response[:500] + "..." if len(sanitized_response) > 500 else sanitized_response,
+            "validation_result": validation_result
+        }
+        
+        logger.info(f"LLM Response received: {json.dumps(log_data, indent=2)}")
     
     def analyze_market_conditions(self, 
                                 current_price: float,
@@ -150,6 +241,9 @@ Remember: Return ONLY the JSON object, nothing else.
     def _query_llm(self, prompt: str) -> str:
         """Query the LLM with the given prompt"""
         
+        # Log the prompt being sent
+        self._log_prompt(prompt, {"model": self.model, "temperature": 0.3})
+        
         headers = {
             "Authorization": f"Bearer {self.cohere_key}",
             "Content-Type": "application/json"
@@ -175,17 +269,23 @@ Remember: Return ONLY the JSON object, nothing else.
         response.raise_for_status()
         result = response.json()
         
-        return result['generations'][0]['text'].strip()
+        llm_response = result['generations'][0]['text'].strip()
+        
+        # Log the response received
+        self._log_response(llm_response)
+        
+        return llm_response
     
     def _parse_llm_response(self, response: str, current_price: float) -> MarketAnalysis:
-        """Parse LLM response into MarketAnalysis object"""
+        """Parse LLM response into MarketAnalysis object with strict validation"""
+        
+        validation_result = {"status": "unknown", "errors": []}
         
         try:
             # Clean the response by removing control characters and extra whitespace
             cleaned_response = response.strip()
             
             # Remove common control characters that can break JSON parsing
-            import re
             cleaned_response = re.sub(r'[\x00-\x1f\x7f-\x9f]', '', cleaned_response)
             
             # Extract JSON from response
@@ -206,10 +306,90 @@ Remember: Return ONLY the JSON object, nothing else.
                 data = json.loads(json_str)
             except json.JSONDecodeError as json_error:
                 logger.warning(f"Initial JSON parsing failed: {json_error}")
+                validation_result["errors"].append(f"JSON parse error: {json_error}")
                 
                 # Try to extract key-value pairs manually as fallback
                 data = self._extract_key_value_pairs(json_str)
             
+            # Validate with Pydantic schema
+            try:
+                validated_data = LLMResponseSchema(**data)
+                validation_result["status"] = "valid"
+                
+                # Check confidence threshold
+                if validated_data.confidence < self.min_confidence:
+                    validation_result["status"] = "rejected"
+                    validation_result["errors"].append(f"Confidence {validated_data.confidence} below minimum {self.min_confidence}")
+                    logger.warning(f"LLM response rejected: confidence {validated_data.confidence} < {self.min_confidence}")
+                
+                # Check risk level
+                risk_levels = {"low": 1, "medium": 2, "high": 3}
+                max_risk = risk_levels.get(self.max_risk_level, 2)
+                current_risk = risk_levels.get(validated_data.risk_level, 2)
+                
+                if current_risk > max_risk:
+                    validation_result["status"] = "rejected"
+                    validation_result["errors"].append(f"Risk level {validated_data.risk_level} exceeds maximum {self.max_risk_level}")
+                    logger.warning(f"LLM response rejected: risk level {validated_data.risk_level} > {self.max_risk_level}")
+                
+                # Log validation result
+                self._log_response(response, validation_result)
+                
+                # Return validated analysis
+                return MarketAnalysis(
+                    sentiment=validated_data.sentiment,
+                    confidence=validated_data.confidence,
+                    reasoning=validated_data.reasoning,
+                    recommended_action=validated_data.recommended_action,
+                    risk_level=validated_data.risk_level,
+                    price_target=validated_data.price_target,
+                    stop_loss=validated_data.stop_loss
+                )
+                
+            except Exception as validation_error:
+                validation_result["status"] = "invalid"
+                validation_result["errors"].append(f"Schema validation failed: {validation_error}")
+                logger.error(f"LLM response validation failed: {validation_error}")
+                
+                # Log the failed validation
+                self._log_response(response, validation_result)
+                
+                # Fall back to manual parsing for backward compatibility
+                return self._fallback_parse_response(data, current_price)
+            
+        except Exception as e:
+            validation_result["status"] = "error"
+            validation_result["errors"].append(f"Parse error: {e}")
+            logger.error(f"Error parsing LLM response: {e}")
+            
+            # Log the error
+            self._log_response(response, validation_result)
+            
+            # Return neutral analysis as fallback
+            return MarketAnalysis(
+                sentiment="neutral",
+                confidence=0.5,
+                reasoning=f"Failed to parse LLM response: {str(e)}",
+                recommended_action="hold",
+                risk_level="medium"
+            )
+            
+        except Exception as e:
+            logger.error(f"Error parsing LLM response: {e}")
+            logger.error(f"Raw response: {response}")
+            
+            # Return neutral analysis as fallback
+            return MarketAnalysis(
+                sentiment="neutral",
+                confidence=0.5,
+                reasoning=f"Failed to parse LLM response: {str(e)}",
+                recommended_action="hold",
+                risk_level="medium"
+            )
+    
+    def _fallback_parse_response(self, data: Dict, current_price: float) -> MarketAnalysis:
+        """Fallback parsing when Pydantic validation fails"""
+        try:
             # Parse values with defaults
             sentiment = data.get('sentiment', 'neutral')
             confidence = float(data.get('confidence', 0.5))
@@ -244,23 +424,18 @@ Remember: Return ONLY the JSON object, nothing else.
             )
             
         except Exception as e:
-            logger.error(f"Error parsing LLM response: {e}")
-            logger.error(f"Raw response: {response}")
-            
-            # Return neutral analysis as fallback
+            logger.error(f"Fallback parsing failed: {e}")
             return MarketAnalysis(
                 sentiment="neutral",
                 confidence=0.5,
-                reasoning=f"Failed to parse LLM response: {str(e)}",
+                reasoning=f"Fallback parsing failed: {str(e)}",
                 recommended_action="hold",
                 risk_level="medium"
             )
-    
+
     def _extract_key_value_pairs(self, text: str) -> Dict:
         """Extract key-value pairs from malformed JSON text as fallback"""
         try:
-            import re
-            
             # Pattern to match key-value pairs
             pattern = r'"([^"]+)"\s*:\s*"([^"]*)"'
             matches = re.findall(pattern, text)
