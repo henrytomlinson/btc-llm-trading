@@ -105,6 +105,19 @@ def init_db() -> None:
             )
             """
         )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS settings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                key TEXT NOT NULL UNIQUE,
+                value TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+    
+    # Initialize default settings
+    init_default_settings()
 
 
 def _upsert_position(conn: sqlite3.Connection, symbol: str) -> None:
@@ -330,5 +343,64 @@ def get_hodl_benchmark(current_price: float) -> Tuple[float, float]:
         hodl_value = btc_if_hodl * get_last_price(conn, default=first_price)
         hodl_pnl = hodl_value - net_invested
         return hodl_value, hodl_pnl
+
+
+def read_settings() -> Dict:
+    """Read all settings from the database."""
+    with _connect() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT key, value FROM settings")
+        rows = cur.fetchall()
+        settings = {}
+        for row in rows:
+            key = row[0]
+            value = row[1]
+            # Try to convert to appropriate type
+            try:
+                if value.lower() in ('true', 'false'):
+                    settings[key] = value.lower() == 'true'
+                elif '.' in value:
+                    settings[key] = float(value)
+                else:
+                    settings[key] = int(value)
+            except (ValueError, AttributeError):
+                settings[key] = value
+        return settings
+
+
+def write_setting(key: str, value) -> None:
+    """Write a setting to the database."""
+    with _connect() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT OR REPLACE INTO settings(key, value, updated_at)
+            VALUES(?, ?, ?)
+            """,
+            (key, str(value), datetime.utcnow().isoformat())
+        )
+
+
+def get_setting(key: str, default=None):
+    """Get a single setting value from the database."""
+    settings = read_settings()
+    return settings.get(key, default)
+
+
+def init_default_settings() -> None:
+    """Initialize default settings if they don't exist."""
+    import os
+    defaults = {
+        "min_confidence": float(os.getenv("MIN_CONFIDENCE", "0.7")),
+        "max_exposure": float(os.getenv("MAX_EXPOSURE", "0.8")),
+        "trade_cooldown_hours": float(os.getenv("TRADE_COOLDOWN_HOURS", "3")),
+        "min_trade_delta": float(os.getenv("MIN_TRADE_DELTA", "0.05")),
+        "auto_trade_enabled": True,
+    }
+    
+    current_settings = read_settings()
+    for key, default_value in defaults.items():
+        if key not in current_settings:
+            write_setting(key, default_value)
 
 

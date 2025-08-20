@@ -9,6 +9,11 @@ import json
 import logging
 from datetime import datetime
 import time
+import os
+import sys
+
+# Add the current directory to Python path to import db module
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 # Configure logging
 logging.basicConfig(
@@ -27,9 +32,34 @@ TRADING_URL = "https://henryt-btc.live/auto_trade_scheduled"
 MAX_RETRIES = 3
 RETRY_DELAY = 30  # seconds
 
+def load_runtime_settings():
+    """Load runtime settings from database."""
+    try:
+        from db import read_settings
+        settings = read_settings()
+        return {
+            "max_exposure": float(settings.get("max_exposure", 0.8)),
+            "cooldown_hours": float(settings.get("trade_cooldown_hours", 3)),
+            "min_confidence": float(settings.get("min_confidence", 0.7)),
+            "min_trade_delta": float(settings.get("min_trade_delta", 0.05)),
+        }
+    except Exception as e:
+        logger.warning(f"Failed to load settings from DB: {e}")
+        # Fallback to environment variables
+        return {
+            "max_exposure": float(os.getenv("MAX_EXPOSURE", "0.8")),
+            "cooldown_hours": float(os.getenv("TRADE_COOLDOWN_HOURS", "3")),
+            "min_confidence": float(os.getenv("MIN_CONFIDENCE", "0.7")),
+            "min_trade_delta": float(os.getenv("MIN_TRADE_DELTA", "0.05")),
+        }
+
 def execute_auto_trade():
     """Execute automated trading via the API endpoint"""
     logger.info("🤖 Starting automated trading execution...")
+    
+    # Load current settings from database
+    settings = load_runtime_settings()
+    logger.info(f"⚙️ Current settings: max_exposure={settings['max_exposure']}, cooldown={settings['cooldown_hours']}h, min_confidence={settings['min_confidence']}, min_delta={settings['min_trade_delta']}")
     
     for attempt in range(MAX_RETRIES):
         try:

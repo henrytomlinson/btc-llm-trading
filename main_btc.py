@@ -464,11 +464,31 @@ def get_current_user(token: str = None):
 
 # Runtime settings and toggles
 AUTO_TRADE_ENABLED = True
-RUNTIME_SETTINGS = {
-    "min_confidence": float(os.getenv("MIN_CONFIDENCE", "0.7")),
-    "max_exposure": float(os.getenv("MAX_EXPOSURE", "0.8")),
-    "trade_cooldown_hours": float(os.getenv("TRADE_COOLDOWN_HOURS", "3")),
-}
+
+def load_runtime_settings():
+    """Load runtime settings from database."""
+    if LEDGER_AVAILABLE:
+        try:
+            from db import read_settings
+            settings = read_settings()
+            return {
+                "min_confidence": float(settings.get("min_confidence", 0.7)),
+                "max_exposure": float(settings.get("max_exposure", 0.8)),
+                "trade_cooldown_hours": float(settings.get("trade_cooldown_hours", 3)),
+                "min_trade_delta": float(settings.get("min_trade_delta", 0.05)),
+            }
+        except Exception as e:
+            logger.warning(f"Failed to load settings from DB: {e}")
+    
+    # Fallback to environment variables
+    return {
+        "min_confidence": float(os.getenv("MIN_CONFIDENCE", "0.7")),
+        "max_exposure": float(os.getenv("MAX_EXPOSURE", "0.8")),
+        "trade_cooldown_hours": float(os.getenv("TRADE_COOLDOWN_HOURS", "3")),
+        "min_trade_delta": float(os.getenv("MIN_TRADE_DELTA", "0.05")),
+    }
+
+RUNTIME_SETTINGS = load_runtime_settings()
 
 # After strategy and bot are initialized, sync runtime settings
 try:
@@ -488,11 +508,17 @@ async def get_settings(token: str = None):
         verify_jwt_token(token)
     except Exception:
         raise HTTPException(status_code=401, detail="Authentication required")
+    
+    # Load current settings from database
+    current_settings = load_runtime_settings()
+    auto_trade_enabled = get_setting("auto_trade_enabled", True) if LEDGER_AVAILABLE else AUTO_TRADE_ENABLED
+    
     return {
-        "auto_trade_enabled": AUTO_TRADE_ENABLED,
-        "min_confidence": RUNTIME_SETTINGS["min_confidence"],
-        "max_exposure": RUNTIME_SETTINGS["max_exposure"],
-        "trade_cooldown_hours": RUNTIME_SETTINGS["trade_cooldown_hours"],
+        "auto_trade_enabled": auto_trade_enabled,
+        "min_confidence": current_settings["min_confidence"],
+        "max_exposure": current_settings["max_exposure"],
+        "trade_cooldown_hours": current_settings["trade_cooldown_hours"],
+        "min_trade_delta": current_settings["min_trade_delta"],
     }
 
 @app.post("/settings")
@@ -502,6 +528,7 @@ async def update_settings(
     min_confidence: Optional[float] = Form(None),
     max_exposure: Optional[float] = Form(None),
     trade_cooldown_hours: Optional[float] = Form(None),
+    min_trade_delta: Optional[float] = Form(None),
 ):
     global AUTO_TRADE_ENABLED
     if not token:
@@ -511,8 +538,26 @@ async def update_settings(
     except Exception:
         raise HTTPException(status_code=401, detail="Authentication required")
 
+    # Write settings to database if available
+    if LEDGER_AVAILABLE:
+        try:
+            from db import write_setting
+            if auto_trade_enabled is not None:
+                write_setting("auto_trade_enabled", bool(auto_trade_enabled))
+            if min_confidence is not None:
+                write_setting("min_confidence", float(min_confidence))
+            if max_exposure is not None:
+                write_setting("max_exposure", float(max_exposure))
+            if trade_cooldown_hours is not None:
+                write_setting("trade_cooldown_hours", float(trade_cooldown_hours))
+            if min_trade_delta is not None:
+                write_setting("min_trade_delta", float(min_trade_delta))
+        except Exception as e:
+            logger.warning(f"Failed to write settings to DB: {e}")
+
+    # Update in-memory settings for immediate use
     if auto_trade_enabled is not None:
-        AUTO_TRADE_ENABLED = bool(str(auto_trade_enabled).lower() in ("true", "1", "on", "yes"))
+        AUTO_TRADE_ENABLED = bool(auto_trade_enabled)
     if min_confidence is not None:
         RUNTIME_SETTINGS["min_confidence"] = float(min_confidence)
         try:
@@ -534,10 +579,21 @@ async def update_settings(
                 trading_bot.trade_cooldown_hours = float(trade_cooldown_hours)
         except Exception:
             pass
+    if min_trade_delta is not None:
+        RUNTIME_SETTINGS["min_trade_delta"] = float(min_trade_delta)
+        try:
+            if trading_bot:
+                trading_bot.rebalance_threshold_pct = float(min_trade_delta)
+        except Exception:
+            pass
 
+    # Return current settings from database
+    current_settings = load_runtime_settings()
+    auto_trade_enabled_db = get_setting("auto_trade_enabled", True) if LEDGER_AVAILABLE else AUTO_TRADE_ENABLED
+    
     return {"status": "ok", "settings": {
-        "auto_trade_enabled": AUTO_TRADE_ENABLED,
-        **RUNTIME_SETTINGS,
+        "auto_trade_enabled": auto_trade_enabled_db,
+        **current_settings,
     }}
 
 @app.get("/equity_series")
@@ -1513,7 +1569,12 @@ async def auto_trade_scheduled(token: str = Form(...)):
     """Execute automated trading without authentication (for scheduled runs)"""
     logger.info("🤖 Scheduled Auto Trade endpoint called")
     
-    if not AUTO_TRADE_ENABLED:
+    # Check both in-memory and database settings
+    auto_trade_enabled_memory = AUTO_TRADE_ENABLED
+    auto_trade_enabled_db = get_setting("auto_trade_enabled", True) if LEDGER_AVAILABLE else True
+    
+    if not auto_trade_enabled_memory or not auto_trade_enabled_db:
+        logger.info(f"⏸️ Auto-trade disabled (memory: {auto_trade_enabled_memory}, db: {auto_trade_enabled_db})")
         return {"status": "skipped", "message": "Auto-trade disabled"}
     
     if not trading_bot:
@@ -1548,6 +1609,27 @@ async def _execute_auto_trade_scheduled():
     """Internal function to execute the scheduled auto trade logic"""
 
     try:
+        # Load current settings from database on each run
+        logger.info("📋 Loading current settings from database...")
+        current_settings = load_runtime_settings()
+        auto_trade_enabled = get_setting("auto_trade_enabled", True) if LEDGER_AVAILABLE else AUTO_TRADE_ENABLED
+        
+        if not auto_trade_enabled:
+            logger.info("⏸️ Auto-trade disabled in database settings")
+            return {"status": "skipped", "message": "Auto-trade disabled in database settings"}
+        
+        # Update trading components with current settings
+        try:
+            if llm_strategy:
+                llm_strategy.min_confidence = current_settings["min_confidence"]
+                llm_strategy.max_exposure = current_settings["max_exposure"]
+            if trading_bot:
+                trading_bot.trade_cooldown_hours = current_settings["trade_cooldown_hours"]
+                trading_bot.rebalance_threshold_pct = current_settings["min_trade_delta"]
+        except Exception as e:
+            logger.warning(f"Failed to update trading components with settings: {e}")
+        
+        logger.info(f"⚙️ Current settings: min_confidence={current_settings['min_confidence']}, max_exposure={current_settings['max_exposure']}, cooldown={current_settings['trade_cooldown_hours']}h, min_delta={current_settings['min_trade_delta']}")
         logger.info("🤖 Starting scheduled LLM market analysis...")
         
         # Get current market data
