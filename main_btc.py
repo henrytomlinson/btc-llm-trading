@@ -544,6 +544,15 @@ async def equity_series(token: str = None, limit: int = 500):
     except Exception as e:
         return {"equity_curve": [], "hodl_curve": [], "error": str(e)}
 
+@app.get("/equity_series_public")
+async def equity_series_public(limit: int = 500):
+    try:
+        eq = ledger_get_equity_curve(limit=limit)
+        hodl = ledger_get_hodl_curve(limit=limit)
+        return {"equity_curve": eq, "hodl_curve": hodl}
+    except Exception as e:
+        return {"equity_curve": [], "hodl_curve": [], "error": str(e)}
+
 @app.get("/", response_class=HTMLResponse)
 async def dashboard():
     """Main Bitcoin trading dashboard"""
@@ -725,21 +734,24 @@ async def dashboard():
             }
 
             async function loadEquityCharts() {
-                if (!jwtToken) return;
-                try {
-                    const res = await fetch('/equity_series?token=' + encodeURIComponent(jwtToken));
-                    if (!res.ok) return;
-                    const js = await res.json();
-                    const labels = (js.equity_curve||[]).map(p => p.timestamp);
-                    const equity = (js.equity_curve||[]).map(p => p.equity);
-                    const hodl = (js.hodl_curve||[]).map(p => p.hodl_value);
-                    const ctx = document.getElementById('equityChart') && document.getElementById('equityChart').getContext ? document.getElementById('equityChart').getContext('2d') : null;
-                    if (ctx){ if (equityChart) equityChart.destroy(); equityChart = new Chart(ctx, { type: 'line', data: { labels, datasets:[ {label:'Equity', data: equity, borderColor:'#17a2b8', fill:false}, {label:'HODL', data: hodl, borderColor:'#6c757d', fill:false} ]}, options: { responsive: true, maintainAspectRatio: false } }); }
-                    const pnl = []; for (let i=1;i<equity.length;i++){ pnl.push(equity[i]-equity[i-1]); }
-                    const pnlLabels = labels.slice(1);
-                    const ctx2 = document.getElementById('pnlChart') && document.getElementById('pnlChart').getContext ? document.getElementById('pnlChart').getContext('2d') : null;
-                    if (ctx2){ if (pnlChart) pnlChart.destroy(); pnlChart = new Chart(ctx2, { type: 'bar', data: { labels: pnlLabels, datasets:[{label:'PnL (per bar)', data: pnl, backgroundColor:'#f7931a'}]}, options: { responsive: true, maintainAspectRatio: false } }); }
-                } catch(e) { console.warn('Chart load failed', e); }
+                // Try authed first, then fallback to public
+                let js = null;
+                if (jwtToken){
+                    try { const res = await fetch('/equity_series?token=' + encodeURIComponent(jwtToken)); if (res.ok) js = await res.json(); } catch(_e){}
+                }
+                if (!js){
+                    try { const res2 = await fetch('/equity_series_public'); if (res2.ok) js = await res2.json(); } catch(_e){}
+                }
+                if (!js) return;
+                const labels = (js.equity_curve||[]).map(p => p.timestamp);
+                const equity = (js.equity_curve||[]).map(p => p.equity);
+                const hodl = (js.hodl_curve||[]).map(p => p.hodl_value);
+                const ctx = document.getElementById('equityChart') && document.getElementById('equityChart').getContext ? document.getElementById('equityChart').getContext('2d') : null;
+                if (ctx){ if (equityChart) equityChart.destroy(); equityChart = new Chart(ctx, { type: 'line', data: { labels, datasets:[ {label:'Equity', data: equity, borderColor:'#17a2b8', fill:false}, {label:'HODL', data: hodl, borderColor:'#6c757d', fill:false} ]}, options: { responsive: true, maintainAspectRatio: false } }); }
+                const pnl = []; for (let i=1;i<equity.length;i++){ pnl.push(equity[i]-equity[i-1]); }
+                const pnlLabels = labels.slice(1);
+                const ctx2 = document.getElementById('pnlChart') && document.getElementById('pnlChart').getContext ? document.getElementById('pnlChart').getContext('2d') : null;
+                if (ctx2){ if (pnlChart) pnlChart.destroy(); pnlChart = new Chart(ctx2, { type: 'bar', data: { labels: pnlLabels, datasets:[{label:'PnL (per bar)', data: pnl, backgroundColor:'#f7931a'}]}, options: { responsive: true, maintainAspectRatio: false } }); }
             }
 
             async function loadPnl() {
