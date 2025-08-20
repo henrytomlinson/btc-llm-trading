@@ -13,6 +13,7 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple, Literal
 from dataclasses import dataclass
 from pydantic import BaseModel, Field, validator, root_validator
+from strategy_core import decide_target_allocation
 
 logger = logging.getLogger(__name__)
 
@@ -543,14 +544,15 @@ Remember: Return ONLY the JSON object, nothing else.
             # Determine if trade should be executed
             should_trade, reason = self.should_execute_trade(analysis)
 
-            # Map to target allocation in [-max_exposure, +max_exposure]
-            # Negative values indicate desire to reduce to cash; we do not short.
+            # Compute target exposure via pure decision function
             target_exposure = 0.0
             if analysis.recommended_action in ["buy", "sell"]:
-                conf = max(0.0, min(1.0, float(analysis.confidence)))
-                sign = 1.0 if analysis.recommended_action == "buy" else -1.0
-                target_exposure = self.max_exposure * conf * sign
-            
+                target_exposure = decide_target_allocation(
+                    analysis.recommended_action,
+                    analysis.confidence,
+                    self.max_exposure,
+                )
+
             return {
                 "should_trade": should_trade,
                 "action": analysis.recommended_action,
