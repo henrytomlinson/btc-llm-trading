@@ -11,7 +11,7 @@ from datetime import datetime, timedelta
 from typing import List, Dict, Optional
 import jwt
 import secrets
-from fastapi import FastAPI, HTTPException, Form, Depends, Request
+from fastapi import FastAPI, HTTPException, Form, Depends, Request, Body
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -709,33 +709,20 @@ async def dashboard():
 
             async function loadEquityCharts() {
                 if (!jwtToken) return;
-                const res = await fetch('/equity_series?token=' + encodeURIComponent(jwtToken));
-                if (!res.ok) return;
-                const js = await res.json();
-                const labels = js.equity_curve.map(p => p.timestamp);
-                const equity = js.equity_curve.map(p => p.equity);
-                const hodl = (js.hodl_curve||[]).map(p => p.hodl_value);
-                const ctx = document.getElementById('equityChart').getContext('2d');
-                if (equityChart) equityChart.destroy();
-                equityChart = new Chart(ctx, {
-                    type: 'line',
-                    data: { labels, datasets:[
-                        {label:'Equity', data: equity, borderColor:'#17a2b8', fill:false},
-                        {label:'HODL', data: hodl, borderColor:'#6c757d', fill:false}
-                    ]},
-                    options: { responsive: true, maintainAspectRatio: false }
-                });
-                // Daily PnL series
-                const pnl = [];
-                for (let i=1;i<equity.length;i++){ pnl.push(equity[i]-equity[i-1]); }
-                const pnlLabels = labels.slice(1);
-                const ctx2 = document.getElementById('pnlChart').getContext('2d');
-                if (pnlChart) pnlChart.destroy();
-                pnlChart = new Chart(ctx2, {
-                    type: 'bar',
-                    data: { labels: pnlLabels, datasets:[{label:'PnL (per bar)', data: pnl, backgroundColor:'#f7931a'}]},
-                    options: { responsive: true, maintainAspectRatio: false }
-                });
+                try {
+                    const res = await fetch('/equity_series?token=' + encodeURIComponent(jwtToken));
+                    if (!res.ok) return;
+                    const js = await res.json();
+                    const labels = (js.equity_curve||[]).map(p => p.timestamp);
+                    const equity = (js.equity_curve||[]).map(p => p.equity);
+                    const hodl = (js.hodl_curve||[]).map(p => p.hodl_value);
+                    const ctx = document.getElementById('equityChart') && document.getElementById('equityChart').getContext ? document.getElementById('equityChart').getContext('2d') : null;
+                    if (ctx){ if (equityChart) equityChart.destroy(); equityChart = new Chart(ctx, { type: 'line', data: { labels, datasets:[ {label:'Equity', data: equity, borderColor:'#17a2b8', fill:false}, {label:'HODL', data: hodl, borderColor:'#6c757d', fill:false} ]}, options: { responsive: true, maintainAspectRatio: false } }); }
+                    const pnl = []; for (let i=1;i<equity.length;i++){ pnl.push(equity[i]-equity[i-1]); }
+                    const pnlLabels = labels.slice(1);
+                    const ctx2 = document.getElementById('pnlChart') && document.getElementById('pnlChart').getContext ? document.getElementById('pnlChart').getContext('2d') : null;
+                    if (ctx2){ if (pnlChart) pnlChart.destroy(); pnlChart = new Chart(ctx2, { type: 'bar', data: { labels: pnlLabels, datasets:[{label:'PnL (per bar)', data: pnl, backgroundColor:'#f7931a'}]}, options: { responsive: true, maintainAspectRatio: false } }); }
+                } catch(e) { console.warn('Chart load failed', e); }
             }
 
             async function loadPnl() {
@@ -767,6 +754,8 @@ async def dashboard():
                     const data = await response.json();
                         jwtToken = data.session_token;
                         localStorage.setItem('jwt_token', jwtToken);
+                        // Snapshot equity on first login to seed chart
+                        try { const f=new FormData(); f.append('token', jwtToken); await fetch('/snapshot_equity', {method:'POST', body:f}); } catch(_e){}
                         await loadSettings();
                         await refreshAll();
                         return true;
@@ -776,8 +765,8 @@ async def dashboard():
 
             function showLoginForm(){ document.getElementById('login-form').style.display='block'; document.getElementById('login-btn').style.display='none'; }
             function hideLoginForm(){ document.getElementById('login-form').style.display='none'; document.getElementById('login-btn').style.display='inline-block'; }
-            async function login(){ const u=document.getElementById('login-username').value; const p=document.getElementById('login-password').value; if (await loginUser(u,p)){ document.getElementById('login-status').textContent='Logged in as '+u; document.getElementById('login-btn').style.display='none'; document.getElementById('logout-btn').style.display='inline-block'; alert('Login successful!'); } else { alert('Login failed.'); } }
-            function logout(){ jwtToken=null; localStorage.removeItem('jwt_token'); document.getElementById('login-status').textContent='Not logged in'; document.getElementById('login-btn').style.display='inline-block'; document.getElementById('logout-btn').style.display='none'; alert('Logged out successfully!'); }
+            async function login(){ const u=document.getElementById('login-username').value; const p=document.getElementById('login-password').value; if (await loginUser(u,p)){ document.getElementById('login-status').textContent='Logged in as '+u; document.getElementById('login-btn').style.display='none'; document.getElementById('logout-btn').style.display='inline-block'; document.getElementById('login-form').style.display='none'; } else { alert('Login failed.'); } }
+            function logout(){ jwtToken=null; localStorage.removeItem('jwt_token'); document.getElementById('login-status').textContent='Not logged in'; document.getElementById('login-btn').style.display='inline-block'; document.getElementById('logout-btn').style.display='none'; }
 
             function loadBTCData(){ fetch('/btc_data_public').then(r=>r.json()).then(data=>{ if (data.error){ document.getElementById('btc-price').innerHTML='Error loading data'; document.getElementById('btc-info').innerHTML='<p>Unable to fetch market data</p>'; return; } document.getElementById('btc-price').innerHTML='$'+data.price.toLocaleString(); document.getElementById('btc-info').innerHTML=`<p><strong>24h Change:</strong> <span class="${data.change_24h >= 0 ? 'signal-buy' : 'signal-sell'}">${data.change_24h > 0 ? '+' : ''}${data.change_24h.toFixed(2)}%</span></p><p><strong>Volume:</strong> $${data.volume.toLocaleString()}</p>`; document.getElementById('btc-news').innerHTML=data.news||'Real-time Bitcoin data'; const sentimentText=data.sentiment>0?'Positive':data.sentiment<0?'Negative':'Neutral'; const sentimentClass=data.sentiment>0?'signal-buy':data.sentiment<0?'signal-sell':'signal-hold'; document.getElementById('signals').innerHTML=`<p><strong>Sentiment:</strong> <span class="${sentimentClass}">${sentimentText}</span></p><p><strong>Confidence:</strong> ${(data.probability*100).toFixed(1)}%</p><p><strong>Signal:</strong> <span class="${data.signal===1?'signal-buy':data.signal===-1?'signal-sell':'signal-hold'}">${data.signal===1?'BUY':data.signal===-1?'SELL':'HOLD'}</span></p>`; }).catch(()=>{ document.getElementById('btc-price').innerHTML='Error loading data'; document.getElementById('btc-info').innerHTML='<p>Unable to fetch market data</p>'; }); }
             
@@ -1640,6 +1629,24 @@ async def pnl_summary(token: str = None):
         qty_btc=pnl['qty_btc'],
         avg_cost=pnl['avg_cost']
     )
+
+# Snapshot equity endpoint
+@app.post("/snapshot_equity")
+async def snapshot_equity_endpoint(token: str = Form(...)):
+    if not token:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    try:
+        verify_jwt_token(token)
+    except Exception:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    try:
+        acct = trading_bot.get_account_info() if trading_bot else None
+        eq = float(acct.get('equity', 0.0)) if isinstance(acct, (dict, Dict)) else 0.0
+        if eq:
+            ledger_snapshot_equity(eq)
+        return {"status": "ok", "equity": eq}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000) 
