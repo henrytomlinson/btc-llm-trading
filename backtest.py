@@ -5,6 +5,7 @@ Requires a CSV with columns: timestamp, close.
 """
 import argparse
 import math
+from typing import Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -23,12 +24,12 @@ class BacktestConfig:
 
 
 def run_backtest(
-    df,
-    confidence_threshold=0.7,
-    max_exposure=0.8,
-    cooldown_bars=3,
-    fee_bps=10.0,
-):
+    df: pd.DataFrame,
+    confidence_threshold: float = 0.7,
+    max_exposure: float = 0.8,
+    cooldown_bars: int = 3,
+    fee_bps: float = 10.0,
+) -> Tuple[pd.DataFrame, dict]:
     df = df.copy()
     df = df.sort_values("timestamp").reset_index(drop=True)
 
@@ -105,7 +106,8 @@ def run_backtest(
     # Metrics
     total_return = df["equity"].iloc[-1] / df["equity"].iloc[0] - 1.0
     num_years = (pd.to_datetime(df["timestamp"]).iloc[-1] - pd.to_datetime(df["timestamp"]).iloc[0]).days / 365.25
-    cagr = (1 + total_return) ** (1 / max(num_years, 1e-9)) - 1.0
+    num_years = max(num_years, 0.001)  # Minimum 0.001 years to avoid division by zero
+    cagr = (1 + total_return) ** (1 / num_years) - 1.0
 
     # Daily (or bar) returns for Sharpe
     port_rets = pd.Series(df["equity"]).pct_change().fillna(0.0)
@@ -120,7 +122,7 @@ def run_backtest(
     start_price = float(df["close"].iloc[0])
     end_price = float(df["close"].iloc[-1])
     bh_return = end_price / start_price - 1.0
-    bh_cagr = (1 + bh_return) ** (1 / max(num_years, 1e-9)) - 1.0
+    bh_cagr = (1 + bh_return) ** (1 / num_years) - 1.0
 
     metrics = {
         "final_equity": float(df["equity"].iloc[-1]),
@@ -159,7 +161,7 @@ def main():
 
     print("Backtest Metrics:")
     for k, v in metrics.items():
-        print("- {}: {}".format(k, v))
+        print(f"- {k}: {v}")
 
 
 if __name__ == "__main__":
