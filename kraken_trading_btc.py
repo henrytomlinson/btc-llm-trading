@@ -350,6 +350,22 @@ class KrakenTradingBot:
             logger.error(f"Error calculating position size: {e}")
             return 0.0
 
+    def compute_exposure_summary(self, balances: Dict, last_price: float, equity: float) -> Tuple[float, float]:
+        """Compute exposure value and percentage using live balances and consistent price.
+        
+        Args:
+            balances: Live account balances from Kraken
+            last_price: The same price used for PnL calculations
+            equity: Total account equity
+            
+        Returns:
+            Tuple of (exposure_value_usd, exposure_percentage)
+        """
+        btc_qty = float(balances.get("XXBT", 0.0))
+        exposure_value = btc_qty * last_price if last_price else 0.0
+        exposure_pct = (exposure_value / equity) if (equity and equity > 0) else 0.0
+        return exposure_value, exposure_pct
+
     def get_current_exposure(self) -> Dict:
         """Return current BTC exposure as fraction of equity in [0,1]."""
         acct = self.get_account_info()
@@ -358,9 +374,11 @@ class KrakenTradingBot:
             mkt = self.get_market_data() or {}
             price = float(mkt.get('close', 0.0) or 0.0)
             balances = acct.get('balances', {}) or {}
+            
+            # Use the new compute_exposure_summary function
+            exposure_value, exposure_frac = self.compute_exposure_summary(balances, price, equity)
             btc_qty = float(balances.get('XXBT', '0') or 0.0)
-            exposure_usd = btc_qty * price
-            exposure_frac = (exposure_usd / equity) if equity > 0 else 0.0
+            
             return {"equity": equity, "btc_qty": btc_qty, "price": price, "exposure_frac": exposure_frac}
         return {"equity": 0.0, "btc_qty": 0.0, "price": 0.0, "exposure_frac": 0.0}
 
@@ -419,6 +437,31 @@ class KrakenTradingBot:
             # Keep only last 1000 orders to prevent memory bloat
             if len(self._executed_orders) > 1000:
                 self._executed_orders = set(list(self._executed_orders)[-1000:])
+            
+            # After every executed order: refresh balances and recompute exposure
+            try:
+                # 1) Refresh balances from Kraken
+                acct = self.get_account_info()
+                if isinstance(acct, dict) and 'balances' in acct:
+                    balances = acct.get('balances', {})
+                    equity = float(acct.get('equity', 0.0))
+                    
+                    # 2) Recompute exposure using the SAME last_price used for PnL
+                    # Use decision_price if provided, otherwise get current market price
+                    exposure_price = decision_price if decision_price else current_price
+                    exposure_value, exposure_pct = self.compute_exposure_summary(balances, exposure_price, equity)
+                    
+                    logger.info(f"Post-trade exposure: ${exposure_value:.2f} ({exposure_pct:.3%}) at price ${exposure_price:.2f}")
+                    
+                    # 3) Update result with fresh exposure data
+                    result['post_trade_exposure'] = {
+                        'exposure_value_usd': exposure_value,
+                        'exposure_percentage': exposure_pct,
+                        'price_used': exposure_price,
+                        'equity': equity
+                    }
+            except Exception as e:
+                logger.warning(f"Failed to refresh post-trade exposure: {e}")
                 
         return {"status": "executed" if result.get('status') == 'success' else 'error', "order": result, "current": current, "target": target_long, "delta": delta, "client_order_id": client_order_id}
     

@@ -1812,18 +1812,33 @@ async def pnl_summary(token: str = None):
 
     # Determine equity from broker if available; otherwise approximate
     equity = 0.0
+    exposure_value = 0.0
+    exposure_pct = 0.0
+    
     try:
         acct = trading_bot.get_account_info() if trading_bot else None
         if isinstance(acct, dict) and acct.get('equity') is not None:
             equity = float(acct.get('equity', 0.0))
+            
+            # Use improved exposure calculation with live balances and same price
+            if 'balances' in acct:
+                balances = acct.get('balances', {})
+                exposure_value, exposure_pct = trading_bot.compute_exposure_summary(balances, current_price, equity)
+            else:
+                # Fallback to ledger-based exposure
+                exposure_value = pnl['exposure_usd']
+                exposure_pct = (exposure_value / equity) if equity > 0 else 0.0
         else:
             cash_usd = float(acct.get('cash', 0.0)) if isinstance(acct, dict) else 0.0
             equity = cash_usd + pnl['exposure_usd']
+            exposure_value = pnl['exposure_usd']
+            exposure_pct = (exposure_value / equity) if equity > 0 else 0.0
     except Exception:
         equity = pnl['exposure_usd']
+        exposure_value = pnl['exposure_usd']
+        exposure_pct = (exposure_value / equity) if equity > 0 else 0.0
 
     hodl_value, hodl_pnl = ledger_get_hodl_benchmark(current_price)
-    exposure_pct = (pnl['exposure_usd'] / equity) if equity > 0 else 0.0
 
     return PnlSummary(
         symbol=pnl['symbol'],
@@ -1831,8 +1846,8 @@ async def pnl_summary(token: str = None):
         realized_pnl=pnl['realized_pnl'],
         unrealized_pnl=pnl['unrealized_pnl'],
         total_fees=pnl['fees'],
-        exposure_usd=pnl['exposure_usd'],
-        exposure_pct=exposure_pct,
+        exposure_usd=exposure_value,  # Use live balance-based exposure
+        exposure_pct=exposure_pct,    # Use live balance-based exposure percentage
         hodl_value=hodl_value,
         hodl_pnl=hodl_pnl,
         qty_btc=pnl['qty_btc'],
