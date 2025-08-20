@@ -5,7 +5,6 @@ Requires a CSV with columns: timestamp, close.
 """
 import argparse
 import math
-from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import numpy as np
@@ -14,14 +13,14 @@ import pandas as pd
 from strategy_core import decide_target_allocation
 
 
-@dataclass
 class BacktestConfig:
-    initial_equity: float = 10000.0
-    fee_bps: float = 10.0  # 0.10% per trade
-    max_exposure: float = 0.8
-    min_trade_threshold: float = 0.05  # 5% of equity
-    cooldown_bars: int = 3  # hours if data is hourly
-    min_order_usd: float = 10.0
+    def __init__(self):
+        self.initial_equity = 10000.0
+        self.fee_bps = 10.0  # 0.10% per trade
+        self.max_exposure = 0.8
+        self.min_trade_threshold = 0.05  # 5% of equity
+        self.cooldown_bars = 3  # hours if data is hourly
+        self.min_order_usd = 10.0
 
 
 def run_backtest(
@@ -49,7 +48,8 @@ def run_backtest(
     ]
 
     # Simulate portfolio
-    equity = BacktestConfig.initial_equity
+    config = BacktestConfig()
+    equity = config.initial_equity
     btc_qty = 0.0
     last_trade_idx = -9999
     fee_rate = fee_bps / 10000.0
@@ -76,7 +76,7 @@ def run_backtest(
         notional = abs(delta) * equity
 
         # Threshold and min order
-        if notional >= BacktestConfig.min_order_usd and abs(delta) >= BacktestConfig.min_trade_threshold:
+        if notional >= config.min_order_usd and abs(delta) >= config.min_trade_threshold:
             # Execute trade: buy/sell
             if delta > 0:
                 usd_to_buy = notional
