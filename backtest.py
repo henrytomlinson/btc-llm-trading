@@ -5,7 +5,6 @@ Requires a CSV with columns: timestamp, close.
 """
 import argparse
 import math
-from typing import Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -24,12 +23,12 @@ class BacktestConfig:
 
 
 def run_backtest(
-    df: pd.DataFrame,
-    confidence_threshold: float = 0.7,
-    max_exposure: float = 0.8,
-    cooldown_bars: int = 3,
-    fee_bps: float = 10.0,
-) -> Tuple[pd.DataFrame, dict]:
+    df,
+    confidence_threshold=0.7,
+    max_exposure=0.8,
+    cooldown_bars=3,
+    fee_bps=10.0,
+):
     df = df.copy()
     df = df.sort_values("timestamp").reset_index(drop=True)
 
