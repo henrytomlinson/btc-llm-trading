@@ -159,7 +159,7 @@ def main():
 
     print("Backtest Metrics:")
     for k, v in metrics.items():
-        print(f"- {k}: {v}")
+        print("- {}: {}".format(k, v))
 
 
 if __name__ == "__main__":
