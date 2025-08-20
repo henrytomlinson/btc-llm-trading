@@ -20,7 +20,6 @@ from typing import Dict, Optional, Tuple
 
 
 DB_PATH = os.getenv("TRADING_DB_PATH", "/opt/btc-trading/trades.db")
-os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
 
 
 @contextmanager
@@ -36,6 +35,21 @@ def _connect():
 
 def init_db() -> None:
     """Create tables if they don't exist."""
+    global DB_PATH
+    # Ensure directory exists, with safe fallbacks if permission denied
+    target_dir = os.path.dirname(DB_PATH) or "."
+    try:
+        os.makedirs(target_dir, exist_ok=True)
+    except Exception:
+        # Fallback to /data, then /tmp
+        for fallback in ("/data", "/tmp"):
+            try:
+                os.makedirs(fallback, exist_ok=True)
+                DB_PATH = os.path.join(fallback, "trades.db")
+                break
+            except Exception:
+                continue
+
     with _connect() as conn:
         cur = conn.cursor()
         cur.execute(
