@@ -852,33 +852,69 @@ async def dashboard():
             async function login(){ const u=document.getElementById('login-username').value; const p=document.getElementById('login-password').value; if (await loginUser(u,p)){ /* UI already updated */ } else { alert('Login failed.'); } }
             function logout(){ jwtToken=null; localStorage.removeItem('jwt_token'); setAuthUi(false); }
 
-            function loadBTCData(){ fetch('/btc_data_public').then(r=>r.json()).then(data=>{ 
-                // Handle graceful degradation
-                if (data.status === 'degraded') {
-                    document.getElementById('btc-price').innerHTML = data.price ? '$'+data.price.toLocaleString() : 'Data unavailable';
-                    document.getElementById('btc-info').innerHTML = `<p><strong>Status:</strong> <span class="signal-hold">Degraded</span></p><p><strong>Last Update:</strong> ${data.last_update}</p>${data.message ? '<p><strong>Message:</strong> '+data.message+'</p>' : ''}`;
-                    document.getElementById('btc-news').innerHTML = 'Real-time Bitcoin data (degraded mode)';
-                    document.getElementById('signals').innerHTML = '<p><strong>Sentiment:</strong> <span class="signal-hold">Unavailable</span></p><p><strong>Signal:</strong> <span class="signal-hold">HOLD</span></p>';
-                    return;
+            // Badge system for status indicators
+            function showBadge(text) {
+                let badge = document.getElementById('status-badge');
+                if (!badge) {
+                    badge = document.createElement('div');
+                    badge.id = 'status-badge';
+                    badge.style.cssText = 'position:fixed;top:10px;right:10px;background:#ff6b6b;color:white;padding:8px 12px;border-radius:4px;font-size:12px;z-index:1000;box-shadow:0 2px 4px rgba(0,0,0,0.2);';
+                    document.body.appendChild(badge);
                 }
-                
-                // Handle normal response
-                if (data.status === 'ok') {
-                    document.getElementById('btc-price').innerHTML = '$'+data.price.toLocaleString();
-                    document.getElementById('btc-info').innerHTML = `<p><strong>24h Change:</strong> <span class="${data.change_24h >= 0 ? 'signal-buy' : 'signal-sell'}">${data.change_24h > 0 ? '+' : ''}${data.change_24h.toFixed(2)}%</span></p><p><strong>Volume:</strong> $${data.volume_24h.toLocaleString()}</p><p><strong>Last Update:</strong> ${data.last_update}</p>`;
-                    document.getElementById('btc-news').innerHTML = 'Real-time Bitcoin data';
-                    document.getElementById('signals').innerHTML = '<p><strong>Sentiment:</strong> <span class="signal-hold">Loading...</span></p><p><strong>Signal:</strong> <span class="signal-hold">HOLD</span></p>';
+                badge.textContent = text;
+                badge.style.display = 'block';
+            }
+            
+            function hideBadge() {
+                const badge = document.getElementById('status-badge');
+                if (badge) badge.style.display = 'none';
+            }
+            
+            // Render ticker with price data
+            function renderTicker(data) {
+                if (data.price) {
+                    document.getElementById('btc-price').innerHTML = '$' + data.price.toLocaleString();
+                    if (data.change_24h !== null) {
+                        const changeClass = data.change_24h >= 0 ? 'signal-buy' : 'signal-sell';
+                        const changeSign = data.change_24h > 0 ? '+' : '';
+                        document.getElementById('btc-info').innerHTML = `<p><strong>24h Change:</strong> <span class="${changeClass}">${changeSign}${data.change_24h.toFixed(2)}%</span></p>`;
+                        if (data.volume_24h !== null) {
+                            document.getElementById('btc-info').innerHTML += `<p><strong>Volume:</strong> $${data.volume_24h.toLocaleString()}</p>`;
+                        }
+                        if (data.last_update) {
+                            document.getElementById('btc-info').innerHTML += `<p><strong>Last Update:</strong> ${data.last_update}</p>`;
+                        }
+                    }
                 } else {
-                    // Fallback for unexpected response format
                     document.getElementById('btc-price').innerHTML = 'Data unavailable';
                     document.getElementById('btc-info').innerHTML = '<p>Unable to fetch market data</p>';
-                    document.getElementById('btc-news').innerHTML = 'Real-time Bitcoin data';
-                    document.getElementById('signals').innerHTML = '<p><strong>Sentiment:</strong> <span class="signal-hold">Unavailable</span></p><p><strong>Signal:</strong> <span class="signal-hold">HOLD</span></p>';
                 }
-            }).catch(()=>{ 
-                document.getElementById('btc-price').innerHTML='Error loading data'; 
-                document.getElementById('btc-info').innerHTML='<p>Unable to fetch market data</p>'; 
-            }); }
+                document.getElementById('btc-news').innerHTML = 'Real-time Bitcoin data';
+                document.getElementById('signals').innerHTML = '<p><strong>Sentiment:</strong> <span class="signal-hold">Loading...</span></p><p><strong>Signal:</strong> <span class="signal-hold">HOLD</span></p>';
+            }
+            
+            // Improved public data loading with graceful degradation
+            async function loadPublicData() {
+                try {
+                    const r = await fetch("/btc_data_public", {cache: "no-store"});
+                    const j = await r.json();
+                    renderTicker(j); // show price even in 'degraded'
+                    if (j.status !== "ok") {
+                        showBadge("Data: degraded");
+                    } else {
+                        hideBadge();
+                    }
+                } catch(err) {
+                    showBadge("Data: offline");
+                    document.getElementById('btc-price').innerHTML = 'Data unavailable';
+                    document.getElementById('btc-info').innerHTML = '<p>Unable to fetch market data</p>';
+                }
+            }
+            
+            // Legacy function for backward compatibility
+            function loadBTCData() {
+                loadPublicData();
+            }
             
             async function refreshAll(){ await loadPnlHeader(); await loadPnl(); await loadEquityCharts(); }
             setInterval(refreshAll, 60000);
