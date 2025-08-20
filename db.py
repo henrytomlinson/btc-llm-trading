@@ -15,7 +15,7 @@ import os
 import json
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, Optional, Tuple, List
 
 
@@ -112,6 +112,18 @@ def init_db() -> None:
                 key TEXT NOT NULL UNIQUE,
                 value TEXT NOT NULL,
                 updated_at TEXT NOT NULL
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS trade_locks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                lock_key TEXT NOT NULL UNIQUE,
+                acquired_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                process_id TEXT,
+                metadata TEXT
             )
             """
         )
@@ -402,5 +414,129 @@ def init_default_settings() -> None:
     for key, default_value in defaults.items():
         if key not in current_settings:
             write_setting(key, default_value)
+
+
+def acquire_trade_lock(lock_key: str = "auto_trade", ttl_sec: int = 600, process_id: str = None, metadata: Dict = None) -> bool:
+    """Acquire a trade lock with TTL.
+    
+    Args:
+        lock_key: Unique identifier for the lock
+        ttl_sec: Time-to-live in seconds (default 10 minutes)
+        process_id: Optional process identifier
+        metadata: Optional metadata for the lock
+        
+    Returns:
+        True if lock was acquired, False if already held and not expired
+    """
+    now = datetime.utcnow()
+    expires_at = now.replace(microsecond=0) + timedelta(seconds=ttl_sec)
+    
+    with _connect() as conn:
+        cur = conn.cursor()
+        
+        # First, clean up expired locks
+        cur.execute(
+            "DELETE FROM trade_locks WHERE expires_at < ?",
+            (now.isoformat(),)
+        )
+        
+        # Try to acquire the lock
+        try:
+            cur.execute(
+                """
+                INSERT INTO trade_locks(lock_key, acquired_at, expires_at, process_id, metadata)
+                VALUES(?, ?, ?, ?, ?)
+                """,
+                (
+                    lock_key,
+                    now.isoformat(),
+                    expires_at.isoformat(),
+                    process_id or str(os.getpid()),
+                    json.dumps(metadata or {})
+                )
+            )
+            return True
+        except sqlite3.IntegrityError:
+            # Lock already exists, check if it's expired
+            cur.execute(
+                "SELECT expires_at FROM trade_locks WHERE lock_key = ?",
+                (lock_key,)
+            )
+            row = cur.fetchone()
+            if row:
+                existing_expires = datetime.fromisoformat(row[0])
+                if existing_expires < now:
+                    # Lock is expired, update it
+                    cur.execute(
+                        """
+                        UPDATE trade_locks 
+                        SET acquired_at = ?, expires_at = ?, process_id = ?, metadata = ?
+                        WHERE lock_key = ?
+                        """,
+                        (
+                            now.isoformat(),
+                            expires_at.isoformat(),
+                            process_id or str(os.getpid()),
+                            json.dumps(metadata or {}),
+                            lock_key
+                        )
+                    )
+                    return True
+            return False
+
+
+def release_trade_lock(lock_key: str = "auto_trade") -> bool:
+    """Release a trade lock.
+    
+    Args:
+        lock_key: Unique identifier for the lock
+        
+    Returns:
+        True if lock was released, False if it didn't exist
+    """
+    with _connect() as conn:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM trade_locks WHERE lock_key = ?", (lock_key,))
+        return cur.rowcount > 0
+
+
+def get_trade_lock_info(lock_key: str = "auto_trade") -> Optional[Dict]:
+    """Get information about a trade lock.
+    
+    Args:
+        lock_key: Unique identifier for the lock
+        
+    Returns:
+        Dictionary with lock info or None if not found
+    """
+    with _connect() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT lock_key, acquired_at, expires_at, process_id, metadata FROM trade_locks WHERE lock_key = ?",
+            (lock_key,)
+        )
+        row = cur.fetchone()
+        if row:
+            return {
+                "lock_key": row[0],
+                "acquired_at": row[1],
+                "expires_at": row[2],
+                "process_id": row[3],
+                "metadata": json.loads(row[4]) if row[4] else {}
+            }
+        return None
+
+
+def cleanup_expired_locks() -> int:
+    """Clean up expired trade locks.
+    
+    Returns:
+        Number of locks cleaned up
+    """
+    now = datetime.utcnow()
+    with _connect() as conn:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM trade_locks WHERE expires_at < ?", (now.isoformat(),))
+        return cur.rowcount
 
 

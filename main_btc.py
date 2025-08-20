@@ -488,6 +488,16 @@ def load_runtime_settings():
         "min_trade_delta": float(os.getenv("MIN_TRADE_DELTA", "0.05")),
     }
 
+def get_setting(key: str, default=None):
+    """Get a single setting value from the database."""
+    if LEDGER_AVAILABLE:
+        try:
+            from db import get_setting as db_get_setting
+            return db_get_setting(key, default)
+        except Exception as e:
+            logger.warning(f"Failed to get setting {key} from DB: {e}")
+    return default
+
 RUNTIME_SETTINGS = load_runtime_settings()
 
 # After strategy and bot are initialized, sync runtime settings
@@ -595,6 +605,97 @@ async def update_settings(
         "auto_trade_enabled": auto_trade_enabled_db,
         **current_settings,
     }}
+
+@app.get("/lock_status")
+async def get_lock_status(token: str = None):
+    """Get current trade lock status"""
+    if not token:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    try:
+        verify_jwt_token(token)
+    except Exception:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    
+    if not LEDGER_AVAILABLE:
+        return {"status": "error", "message": "Database not available"}
+    
+    try:
+        from db import get_trade_lock_info, cleanup_expired_locks
+        
+        # Clean up expired locks first
+        cleaned = cleanup_expired_locks()
+        if cleaned > 0:
+            logger.info(f"🧹 Cleaned up {cleaned} expired trade locks")
+        
+        # Get current lock info
+        lock_info = get_trade_lock_info("auto_trade_scheduled")
+        
+        if lock_info:
+            # Check if lock is expired
+            from datetime import datetime
+            expires_at = datetime.fromisoformat(lock_info['expires_at'])
+            now = datetime.utcnow()
+            is_expired = expires_at < now
+            
+            return {
+                "status": "ok",
+                "lock_held": not is_expired,
+                "lock_info": {
+                    "process_id": lock_info['process_id'],
+                    "acquired_at": lock_info['acquired_at'],
+                    "expires_at": lock_info['expires_at'],
+                    "is_expired": is_expired,
+                    "metadata": lock_info['metadata']
+                }
+            }
+        else:
+            return {
+                "status": "ok",
+                "lock_held": False,
+                "lock_info": None
+            }
+            
+    except Exception as e:
+        logger.error(f"Error getting lock status: {e}")
+        return {"status": "error", "message": f"Error getting lock status: {str(e)}"}
+
+@app.post("/release_lock")
+async def release_lock(token: str = Form(...), lock_key: str = Form("auto_trade_scheduled")):
+    """Force release a trade lock (admin only)"""
+    if not token:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    try:
+        verify_jwt_token(token)
+    except Exception:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    
+    if not LEDGER_AVAILABLE:
+        return {"status": "error", "message": "Database not available"}
+    
+    try:
+        from db import release_trade_lock, get_trade_lock_info
+        
+        # Check if lock exists
+        lock_info = get_trade_lock_info(lock_key)
+        if not lock_info:
+            return {"status": "ok", "message": f"Lock '{lock_key}' not found"}
+        
+        # Release the lock
+        released = release_trade_lock(lock_key)
+        
+        if released:
+            logger.warning(f"🔓 Force released trade lock '{lock_key}' (was held by PID: {lock_info['process_id']})")
+            return {
+                "status": "ok", 
+                "message": f"Lock '{lock_key}' released successfully",
+                "released_lock": lock_info
+            }
+        else:
+            return {"status": "error", "message": f"Failed to release lock '{lock_key}'"}
+            
+    except Exception as e:
+        logger.error(f"Error releasing lock: {e}")
+        return {"status": "error", "message": f"Error releasing lock: {str(e)}"}
 
 @app.get("/equity_series")
 async def equity_series(token: str = None, limit: int = 500):
@@ -1592,18 +1693,57 @@ async def auto_trade_scheduled(token: str = Form(...)):
         logger.warning("Invalid token for scheduled auto trade")
         raise HTTPException(status_code=401, detail="Authentication required")
 
-    # Use file lock to ensure only one instance runs at a time
-    lock_path = "/data/auto_trade.lock"
-    try:
-        with exclusive_lock(lock_path):
-            logger.info("🔒 Acquired exclusive lock for scheduled auto trade")
-            return await _execute_auto_trade_scheduled()
-    except BlockingIOError:
-        logger.warning("⏸️ Another auto trade instance is already running")
-        return {"status": "skipped", "message": "Another auto trade instance is already running"}
-    except Exception as e:
-        logger.error(f"❌ Lock acquisition failed: {e}")
-        return {"status": "error", "message": f"Lock acquisition failed: {str(e)}"}
+    # Use database lock to ensure only one instance runs at a time
+    if LEDGER_AVAILABLE:
+        try:
+            from db import acquire_trade_lock, release_trade_lock, get_trade_lock_info
+            
+            # Try to acquire the trade lock (10 minute TTL)
+            lock_acquired = acquire_trade_lock(
+                lock_key="auto_trade_scheduled",
+                ttl_sec=600,  # 10 minutes
+                process_id=f"web_{os.getpid()}",
+                metadata={"endpoint": "auto_trade_scheduled", "timestamp": datetime.now().isoformat()}
+            )
+            
+            if not lock_acquired:
+                # Check if there's an existing lock
+                lock_info = get_trade_lock_info("auto_trade_scheduled")
+                if lock_info:
+                    logger.warning(f"⏸️ Another auto trade instance is already running (PID: {lock_info['process_id']}, expires: {lock_info['expires_at']})")
+                    return {"status": "skipped", "message": f"Another auto trade instance is already running (expires: {lock_info['expires_at']})"}
+                else:
+                    logger.warning("⏸️ Failed to acquire trade lock")
+                    return {"status": "skipped", "message": "Failed to acquire trade lock"}
+            
+            logger.info("🔒 Acquired database lock for scheduled auto trade")
+            
+            try:
+                return await _execute_auto_trade_scheduled()
+            finally:
+                # Always release the lock
+                released = release_trade_lock("auto_trade_scheduled")
+                if released:
+                    logger.info("🔓 Released database lock for scheduled auto trade")
+                else:
+                    logger.warning("⚠️ Failed to release database lock")
+                    
+        except Exception as e:
+            logger.error(f"❌ Database lock acquisition failed: {e}")
+            return {"status": "error", "message": f"Database lock acquisition failed: {str(e)}"}
+    else:
+        # Fallback to file lock if database not available
+        lock_path = "/data/auto_trade.lock"
+        try:
+            with exclusive_lock(lock_path):
+                logger.info("🔒 Acquired file lock for scheduled auto trade (fallback)")
+                return await _execute_auto_trade_scheduled()
+        except BlockingIOError:
+            logger.warning("⏸️ Another auto trade instance is already running (file lock)")
+            return {"status": "skipped", "message": "Another auto trade instance is already running"}
+        except Exception as e:
+            logger.error(f"❌ File lock acquisition failed: {e}")
+            return {"status": "error", "message": f"File lock acquisition failed: {str(e)}"}
 
 async def _execute_auto_trade_scheduled():
     """Internal function to execute the scheduled auto trade logic"""
