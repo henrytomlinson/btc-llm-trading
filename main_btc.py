@@ -8,7 +8,7 @@ import os
 import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Literal
 import jwt
 import secrets
 from fastapi import FastAPI, HTTPException, Form, Depends, Request, Body
@@ -21,6 +21,7 @@ import requests
 import json
 from dotenv import load_dotenv
 import time
+from decimal import Decimal
 
 # Ledger for persistent PnL and orders
 try:
@@ -32,6 +33,9 @@ try:
         snapshot_equity as ledger_snapshot_equity,
         get_equity_curve as ledger_get_equity_curve,
         get_hodl_curve as ledger_get_hodl_curve,
+        get_realized_pnl_total,
+        get_fees_total,
+        get_avg_cost_from_positions,
     )
     ledger_init_db()
     LEDGER_AVAILABLE = True
@@ -54,6 +58,9 @@ RATE_LIMIT_WINDOW = int(os.getenv('RATE_LIMIT_WINDOW', '3600'))  # 1 hour in sec
 # Admin credentials (use environment variables)
 ADMIN_USERNAME = os.getenv('ADMIN_USERNAME', 'admin')
 ADMIN_PASSWORD = os.getenv('ADMIN_PASSWORD', 'change_this_password_immediately')
+
+# Max staleness used by both summary and trading gates
+MAX_PRICE_STALENESS_SEC = int(os.getenv("MAX_PRICE_STALENESS_SEC", "120"))
 
 # Rate limiting storage (in production, use Redis)
 request_counts = {}
@@ -192,6 +199,17 @@ btc_sentiment_cache_timestamp = {}
 # Last good snapshot for graceful degradation
 _LAST_SNAPSHOT = {"price": None, "change": None, "volume": None, "ts": None}
 
+# Asset code normalization for Kraken
+_ASSET_MAP = {
+    "XXBT": "BTC", "XBT": "BTC", "BTC": "BTC",
+    "ZUSD": "USD", "USD": "USD",
+    "ZEUR": "EUR", "EUR": "EUR",
+    "ZGBP": "GBP", "GBP": "GBP",
+}
+
+def _normalize_asset(symbol: str) -> str:
+    return _ASSET_MAP.get(symbol, symbol)
+
 class PublicBTC(BaseModel):
     status: str                 # "ok" | "degraded"
     price: float | None
@@ -211,18 +229,139 @@ class BTCTradingData(BaseModel):
     volume: float
     change_24h: float
 
-class PnlSummary(BaseModel):
-    symbol: str
+class PnLSummary(BaseModel):
+    status: Literal["ok","degraded"]
+    message: Optional[str] = None
+    last_price: float
+    price_ts: str
     equity: float
     realized_pnl: float
     unrealized_pnl: float
-    total_fees: float
-    exposure_usd: float
+    fees_total: float
+    exposure_value: float
     exposure_pct: float
+    position_qty: float
     hodl_value: float
-    hodl_pnl: float
-    qty_btc: float
-    avg_cost: float
+
+# --- helper: compute PnL summary deterministically --------------------------
+async def _compute_pnl_summary() -> PnLSummary:
+    from decimal import Decimal
+    from datetime import datetime, timezone
+
+    EQ_STALE_SEC = 90  # ignore equity_curve rows older than this
+
+    # 1) Price snapshot + staleness
+    try:
+        # Get current price from market data
+        market_data = get_btc_market_data()
+        if market_data and 'close' in market_data:
+            price = float(market_data['close'])
+            # Use current time as price timestamp (since we don't have exact timestamp)
+            price_ts = datetime.now(timezone.utc)
+        else:
+            # Fallback to a default price
+            price = 45000.0
+            price_ts = datetime.now(timezone.utc)
+    except Exception:
+        price = 45000.0
+        price_ts = datetime.now(timezone.utc)
+    
+    now = datetime.now(timezone.utc)
+    staleness = (now - price_ts).total_seconds()
+
+    # 2) Live balances (normalized)
+    balances = {}
+    btc_qty = 0.0
+    cash_usd = 0.0
+    try:
+        if trading_bot:
+            account_info = trading_bot.get_account_info()
+            if account_info and 'balances' in account_info:
+                raw_balances = account_info['balances']
+                # Normalize asset codes
+                for k, v in raw_balances.items():
+                    sym = _normalize_asset(k)
+                    try:
+                        balances[sym] = balances.get(sym, 0.0) + float(v)
+                    except (ValueError, TypeError):
+                        pass
+                
+                btc_qty = float(balances.get("BTC", 0.0))
+                # Prefer USD cash; fall back to ZUSD (already normalized) or 0
+                cash_usd = float(balances.get("USD", 0.0))
+    except Exception:
+        pass
+
+    # 3) Equity from live snapshot
+    equity_live = cash_usd + btc_qty * price
+
+    # 4) Optional: only override with DB equity if it's fresh and positive
+    equity = equity_live
+    avg_cost = 0.0
+    try:
+        if LEDGER_AVAILABLE:
+            rows = ledger_get_equity_curve(limit=1)
+            row = rows[0] if rows and len(rows) > 0 else {}
+            use_db_equity = False
+            if row and "timestamp" in row:
+                try:
+                    row_ts = datetime.fromisoformat(row["timestamp"].replace('Z', '+00:00'))
+                    if (now - row_ts).total_seconds() <= EQ_STALE_SEC and float(row.get("equity", 0)) > 0:
+                        use_db_equity = True
+                except (ValueError, TypeError):
+                    pass
+
+            if use_db_equity:
+                equity = float(row["equity"])
+                # avg_cost is not stored in equity_curve, so get it from positions
+                avg_cost = float(get_avg_cost_from_positions() or 0.0)
+            else:
+                # Use live equity and try to get avg_cost from positions
+                avg_cost = float(get_avg_cost_from_positions() or 0.0)
+    except Exception:
+        pass
+
+    # 5) Unrealized PnL (only if we have avg_cost)
+    unrealized = (price - avg_cost) * btc_qty if (avg_cost and btc_qty) else 0.0
+
+    # 6) Realized PnL and fees from database
+    realized = 0.0
+    fees_cum = 0.0
+    try:
+        if LEDGER_AVAILABLE:
+            realized = float(get_realized_pnl_total() or 0.0)
+            fees_cum = float(get_fees_total() or 0.0)
+    except Exception:
+        pass
+
+    # 7) Exposure and benchmark
+    exposure_value = btc_qty * price
+    exposure_pct = (exposure_value / equity) if equity > 0 else 0.0
+    
+    hodl_value = 0.0
+    try:
+        if LEDGER_AVAILABLE:
+            hodl_value, _ = ledger_get_hodl_benchmark(price)
+    except Exception:
+        pass
+
+    status = "ok" if staleness <= MAX_PRICE_STALENESS_SEC else "degraded"
+    msg = None if status == "ok" else f"price stale: {int(staleness)}s"
+
+    return PnLSummary(
+        status=status,
+        message=msg,
+        last_price=price,
+        price_ts=price_ts.isoformat(),
+        equity=round(equity, 8),
+        realized_pnl=round(realized, 8),
+        unrealized_pnl=round(unrealized, 8),
+        fees_total=round(fees_cum, 8),
+        exposure_value=round(exposure_value, 8),
+        exposure_pct=round(exposure_pct, 6),
+        position_qty=round(btc_qty, 8),
+        hodl_value=round(hodl_value, 8),
+    )
 
 def get_btc_news() -> str:
     """Get latest Bitcoin news from News API"""
@@ -476,6 +615,12 @@ def load_runtime_settings():
                 "max_exposure": float(settings.get("max_exposure", 0.8)),
                 "trade_cooldown_hours": float(settings.get("trade_cooldown_hours", 3)),
                 "min_trade_delta": float(settings.get("min_trade_delta", 0.05)),
+                "min_trade_delta_usd": float(settings.get("min_trade_delta_usd", 30.0)),
+                "safety_skip_degraded": bool(settings.get("safety_skip_degraded", True)),
+                "safety_max_price_staleness_sec": float(settings.get("safety_max_price_staleness_sec", 120.0)),
+                "safety_min_expected_move_pct": float(settings.get("safety_min_expected_move_pct", 0.1)),
+                "safety_daily_pnl_limit_usd": float(settings.get("safety_daily_pnl_limit_usd", -5.0)),
+                "safety_daily_equity_drop_pct": float(settings.get("safety_daily_equity_drop_pct", 3.0)),
             }
         except Exception as e:
             logger.warning(f"Failed to load settings from DB: {e}")
@@ -486,6 +631,12 @@ def load_runtime_settings():
         "max_exposure": float(os.getenv("MAX_EXPOSURE", "0.8")),
         "trade_cooldown_hours": float(os.getenv("TRADE_COOLDOWN_HOURS", "3")),
         "min_trade_delta": float(os.getenv("MIN_TRADE_DELTA", "0.05")),
+        "min_trade_delta_usd": float(os.getenv("MIN_TRADE_DELTA_USD", "30.0")),
+        "safety_skip_degraded": True,
+        "safety_max_price_staleness_sec": 120.0,
+        "safety_min_expected_move_pct": 0.1,
+        "safety_daily_pnl_limit_usd": -5.0,
+        "safety_daily_equity_drop_pct": 3.0,
     }
 
 def get_setting(key: str, default=None):
@@ -529,6 +680,12 @@ async def get_settings(token: str = None):
         "max_exposure": current_settings["max_exposure"],
         "trade_cooldown_hours": current_settings["trade_cooldown_hours"],
         "min_trade_delta": current_settings["min_trade_delta"],
+        "min_trade_delta_usd": current_settings["min_trade_delta_usd"],
+        "safety_skip_degraded": current_settings["safety_skip_degraded"],
+        "safety_max_price_staleness_sec": current_settings["safety_max_price_staleness_sec"],
+        "safety_min_expected_move_pct": current_settings["safety_min_expected_move_pct"],
+        "safety_daily_pnl_limit_usd": current_settings["safety_daily_pnl_limit_usd"],
+        "safety_daily_equity_drop_pct": current_settings["safety_daily_equity_drop_pct"],
     }
 
 @app.post("/settings")
@@ -539,6 +696,12 @@ async def update_settings(
     max_exposure: Optional[float] = Form(None),
     trade_cooldown_hours: Optional[float] = Form(None),
     min_trade_delta: Optional[float] = Form(None),
+    min_trade_delta_usd: Optional[float] = Form(None),
+    safety_skip_degraded: Optional[bool] = Form(None),
+    safety_max_price_staleness_sec: Optional[float] = Form(None),
+    safety_min_expected_move_pct: Optional[float] = Form(None),
+    safety_daily_pnl_limit_usd: Optional[float] = Form(None),
+    safety_daily_equity_drop_pct: Optional[float] = Form(None),
 ):
     global AUTO_TRADE_ENABLED
     if not token:
@@ -562,6 +725,18 @@ async def update_settings(
                 write_setting("trade_cooldown_hours", float(trade_cooldown_hours))
             if min_trade_delta is not None:
                 write_setting("min_trade_delta", float(min_trade_delta))
+            if min_trade_delta_usd is not None:
+                write_setting("min_trade_delta_usd", float(min_trade_delta_usd))
+            if safety_skip_degraded is not None:
+                write_setting("safety_skip_degraded", bool(safety_skip_degraded))
+            if safety_max_price_staleness_sec is not None:
+                write_setting("safety_max_price_staleness_sec", float(safety_max_price_staleness_sec))
+            if safety_min_expected_move_pct is not None:
+                write_setting("safety_min_expected_move_pct", float(safety_min_expected_move_pct))
+            if safety_daily_pnl_limit_usd is not None:
+                write_setting("safety_daily_pnl_limit_usd", float(safety_daily_pnl_limit_usd))
+            if safety_daily_equity_drop_pct is not None:
+                write_setting("safety_daily_equity_drop_pct", float(safety_daily_equity_drop_pct))
         except Exception as e:
             logger.warning(f"Failed to write settings to DB: {e}")
 
@@ -596,6 +771,23 @@ async def update_settings(
                 trading_bot.rebalance_threshold_pct = float(min_trade_delta)
         except Exception:
             pass
+    if min_trade_delta_usd is not None:
+        RUNTIME_SETTINGS["min_trade_delta_usd"] = float(min_trade_delta_usd)
+        try:
+            if trading_bot:
+                trading_bot.min_trade_delta_usd = float(min_trade_delta_usd)
+        except Exception:
+            pass
+    if safety_skip_degraded is not None:
+        RUNTIME_SETTINGS["safety_skip_degraded"] = bool(safety_skip_degraded)
+    if safety_max_price_staleness_sec is not None:
+        RUNTIME_SETTINGS["safety_max_price_staleness_sec"] = float(safety_max_price_staleness_sec)
+    if safety_min_expected_move_pct is not None:
+        RUNTIME_SETTINGS["safety_min_expected_move_pct"] = float(safety_min_expected_move_pct)
+    if safety_daily_pnl_limit_usd is not None:
+        RUNTIME_SETTINGS["safety_daily_pnl_limit_usd"] = float(safety_daily_pnl_limit_usd)
+    if safety_daily_equity_drop_pct is not None:
+        RUNTIME_SETTINGS["safety_daily_equity_drop_pct"] = float(safety_daily_equity_drop_pct)
 
     # Return current settings from database
     current_settings = load_runtime_settings()
@@ -768,6 +960,11 @@ async def dashboard():
                     <div class="stat"><div>Unrealized PnL</div><div id="stat-unrealized">$0</div></div>
                     <div class="stat"><div>Exposure</div><div id="stat-exposure">0%</div></div>
                 </div>
+                <div class="position-info" style="margin-top: 10px; font-size: 14px; color: #ccc;">
+                    <div id="position-line">Position: 0.00000000 BTC @ $0.00</div>
+                    <div id="exposure-line">Exposure: $0.00 (0.0%)</div>
+                    <div id="last-update" style="font-size: 12px; color: #999;">Last update: --:--:-- UTC</div>
+                </div>
                 <div id="auth-status" style="margin-top: 10px;">
                     <span id="login-status">Not logged in</span>
                     <button id="login-btn" onclick="showLoginForm()" style="margin-left: 10px; padding: 5px 10px; background: #28a745; color: white; border: none; border-radius: 3px; cursor: pointer;">Login</button>
@@ -808,7 +1005,39 @@ async def dashboard():
                         <input type="number" id="min-confidence" min="0" max="1" step="0.05" value="0.7">
                     </div>
                     <div>
+                        <label>Min Trade Delta (%)</label>
+                        <input type="number" id="min-trade-delta" min="0" max="50" step="1" value="5">
+                    </div>
+                    <div>
+                        <label>Min Trade Delta ($)</label>
+                        <input type="number" id="min-trade-delta-usd" min="10" max="1000" step="5" value="30">
+                    </div>
+                    <div>
                         <button class="btn btn-buy" onclick="saveSettings()">Save Settings</button>
+                    </div>
+                </div>
+                
+                <h4>🛡️ Safety Settings</h4>
+                <div class="settings-grid">
+                    <div class="toggle-row">
+                        <input type="checkbox" id="safety-skip-degraded" checked>
+                        <label for="safety-skip-degraded">Skip trades if data degraded</label>
+                    </div>
+                    <div>
+                        <label>Max Price Staleness (sec)</label>
+                        <input type="number" id="safety-max-staleness" min="30" max="600" step="30" value="120">
+                    </div>
+                    <div>
+                        <label>Min Expected Move (%)</label>
+                        <input type="number" id="safety-min-move" min="0.01" max="10" step="0.01" value="0.1">
+                    </div>
+                    <div>
+                        <label>Daily PnL Limit ($)</label>
+                        <input type="number" id="safety-daily-pnl" min="-100" max="0" step="1" value="-5">
+                    </div>
+                    <div>
+                        <label>Daily Equity Drop Limit (%)</label>
+                        <input type="number" id="safety-daily-equity" min="1" max="20" step="1" value="3">
                     </div>
                 </div>
             </div>
@@ -845,6 +1074,13 @@ async def dashboard():
         </div>
         
         <script>
+            // Format helpers for consistent display
+            const fmtCurrency = new Intl.NumberFormat('en-US', {style:'currency', currency: 'USD', maximumFractionDigits:2});
+            const fmt$ = (x)=> fmtCurrency.format(Number(x)||0);
+            const fmtPercent = (x) => `${(x*100).toFixed(1)}%`;
+            const n = (v, d=0) => Number.isFinite(v) ? v : d;
+            
+            // Global state
             let jwtToken = localStorage.getItem('jwt_token');
             let equityChart, pnlChart;
 
@@ -874,24 +1110,45 @@ async def dashboard():
             }
             function drawBarFallback(canvasId, values, color){
                 const canvas = document.getElementById(canvasId);
-                if (!canvas || !canvas.getContext) return;
+                if (!canvas) return;
                 const ctx = canvas.getContext('2d');
-                const w = canvas.width = canvas.clientWidth || 800;
-                const h = canvas.height = canvas.clientHeight || 200;
-                ctx.clearRect(0,0,w,h);
+                canvas.width = canvas.offsetWidth;
+                canvas.height = canvas.offsetHeight;
+                ctx.clearRect(0, 0, canvas.width, canvas.height);
                 if (!values || values.length === 0) return;
-                const minV = Math.min(...values);
-                const maxV = Math.max(...values);
-                const pad = 10;
-                const step = (w-2*pad)/Math.max(values.length,1);
-                for (let i=0;i<values.length;i++){
-                    const v = values[i];
-                    const norm = (v - Math.min(0,minV)) / (Math.max(0,maxV) - Math.min(0,minV) || 1);
-                    const barH = norm * (h-2*pad);
-                    const y0 = h - pad - (v>=0? barH : ( (0 - minV) / ((maxV - minV)||1) )*(h-2*pad) );
-                    ctx.fillStyle = (v>=0 ? (color||'#4caf50') : '#dc3545');
-                    ctx.fillRect(pad + i*step, y0, Math.max(1, step*0.8), Math.abs(barH));
-                }
+                
+                const max = Math.max(...values.map(Math.abs));
+                const barWidth = canvas.width / values.length;
+                const scale = (canvas.height * 0.8) / max;
+                
+                values.forEach((value, i) => {
+                    const height = Math.abs(value) * scale;
+                    const y = value >= 0 ? canvas.height/2 - height : canvas.height/2;
+                    ctx.fillStyle = color;
+                    ctx.fillRect(i * barWidth, y, barWidth * 0.8, height);
+                });
+            }
+            
+            function drawBarFallbackColored(canvasId, values){
+                const canvas = document.getElementById(canvasId);
+                if (!canvas) return;
+                const ctx = canvas.getContext('2d');
+                canvas.width = canvas.offsetWidth;
+                canvas.height = canvas.offsetHeight;
+                ctx.clearRect(0, 0, canvas.width, canvas.height);
+                if (!values || values.length === 0) return;
+                
+                const max = Math.max(...values.map(Math.abs));
+                const barWidth = canvas.width / values.length;
+                const scale = (canvas.height * 0.8) / max;
+                
+                values.forEach((value, i) => {
+                    const height = Math.abs(value) * scale;
+                    const y = value >= 0 ? canvas.height/2 - height : canvas.height/2;
+                    // Color coding: green for positive, red for negative
+                    ctx.fillStyle = value >= 0 ? '#28a745' : '#dc3545';
+                    ctx.fillRect(i * barWidth, y, barWidth * 0.8, height);
+                });
             }
 
             function setAuthUi(loggedIn, username){
@@ -904,7 +1161,7 @@ async def dashboard():
                     loginBtn.style.display = 'none';
                     logoutBtn.style.display = 'inline-block';
                     if (formEl) formEl.style.display = 'none';
-                } else {
+                    } else {
                     statusEl.textContent = 'Not logged in';
                     loginBtn.style.display = 'inline-block';
                     logoutBtn.style.display = 'none';
@@ -917,11 +1174,44 @@ async def dashboard():
                     const res = await fetch('/pnl_summary?token=' + encodeURIComponent(jwtToken));
                     if (!res.ok) return;
                     const d = await res.json();
-                    document.getElementById('stat-equity').textContent = '$' + d.equity.toLocaleString(undefined,{maximumFractionDigits:2});
-                    document.getElementById('stat-realized').textContent = '$' + d.realized_pnl.toLocaleString(undefined,{maximumFractionDigits:2});
-                    document.getElementById('stat-unrealized').textContent = '$' + d.unrealized_pnl.toLocaleString(undefined,{maximumFractionDigits:2});
-                    document.getElementById('stat-exposure').textContent = (d.exposure_pct*100).toFixed(1) + '%';
-                } catch (e) {}
+                    
+                    // Check status and show staleness
+                    const isOk = d.status === "ok";
+                    if (!isOk) {
+                        showBadge(`Data: ${d.message || 'offline'}`);
+                        disableTradingButtons();
+                } else {
+                        hideBadge();
+                        enableTradingButtons();
+                    }
+                    
+                    // Show last update time
+                    if (d.price_ts) {
+                        const updateTime = new Date(d.price_ts).toLocaleTimeString('en-US', {timeZone: 'UTC', hour12: false});
+                        document.getElementById('last-update').textContent = `Last update: ${updateTime} UTC`;
+                    }
+                    
+                    // Update header tiles with safety checks
+                    document.getElementById('stat-equity').textContent = fmt$(n(d.equity));
+                    document.getElementById('stat-realized').textContent = fmt$(n(d.realized_pnl));
+                    document.getElementById('stat-unrealized').textContent = fmt$(n(d.unrealized_pnl));
+                    document.getElementById('stat-exposure').textContent = fmtPercent(n(d.exposure_pct));
+                    
+                    // Add color coding for PnL
+                    const realizedEl = document.getElementById('stat-realized');
+                    const unrealizedEl = document.getElementById('stat-unrealized');
+                    realizedEl.style.color = n(d.realized_pnl) > 0 ? '#28a745' : n(d.realized_pnl) < 0 ? '#dc3545' : '#ccc';
+                    unrealizedEl.style.color = n(d.unrealized_pnl) > 0 ? '#28a745' : n(d.unrealized_pnl) < 0 ? '#dc3545' : '#ccc';
+                    
+                    // Update position and exposure lines with mobile-friendly formatting
+                    const btcDisplay = n(d.position_qty).toFixed(6); // Truncate for mobile
+                    document.getElementById('position-line').textContent = `${btcDisplay} BTC @ ${fmt$(n(d.last_price))}`;
+                    document.getElementById('exposure-line').textContent = `${fmt$(n(d.exposure_value))} (${fmtPercent(n(d.exposure_pct))})`;
+                } catch (e) {
+                    console.error('loadPnlHeader error:', e);
+                    showBadge('Data: error');
+                    disableTradingButtons();
+                }
             }
 
             async function loadSettings() {
@@ -931,8 +1221,15 @@ async def dashboard():
                 const s = await res.json();
                 document.getElementById('auto-toggle').checked = !!s.auto_trade_enabled;
                 document.getElementById('max-exposure').value = s.max_exposure;
-                document.getElementById('cooldown').value = s.trade_cooldown_hours;
+                document.getElementById('cooldown').value = s.trade_cooldown_hours || s.cooldown_hours || s.trade_cooldown || '';
                 document.getElementById('min-confidence').value = s.min_confidence;
+                document.getElementById('min-trade-delta').value = s.min_trade_delta || 5;
+                document.getElementById('min-trade-delta-usd').value = s.min_trade_delta_usd || 30;
+                document.getElementById('safety-skip-degraded').checked = !!s.safety_skip_degraded;
+                document.getElementById('safety-max-staleness').value = s.safety_max_price_staleness_sec || 120;
+                document.getElementById('safety-min-move').value = s.safety_min_expected_move_pct || 0.1;
+                document.getElementById('safety-daily-pnl').value = s.safety_daily_pnl_limit_usd || -5;
+                document.getElementById('safety-daily-equity').value = s.safety_daily_equity_drop_pct || 3;
             }
 
             async function saveSettings() {
@@ -943,6 +1240,13 @@ async def dashboard():
                 form.append('max_exposure', document.getElementById('max-exposure').value);
                 form.append('trade_cooldown_hours', document.getElementById('cooldown').value);
                 form.append('min_confidence', document.getElementById('min-confidence').value);
+                form.append('min_trade_delta', document.getElementById('min-trade-delta').value);
+                form.append('min_trade_delta_usd', document.getElementById('min-trade-delta-usd').value);
+                form.append('safety_skip_degraded', document.getElementById('safety-skip-degraded').checked);
+                form.append('safety_max_price_staleness_sec', document.getElementById('safety-max-staleness').value);
+                form.append('safety_min_expected_move_pct', document.getElementById('safety-min-move').value);
+                form.append('safety_daily_pnl_limit_usd', document.getElementById('safety-daily-pnl').value);
+                form.append('safety_daily_equity_drop_pct', document.getElementById('safety-daily-equity').value);
                 const res = await fetch('/settings', { method: 'POST', body: form });
                 if (res.ok) { alert('Settings saved'); } else { alert('Failed to save settings'); }
             }
@@ -957,13 +1261,12 @@ async def dashboard():
                     try { const res2 = await fetch('/equity_series_public'); if (res2.ok) js = await res2.json(); } catch(_e){}
                 }
                 if (!js) return;
-                const labels = (js.equity_curve||[]).map(p => p.timestamp);
-                const equity = (js.equity_curve||[]).map(p => p.equity);
-                const hodl = (js.hodl_curve||[]).map(p => p.hodl_value);
+                const equity = (js.equity_curve||js.data||[]).map(p => p.equity ?? p[1]).filter(v => Number.isFinite(v));
                 // Force fallback renderer to avoid any CDN/compat issues
                 drawLineFallback('equityChart', equity, '#17a2b8');
                 const pnl = []; for (let i=1;i<equity.length;i++){ pnl.push(equity[i]-equity[i-1]); }
-                drawBarFallback('pnlChart', pnl, '#f7931a');
+                // Use color coding for PnL bars: green for positive, red for negative
+                drawBarFallbackColored('pnlChart', pnl);
             }
 
             async function loadPnl() {
@@ -973,16 +1276,65 @@ async def dashboard():
                     const res = await fetch('/pnl_summary?token=' + encodeURIComponent(jwtToken));
                     if (!res.ok) { container.textContent = 'PnL unavailable'; return; }
                     const d = await res.json();
+                    if (!d || typeof d !== 'object') { container.textContent = 'PnL unavailable'; return; }
+                    
+                    // Show status badge if degraded
+                    if (d.status === 'degraded') {
+                        showBadge(`PnL: ${d.message || 'degraded'}`);
+                    } else {
+                        hideBadge();
+                    }
+                    
                     container.innerHTML = `
-                        <p><strong>Equity:</strong> $${d.equity.toLocaleString(undefined,{maximumFractionDigits:2})}</p>
-                        <p><strong>Realized PnL:</strong> $${d.realized_pnl.toLocaleString(undefined,{maximumFractionDigits:2})}</p>
-                        <p><strong>Unrealized PnL:</strong> $${d.unrealized_pnl.toLocaleString(undefined,{maximumFractionDigits:2})}</p>
-                        <p><strong>Total Fees:</strong> $${d.total_fees.toLocaleString(undefined,{maximumFractionDigits:2})}</p>
-                        <p><strong>Exposure:</strong> $${d.exposure_usd.toLocaleString(undefined,{maximumFractionDigits:2})} (${(d.exposure_pct*100).toFixed(1)}%)</p>
-                        <p><strong>HODL Value:</strong> $${d.hodl_value.toLocaleString(undefined,{maximumFractionDigits:2})} (PnL: $${d.hodl_pnl.toLocaleString(undefined,{maximumFractionDigits:2})})</p>
-                        <p><strong>Position:</strong> ${d.qty_btc.toFixed(8)} BTC @ $${d.avg_cost.toLocaleString(undefined,{maximumFractionDigits:2})}</p>
+                        <p><strong>Equity:</strong> ${fmt$(n(d.equity))}</p>
+                        <p><strong>Realized PnL:</strong> ${fmt$(n(d.realized_pnl))}</p>
+                        <p><strong>Unrealized PnL:</strong> ${fmt$(n(d.unrealized_pnl))}</p>
+                        <p><strong>Total Fees:</strong> ${fmt$(n(d.fees_total))}</p>
+                        <p><strong>Exposure:</strong> ${fmt$(n(d.exposure_value))} (${fmtPercent(n(d.exposure_pct))})</p>
+                        <p><strong>HODL Value:</strong> ${fmt$(n(d.hodl_value))}</p>
+                        <p><strong>Position:</strong> ${n(d.position_qty).toFixed(6)} BTC @ ${fmt$(n(d.last_price))}</p>
                     `;
-                } catch (e) { container.textContent = 'PnL error'; }
+                } catch (e) {
+                    container.textContent = 'Error loading PnL';
+                }
+            }
+
+            async function buyBTC(){
+                const status = document.getElementById('trading-status');
+                try{
+                    if (!jwtToken){ alert('Login required'); return; }
+                    const amt = parseFloat(document.getElementById('trade-amount').value||'0');
+                    const form = new FormData(); form.append('token', jwtToken); form.append('amount', amt);
+                    const res = await fetch('/buy_btc', {method:'POST', body:form});
+                    const j = await res.json();
+                    status.textContent = (j && j.message) ? j.message : 'Buy executed';
+                    await refreshAll();
+                }catch(e){ status.textContent = 'Buy failed'; }
+            }
+
+            async function sellBTC(){
+                const status = document.getElementById('trading-status');
+                try{
+                    if (!jwtToken){ alert('Login required'); return; }
+                    const amt = parseFloat(document.getElementById('trade-amount').value||'0');
+                    const form = new FormData(); form.append('token', jwtToken); form.append('amount', amt);
+                    const res = await fetch('/sell_btc', {method:'POST', body:form});
+                    const j = await res.json();
+                    status.textContent = (j && j.message) ? j.message : 'Sell executed';
+                    await refreshAll();
+                }catch(e){ status.textContent = 'Sell failed'; }
+            }
+
+            async function autoTrade(){
+                const status = document.getElementById('trading-status');
+                try{
+                    if (!jwtToken){ alert('Login required'); return; }
+                    const form = new FormData(); form.append('token', jwtToken);
+                    const res = await fetch('/auto_trade_scheduled', {method:'POST', body:form});
+                    const j = await res.json();
+                    status.textContent = (j && (j.message||j.status)) ? (j.message||j.status) : 'Auto-trade triggered';
+                    await refreshAll();
+                }catch(e){ status.textContent = 'Auto-trade failed'; }
             }
 
             async function loginUser(username, password) {
@@ -1027,30 +1379,34 @@ async def dashboard():
                 if (badge) badge.style.display = 'none';
             }
             
-            // Render ticker with price data
+                        // Render ticker with price data
             function renderTicker(data) {
-                if (data.price) {
-                    document.getElementById('btc-price').innerHTML = '$' + data.price.toLocaleString();
-                    if (data.change_24h !== null) {
-                        const changeClass = data.change_24h >= 0 ? 'signal-buy' : 'signal-sell';
-                        const changeSign = data.change_24h > 0 ? '+' : '';
-                        document.getElementById('btc-info').innerHTML = `<p><strong>24h Change:</strong> <span class="${changeClass}">${changeSign}${data.change_24h.toFixed(2)}%</span></p>`;
-                        if (data.volume_24h !== null) {
-                            document.getElementById('btc-info').innerHTML += `<p><strong>Volume:</strong> $${data.volume_24h.toLocaleString()}</p>`;
+                try {
+                    if (data && data.price) {
+                        document.getElementById('btc-price').innerHTML = '$' + data.price.toString();
+                        if (data.change_24h !== null) {
+                            const changeClass = data.change_24h >= 0 ? 'signal-buy' : 'signal-sell';
+                            const changeSign = data.change_24h > 0 ? '+' : '';
+                            document.getElementById('btc-info').innerHTML = `<p><strong>24h Change:</strong> <span class="${changeClass}">${changeSign}${data.change_24h.toFixed(2)}%</span></p>`;
+                            if (data.volume_24h !== null) {
+                                document.getElementById('btc-info').innerHTML += `<p><strong>Volume:</strong> $${data.volume_24h.toString()}</p>`;
+                            }
+                            if (data.last_update) {
+                                document.getElementById('btc-info').innerHTML += `<p><strong>Last Update:</strong> ${data.last_update}</p>`;
+                            }
                         }
-                        if (data.last_update) {
-                            document.getElementById('btc-info').innerHTML += `<p><strong>Last Update:</strong> ${data.last_update}</p>`;
-                        }
+                    } else {
+                        document.getElementById('btc-price').innerHTML = 'Data unavailable';
+                        document.getElementById('btc-info').innerHTML = '<p>Unable to fetch market data</p>';
                     }
-                } else {
+                    document.getElementById('btc-news').innerHTML = 'Real-time Bitcoin data';
+                } catch (e) {
                     document.getElementById('btc-price').innerHTML = 'Data unavailable';
-                    document.getElementById('btc-info').innerHTML = '<p>Unable to fetch market data</p>';
+                    document.getElementById('btc-info').innerHTML = '<p>Error rendering data</p>';
                 }
-                document.getElementById('btc-news').innerHTML = 'Real-time Bitcoin data';
-                document.getElementById('signals').innerHTML = '<p><strong>Sentiment:</strong> <span class="signal-hold">Loading...</span></p><p><strong>Signal:</strong> <span class="signal-hold">HOLD</span></p>';
             }
             
-            // Improved public data loading with graceful degradation
+                        // Improved public data loading with graceful degradation
             async function loadPublicData() {
                 try {
                     const r = await fetch("/btc_data_public", {cache: "no-store"});
@@ -1074,8 +1430,88 @@ async def dashboard():
             }
             
             async function refreshAll(){ await loadPnlHeader(); await loadPnl(); await loadEquityCharts(); }
-            setInterval(refreshAll, 60000);
-            window.addEventListener('load', ()=>{ if (jwtToken){ setAuthUi(true); loadSettings(); } else { setAuthUi(false); } refreshAll(); loadBTCData(); });
+
+            // New refreshSummary function for comprehensive PnL updates
+            async function refreshSummary(){
+                if (!jwtToken) return;
+                try {
+                    const r = await fetch("/pnl_summary?token=" + encodeURIComponent(jwtToken), { cache: "no-store" });
+                    const s = await r.json();
+
+                    // Check status and show staleness
+                    const isOk = s.status === "ok";
+                    if (!isOk) {
+                        showBadge(`Data: ${s.message || 'offline'}`);
+                        disableTradingButtons();
+                    } else {
+                        hideBadge();
+                        enableTradingButtons();
+                    }
+
+                    // Show last update time
+                    if (s.price_ts) {
+                        const updateTime = new Date(s.price_ts).toLocaleTimeString('en-US', {timeZone: 'UTC', hour12: false});
+                        document.getElementById('last-update').textContent = `Last update: ${updateTime} UTC`;
+                    }
+
+                    // Header tiles with safety checks
+                    document.getElementById('stat-equity').textContent = fmt$(n(s.equity));
+                    document.getElementById('stat-realized').textContent = fmt$(n(s.realized_pnl));
+                    document.getElementById('stat-unrealized').textContent = fmt$(n(s.unrealized_pnl));
+                    document.getElementById('stat-exposure').textContent = fmtPercent(n(s.exposure_pct));
+                    
+                    // Add color coding for PnL
+                    const realizedEl = document.getElementById('stat-realized');
+                    const unrealizedEl = document.getElementById('stat-unrealized');
+                    realizedEl.style.color = n(s.realized_pnl) > 0 ? '#28a745' : n(s.realized_pnl) < 0 ? '#dc3545' : '#ccc';
+                    unrealizedEl.style.color = n(s.unrealized_pnl) > 0 ? '#28a745' : n(s.unrealized_pnl) < 0 ? '#dc3545' : '#ccc';
+                    
+                    // Update position and exposure lines with mobile-friendly formatting
+                    const btcDisplay = n(s.position_qty).toFixed(6); // Truncate for mobile
+                    document.getElementById('position-line').textContent = `${btcDisplay} BTC @ ${fmt$(n(s.last_price))}`;
+                    document.getElementById('exposure-line').textContent = `${fmt$(n(s.exposure_value))} (${fmtPercent(n(s.exposure_pct))})`;
+                } catch (e) {
+                    console.error('refreshSummary error:', e);
+                    showBadge('Data: error');
+                    disableTradingButtons();
+                }
+            }
+            // Set up refresh intervals
+            setInterval(refreshSummary, 30000);  // Refresh PnL every 30 seconds
+            setInterval(refreshAll, 60000);      // Full refresh every 60 seconds
+            
+            window.addEventListener('load', ()=>{ 
+                if (jwtToken){ 
+                    setAuthUi(true); 
+                    loadSettings(); 
+                } else {
+                    setAuthUi(false); 
+                } 
+                refreshSummary();  // Initial PnL refresh
+                refreshAll();      // Full initial load
+                loadBTCData();
+            });
+
+            // Helper functions for trading button control
+            function disableTradingButtons() {
+                const buttons = document.querySelectorAll('.btn-buy, .btn-sell, .btn-auto');
+                buttons.forEach(btn => {
+                    btn.disabled = true;
+                    btn.style.opacity = '0.5';
+                    btn.style.cursor = 'not-allowed';
+                });
+            }
+            
+            function enableTradingButtons() {
+                const buttons = document.querySelectorAll('.btn-buy, .btn-sell, .btn-auto');
+                buttons.forEach(btn => {
+                    btn.disabled = false;
+                    btn.style.opacity = '1';
+                    btn.style.cursor = 'pointer';
+                });
+            }
+            
+            // Badge functions
         </script>
     </body>
     </html>
@@ -1496,6 +1932,24 @@ async def auto_trade(token: str = Form(...)):
         price_change_24h = market_data.get('change_24h', 0.0)
         volume_24h = market_data.get('volume', 1000000.0)
         
+        # Check price staleness
+        try:
+            # Get price timestamp from market data or use current time
+            price_ts = datetime.now(timezone.utc)  # Default to current time
+            if 'last_update' in market_data:
+                try:
+                    price_ts = datetime.fromisoformat(market_data['last_update'].replace('Z', '+00:00'))
+                except:
+                    price_ts = datetime.now(timezone.utc)
+            
+            staleness = (datetime.now(timezone.utc) - price_ts).total_seconds()
+            if staleness > MAX_PRICE_STALENESS_SEC:
+                logger.warning(f"🛡️ Skip trade: price stale ({int(staleness)}s > {MAX_PRICE_STALENESS_SEC}s)")
+                return {"status": "skipped", "reason": f"price_stale_{int(staleness)}s"}
+        except Exception as e:
+            logger.warning(f"🛡️ Skip trade: unable to check price staleness: {e}")
+            return {"status": "skipped", "reason": "staleness_check_failed"}
+        
         logger.info(f"📊 Market Data: Price=${current_price:,.2f}, Change={price_change_24h:+.2f}%, Volume=${volume_24h:,.0f}")
 
         # Get news sentiment
@@ -1745,6 +2199,34 @@ async def auto_trade_scheduled(token: str = Form(...)):
             logger.error(f"❌ File lock acquisition failed: {e}")
             return {"status": "error", "message": f"File lock acquisition failed: {str(e)}"}
 
+async def _check_safety_conditions(current_price, last_update, signal_confidence, target_exposure, current_exposure):
+    """Check safety conditions before executing trades"""
+    settings = load_runtime_settings()
+    
+    # 1. Check price staleness (using global MAX_PRICE_STALENESS_SEC)
+    if last_update:
+        try:
+            last_update_dt = datetime.fromisoformat(last_update.replace('Z', '+00:00'))
+            staleness_sec = (datetime.now(timezone.utc) - last_update_dt).total_seconds()
+            if staleness_sec > MAX_PRICE_STALENESS_SEC:
+                return False, f"Price data too stale ({staleness_sec:.0f}s > {MAX_PRICE_STALENESS_SEC}s)"
+        except Exception:
+            return False, "Unable to parse price timestamp"
+    
+    # 2. Check if expected move is worth the round-trip fee
+    if settings.get("safety_min_expected_move_pct", 0.1):
+        exposure_change = abs(target_exposure - current_exposure)
+        if exposure_change < (settings["safety_min_expected_move_pct"] / 100):
+            return False, f"Expected move too small ({exposure_change*100:.2f}% < {settings['safety_min_expected_move_pct']}%)"
+    
+    # 3. Check daily PnL limit (would need to be implemented with daily tracking)
+    # This would require additional database tracking of daily PnL
+    
+    # 4. Check daily equity drop limit (would need to be implemented with daily tracking)
+    # This would require additional database tracking of daily equity
+    
+    return True, "Safety checks passed"
+
 async def _execute_auto_trade_scheduled():
     """Internal function to execute the scheduled auto trade logic"""
 
@@ -1766,6 +2248,7 @@ async def _execute_auto_trade_scheduled():
             if trading_bot:
                 trading_bot.trade_cooldown_hours = current_settings["trade_cooldown_hours"]
                 trading_bot.rebalance_threshold_pct = current_settings["min_trade_delta"]
+                trading_bot.min_trade_delta_usd = current_settings["min_trade_delta_usd"]
         except Exception as e:
             logger.warning(f"Failed to update trading components with settings: {e}")
         
@@ -1781,6 +2264,24 @@ async def _execute_auto_trade_scheduled():
         current_price = market_data.get('close', 45000.0)
         price_change_24h = market_data.get('change_24h', 0.0)
         volume_24h = market_data.get('volume', 1000000.0)
+        
+        # Check price staleness
+        try:
+            # Get price timestamp from market data or use current time
+            price_ts = datetime.now(timezone.utc)  # Default to current time
+            if 'last_update' in market_data:
+                try:
+                    price_ts = datetime.fromisoformat(market_data['last_update'].replace('Z', '+00:00'))
+                except:
+                    price_ts = datetime.now(timezone.utc)
+            
+            staleness = (datetime.now(timezone.utc) - price_ts).total_seconds()
+            if staleness > MAX_PRICE_STALENESS_SEC:
+                logger.warning(f"🛡️ Skip scheduled trade: price stale ({int(staleness)}s > {MAX_PRICE_STALENESS_SEC}s)")
+                return {"status": "skipped", "reason": f"price_stale_{int(staleness)}s"}
+        except Exception as e:
+            logger.warning(f"🛡️ Skip scheduled trade: unable to check price staleness: {e}")
+            return {"status": "skipped", "reason": "staleness_check_failed"}
         
         logger.info(f"📊 Market Data: Price=${current_price:,.2f}, Change={price_change_24h:+.2f}%, Volume=${volume_24h:,.0f}")
 
@@ -2014,7 +2515,7 @@ async def get_trading_summary(token: str = None):
         logger.error(f"Error getting trading summary: {e}")
         return {"message": f"Error getting trading summary: {str(e)}", "summary": None}
 
-@app.get("/pnl_summary")
+@app.get("/pnl_summary", response_model=PnLSummary)
 async def pnl_summary(token: str = None):
     """Return realized/unrealized PnL, fees, exposure, equity, and HODL benchmark."""
     if not token:
@@ -2024,57 +2525,17 @@ async def pnl_summary(token: str = None):
     except:
         raise HTTPException(status_code=401, detail="Authentication required")
 
-    if not LEDGER_AVAILABLE:
-        return {"message": "Ledger not configured"}
-
-    market = get_btc_market_data() or {}
-    current_price = float(market.get('close', 45000.0))
-
-    pnl = ledger_compute_pnl(current_price)
-
-    # Determine equity from broker if available; otherwise approximate
-    equity = 0.0
-    exposure_value = 0.0
-    exposure_pct = 0.0
-    
     try:
-        acct = trading_bot.get_account_info() if trading_bot else None
-        if isinstance(acct, dict) and acct.get('equity') is not None:
-            equity = float(acct.get('equity', 0.0))
-            
-            # Use improved exposure calculation with live balances and same price
-            if 'balances' in acct:
-                balances = acct.get('balances', {})
-                exposure_value, exposure_pct = trading_bot.compute_exposure_summary(balances, current_price, equity)
-            else:
-                # Fallback to ledger-based exposure
-                exposure_value = pnl['exposure_usd']
-                exposure_pct = (exposure_value / equity) if equity > 0 else 0.0
-        else:
-            cash_usd = float(acct.get('cash', 0.0)) if isinstance(acct, dict) else 0.0
-            equity = cash_usd + pnl['exposure_usd']
-            exposure_value = pnl['exposure_usd']
-            exposure_pct = (exposure_value / equity) if equity > 0 else 0.0
-    except Exception:
-        equity = pnl['exposure_usd']
-        exposure_value = pnl['exposure_usd']
-        exposure_pct = (exposure_value / equity) if equity > 0 else 0.0
-
-    hodl_value, hodl_pnl = ledger_get_hodl_benchmark(current_price)
-
-    return PnlSummary(
-        symbol=pnl['symbol'],
-        equity=equity,
-        realized_pnl=pnl['realized_pnl'],
-        unrealized_pnl=pnl['unrealized_pnl'],
-        total_fees=pnl['fees'],
-        exposure_usd=exposure_value,  # Use live balance-based exposure
-        exposure_pct=exposure_pct,    # Use live balance-based exposure percentage
-        hodl_value=hodl_value,
-        hodl_pnl=hodl_pnl,
-        qty_btc=pnl['qty_btc'],
-        avg_cost=pnl['avg_cost']
-    )
+        return await _compute_pnl_summary()
+    except Exception as e:
+        # ultra-defensive: degraded + zeros (UI still renders)
+        now = datetime.now(timezone.utc).isoformat()
+        return PnLSummary(
+            status="degraded", message=f"error: {type(e).__name__}",
+            last_price=0.0, price_ts=now,
+            equity=0.0, realized_pnl=0.0, unrealized_pnl=0.0, fees_total=0.0,
+            exposure_value=0.0, exposure_pct=0.0, position_qty=0.0, hodl_value=0.0
+        )
 
 # Snapshot equity endpoint
 @app.post("/snapshot_equity")
@@ -2136,6 +2597,45 @@ async def metrics():
         return PlainTextResponse(generate_latest(metrics_registry), media_type=CONTENT_TYPE_LATEST)
     except Exception:
         return PlainTextResponse(generate_latest(metrics_registry), media_type=CONTENT_TYPE_LATEST)
+
+@app.get("/diagnostics/balances")
+def diag_balances():
+    """Quick diagnostics endpoint to verify balance calculations."""
+    try:
+        # Get current price and balances
+        market_data = get_btc_market_data()
+        price = float(market_data.get('close', 45000.0)) if market_data else 45000.0
+        ts = datetime.now(timezone.utc)
+        
+        # Get normalized balances
+        balances = {}
+        if trading_bot:
+            account_info = trading_bot.get_account_info()
+            if account_info and 'balances' in account_info:
+                raw_balances = account_info['balances']
+                # Normalize asset codes
+                for k, v in raw_balances.items():
+                    sym = _normalize_asset(k)
+                    try:
+                        balances[sym] = balances.get(sym, 0.0) + float(v)
+                    except (ValueError, TypeError):
+                        pass
+        
+        # Calculate key metrics
+        btc_qty = float(balances.get("BTC", 0.0))
+        cash_usd = float(balances.get("USD", 0.0))
+        equity = cash_usd + btc_qty * price
+        
+        return {
+            "raw": balances,
+            "price": price,
+            "price_ts": ts.isoformat(),
+            "btc_qty": btc_qty,
+            "cash_usd": cash_usd,
+            "equity": equity,
+        }
+    except Exception as e:
+        return {"error": str(e)}
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000) 

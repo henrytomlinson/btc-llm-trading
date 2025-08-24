@@ -21,6 +21,29 @@ import random
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Asset code normalization for Kraken
+_ASSET_MAP = {
+    "XXBT": "BTC", "XBT": "BTC", "BTC": "BTC",
+    "ZUSD": "USD", "USD": "USD",
+    "ZEUR": "EUR", "EUR": "EUR",
+    "ZGBP": "GBP", "GBP": "GBP",
+}
+
+def _normalize_asset(symbol: str) -> str:
+    return _ASSET_MAP.get(symbol, symbol)
+
+def get_balances_normalized() -> dict[str, float]:
+    """Get normalized balances from Kraken"""
+    raw = get_balances_raw_from_kraken()  # your existing private/Balance call
+    balances = {}
+    for k, v in (raw or {}).items():
+        sym = _normalize_asset(k)
+        try:
+            balances[sym] = balances.get(sym, 0.0) + float(v)
+        except (ValueError, TypeError):
+            pass
+    return balances
+
 class KrakenTradingBot:
     """Bitcoin-focused Kraken trading bot using real spot trading"""
     
@@ -408,13 +431,19 @@ class KrakenTradingBot:
             if not slippage_ok:
                 return {"status": "skipped", "reason": f"Slippage {slippage_pct:.3%} exceeds limit {self.max_slippage_pct:.3%}", "current": current, "target": target_long}
 
-        threshold = self.rebalance_threshold_pct
-        if abs(delta) < threshold:
-            return {"status": "skipped", "reason": f"Delta {delta:.3f} < threshold {threshold:.3f}", "current": current, "target": target_long}
-
+        # Calculate dollar delta and apply min trade delta logic
         dollar_delta = abs(delta) * equity
-        if dollar_delta < self.min_trade_amount:
-            return {"status": "skipped", "reason": f"Notional ${dollar_delta:.2f} below min ${self.min_trade_amount:.2f}"}
+        
+        # Use max(MIN_TRADE_DELTA_USD, min_trade_delta_pct * equity) when computing the order delta
+        # Get min_trade_delta_usd from settings (default to 30.0 if not available)
+        min_trade_delta_usd = getattr(self, 'min_trade_delta_usd', 30.0)
+        min_trade_delta_pct = self.rebalance_threshold_pct
+        
+        min_delta = max(min_trade_delta_usd, min_trade_delta_pct * equity)
+        
+        if dollar_delta < min_delta:
+            logger.info("Skip: delta $%.2f < min $%.2f", dollar_delta, min_delta)
+            return {"status": "skipped", "reason": f"min_trade_delta", "current": current, "target": target_long, "delta_usd": dollar_delta, "min_delta": min_delta}
 
         # Generate client order ID for idempotency
         client_order_id = self._generate_client_order_id('rebalance', dollar_delta)

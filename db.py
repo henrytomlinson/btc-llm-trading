@@ -357,6 +357,40 @@ def get_hodl_benchmark(current_price: float) -> Tuple[float, float]:
         return hodl_value, hodl_pnl
 
 
+def get_realized_pnl_total() -> float:
+    """Get total realized PnL from all positions."""
+    with _connect() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT SUM(realized_pnl) FROM positions 
+            WHERE realized_pnl IS NOT NULL
+        """)
+        result = cur.fetchone()
+        return float(result[0]) if result and result[0] is not None else 0.0
+
+
+def get_fees_total() -> float:
+    """Get total fees from positions (more reliable than fills table)."""
+    with _connect() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT SUM(fees) FROM positions WHERE fees IS NOT NULL")
+        result = cur.fetchone()
+        return float(result[0]) if result and result[0] is not None else 0.0
+
+
+def get_avg_cost_from_positions() -> Optional[float]:
+    """Get average cost from current position."""
+    with _connect() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT avg_cost FROM positions 
+            WHERE avg_cost IS NOT NULL AND avg_cost > 0
+            ORDER BY updated_at DESC LIMIT 1
+        """)
+        result = cur.fetchone()
+        return float(result[0]) if result and result[0] is not None else None
+
+
 def read_settings() -> Dict:
     """Read all settings from the database."""
     with _connect() as conn:
@@ -407,7 +441,13 @@ def init_default_settings() -> None:
         "max_exposure": float(os.getenv("MAX_EXPOSURE", "0.8")),
         "trade_cooldown_hours": float(os.getenv("TRADE_COOLDOWN_HOURS", "3")),
         "min_trade_delta": float(os.getenv("MIN_TRADE_DELTA", "0.05")),
+        "min_trade_delta_usd": float(os.getenv("MIN_TRADE_DELTA_USD", "30.0")),
         "auto_trade_enabled": True,
+        "safety_skip_degraded": True,
+        "safety_max_price_staleness_sec": 120.0,
+        "safety_min_expected_move_pct": 0.1,
+        "safety_daily_pnl_limit_usd": -5.0,
+        "safety_daily_equity_drop_pct": 3.0,
     }
     
     current_settings = read_settings()
