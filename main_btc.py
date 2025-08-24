@@ -23,6 +23,17 @@ from dotenv import load_dotenv
 import time
 from decimal import Decimal
 
+# Boolean parsing utility
+try:
+    from utils_bool import parse_bool
+except ImportError:
+    # Fallback if utils_bool is not available
+    def parse_bool(v, default=False):
+        if isinstance(v, bool): return v
+        if v is None: return default
+        s = str(v).strip().lower()
+        return s in {"1","true","t","yes","y","on","enabled","enable"}
+
 # Ledger for persistent PnL and orders
 try:
     from db import (
@@ -164,6 +175,15 @@ try:
 except Exception as e:
     logger.error(f"❌ Failed to initialize LLM trading strategy: {e}")
     llm_strategy = None
+
+# Initialize Grid Executor
+try:
+    from grid_executor import GridExecutor
+    grid_executor = GridExecutor(trading_bot)
+    logger.info("✅ Grid executor initialized successfully")
+except Exception as e:
+    logger.error(f"❌ Failed to initialize grid executor: {e}")
+    grid_executor = None
 
 # Initialize Technical Analysis (if available)
 try:
@@ -615,8 +635,14 @@ def load_runtime_settings():
                 "max_exposure": float(settings.get("max_exposure", 0.8)),
                 "trade_cooldown_hours": float(settings.get("trade_cooldown_hours", 3)),
                 "min_trade_delta": float(settings.get("min_trade_delta", 0.05)),
-                "min_trade_delta_usd": float(settings.get("min_trade_delta_usd", 30.0)),
-                "safety_skip_degraded": bool(settings.get("safety_skip_degraded", True)),
+                "min_trade_delta_usd": float(settings.get("min_trade_delta_usd", 10.0)),
+                "min_trade_delta_pct": float(settings.get("min_trade_delta_pct", 0.00)),
+                "no_fee_mode": parse_bool(settings.get("no_fee_mode", True)),
+                "grid_executor_enabled": parse_bool(settings.get("grid_executor_enabled", True)),
+                "grid_step_pct": float(settings.get("grid_step_pct", 0.25)),
+                "grid_order_usd": float(settings.get("grid_order_usd", 12.0)),
+                "max_grid_exposure": float(settings.get("max_grid_exposure", 0.1)),
+                "safety_skip_degraded": parse_bool(settings.get("safety_skip_degraded", True)),
                 "safety_max_price_staleness_sec": float(settings.get("safety_max_price_staleness_sec", 120.0)),
                 "safety_min_expected_move_pct": float(settings.get("safety_min_expected_move_pct", 0.1)),
                 "safety_daily_pnl_limit_usd": float(settings.get("safety_daily_pnl_limit_usd", -5.0)),
@@ -631,7 +657,13 @@ def load_runtime_settings():
         "max_exposure": float(os.getenv("MAX_EXPOSURE", "0.8")),
         "trade_cooldown_hours": float(os.getenv("TRADE_COOLDOWN_HOURS", "3")),
         "min_trade_delta": float(os.getenv("MIN_TRADE_DELTA", "0.05")),
-        "min_trade_delta_usd": float(os.getenv("MIN_TRADE_DELTA_USD", "30.0")),
+        "min_trade_delta_usd": float(os.getenv("MIN_TRADE_DELTA_USD", "10.0")),
+        "min_trade_delta_pct": float(os.getenv("MIN_TRADE_DELTA_PCT", "0.00")),
+        "no_fee_mode": parse_bool(os.getenv("NO_FEE_MODE", "True")),
+        "grid_executor_enabled": parse_bool(os.getenv("GRID_EXECUTOR_ENABLED", "True")),
+        "grid_step_pct": float(os.getenv("GRID_STEP_PCT", "0.25")),
+        "grid_order_usd": float(os.getenv("GRID_ORDER_USD", "12.0")),
+        "max_grid_exposure": float(os.getenv("MAX_GRID_EXPOSURE", "0.1")),
         "safety_skip_degraded": True,
         "safety_max_price_staleness_sec": 120.0,
         "safety_min_expected_move_pct": 0.1,
@@ -681,6 +713,12 @@ async def get_settings(token: str = None):
         "trade_cooldown_hours": current_settings["trade_cooldown_hours"],
         "min_trade_delta": current_settings["min_trade_delta"],
         "min_trade_delta_usd": current_settings["min_trade_delta_usd"],
+        "min_trade_delta_pct": current_settings["min_trade_delta_pct"],
+        "no_fee_mode": current_settings["no_fee_mode"],
+        "grid_executor_enabled": current_settings["grid_executor_enabled"],
+        "grid_step_pct": current_settings["grid_step_pct"],
+        "grid_order_usd": current_settings["grid_order_usd"],
+        "max_grid_exposure": current_settings["max_grid_exposure"],
         "safety_skip_degraded": current_settings["safety_skip_degraded"],
         "safety_max_price_staleness_sec": current_settings["safety_max_price_staleness_sec"],
         "safety_min_expected_move_pct": current_settings["safety_min_expected_move_pct"],
@@ -697,6 +735,12 @@ async def update_settings(
     trade_cooldown_hours: Optional[float] = Form(None),
     min_trade_delta: Optional[float] = Form(None),
     min_trade_delta_usd: Optional[float] = Form(None),
+    min_trade_delta_pct: Optional[float] = Form(None),
+    no_fee_mode: Optional[bool] = Form(None),
+    grid_executor_enabled: Optional[bool] = Form(None),
+    grid_step_pct: Optional[float] = Form(None),
+    grid_order_usd: Optional[float] = Form(None),
+    max_grid_exposure: Optional[float] = Form(None),
     safety_skip_degraded: Optional[bool] = Form(None),
     safety_max_price_staleness_sec: Optional[float] = Form(None),
     safety_min_expected_move_pct: Optional[float] = Form(None),
@@ -727,6 +771,18 @@ async def update_settings(
                 write_setting("min_trade_delta", float(min_trade_delta))
             if min_trade_delta_usd is not None:
                 write_setting("min_trade_delta_usd", float(min_trade_delta_usd))
+            if min_trade_delta_pct is not None:
+                write_setting("min_trade_delta_pct", float(min_trade_delta_pct))
+            if no_fee_mode is not None:
+                write_setting("no_fee_mode", bool(no_fee_mode))
+            if grid_executor_enabled is not None:
+                write_setting("grid_executor_enabled", bool(grid_executor_enabled))
+            if grid_step_pct is not None:
+                write_setting("grid_step_pct", float(grid_step_pct))
+            if grid_order_usd is not None:
+                write_setting("grid_order_usd", float(grid_order_usd))
+            if max_grid_exposure is not None:
+                write_setting("max_grid_exposure", float(max_grid_exposure))
             if safety_skip_degraded is not None:
                 write_setting("safety_skip_degraded", bool(safety_skip_degraded))
             if safety_max_price_staleness_sec is not None:
@@ -778,6 +834,48 @@ async def update_settings(
                 trading_bot.min_trade_delta_usd = float(min_trade_delta_usd)
         except Exception:
             pass
+    if min_trade_delta_pct is not None:
+        RUNTIME_SETTINGS["min_trade_delta_pct"] = float(min_trade_delta_pct)
+        try:
+            if trading_bot:
+                trading_bot.min_trade_delta_pct = float(min_trade_delta_pct)
+        except Exception:
+            pass
+    if no_fee_mode is not None:
+        RUNTIME_SETTINGS["no_fee_mode"] = bool(no_fee_mode)
+        try:
+            if trading_bot:
+                trading_bot.no_fee_mode = bool(no_fee_mode)
+        except Exception:
+            pass
+    if grid_executor_enabled is not None:
+        RUNTIME_SETTINGS["grid_executor_enabled"] = bool(grid_executor_enabled)
+        try:
+            if grid_executor:
+                grid_executor.enabled = bool(grid_executor_enabled)
+        except Exception:
+            pass
+    if grid_step_pct is not None:
+        RUNTIME_SETTINGS["grid_step_pct"] = float(grid_step_pct)
+        try:
+            if grid_executor:
+                grid_executor.grid_step_pct = float(grid_step_pct)
+        except Exception:
+            pass
+    if grid_order_usd is not None:
+        RUNTIME_SETTINGS["grid_order_usd"] = float(grid_order_usd)
+        try:
+            if grid_executor:
+                grid_executor.grid_order_usd = float(grid_order_usd)
+        except Exception:
+            pass
+    if max_grid_exposure is not None:
+        RUNTIME_SETTINGS["max_grid_exposure"] = float(max_grid_exposure)
+        try:
+            if grid_executor:
+                grid_executor.max_grid_exposure = float(max_grid_exposure)
+        except Exception:
+            pass
     if safety_skip_degraded is not None:
         RUNTIME_SETTINGS["safety_skip_degraded"] = bool(safety_skip_degraded)
     if safety_max_price_staleness_sec is not None:
@@ -797,6 +895,89 @@ async def update_settings(
         "auto_trade_enabled": auto_trade_enabled_db,
         **current_settings,
     }}
+
+@app.get("/grid_status")
+async def get_grid_status(token: str = None):
+    """Get current grid executor status"""
+    if not token:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    try:
+        verify_jwt_token(token)
+    except Exception:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    
+    if not grid_executor:
+        return {"status": "error", "message": "Grid executor not available"}
+    
+    return grid_executor.get_grid_status()
+
+@app.post("/grid_control")
+async def grid_control(
+    token: str = Form(...),
+    action: str = Form(...),  # "enable", "disable", "reset", "update_bias"
+    bias_allocation: Optional[float] = Form(None),
+    current_price: Optional[float] = Form(None)
+):
+    """Control grid executor operations"""
+    if not token:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    try:
+        verify_jwt_token(token)
+    except Exception:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    
+    if not grid_executor:
+        return {"status": "error", "message": "Grid executor not available"}
+    
+    try:
+        if action == "enable":
+            grid_executor.enabled = True
+            return {"status": "success", "message": "Grid executor enabled"}
+        elif action == "disable":
+            grid_executor.enabled = False
+            return {"status": "success", "message": "Grid executor disabled"}
+        elif action == "reset":
+            if current_price is None:
+                return {"status": "error", "message": "current_price required for reset"}
+            grid_executor.reset_grid(current_price, bias_allocation or 0.0)
+            return {"status": "success", "message": "Grid reset successfully"}
+        elif action == "update_bias":
+            if bias_allocation is None:
+                return {"status": "error", "message": "bias_allocation required"}
+            grid_executor.update_bias(bias_allocation)
+            return {"status": "success", "message": "Grid bias updated"}
+        else:
+            return {"status": "error", "message": f"Unknown action: {action}"}
+    except Exception as e:
+        return {"status": "error", "message": f"Grid control failed: {str(e)}"}
+
+@app.get("/grid_self_test")
+async def grid_self_test(token: str = None):
+    """Run grid order placement self-test (no live keys)"""
+    logger.info("🧪 Grid self-test requested")
+    
+    if not token:
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    try:
+        username = verify_jwt_token(token)
+    except:
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    if not grid_executor:
+        return {"message": "Grid executor not available", "status": "error"}
+    
+    try:
+        test_results = grid_executor.self_test_order_placement()
+        return {
+            "message": "Grid self-test completed",
+            "status": test_results["overall_status"],
+            "results": test_results
+        }
+            
+    except Exception as e:
+        logger.error(f"Grid self-test failed: {e}")
+        return {"message": f"Grid self-test failed: {str(e)}", "status": "error"}
 
 @app.get("/lock_status")
 async def get_lock_status(token: str = None):
@@ -1679,7 +1860,7 @@ async def buy_btc(amount: float = Form(...), token: str = Form(...)):
     
     try:
         # Execute buy order through the trading bot
-        result = trading_bot.place_buy_order("BTC/USD", amount, 1.0)
+        result = trading_bot.place_buy_order("XXBTZUSD", amount, 1.0)
         
         trade_log.append({
             "action": "BUY",
@@ -1733,7 +1914,7 @@ async def sell_btc(amount: float = Form(...), token: str = Form(...)):
     
     try:
         # Execute sell order through the trading bot
-        result = trading_bot.place_sell_order("BTC/USD", amount)
+        result = trading_bot.place_sell_order("XXBTZUSD", amount)
         
         trade_log.append({
             "action": "SELL",
@@ -2033,7 +2214,7 @@ async def auto_trade(token: str = Form(...)):
                 else:
                     actual_size = min(requested_size, max_buy_size)
                     logger.info(f"💰 Executing buy: ${actual_size:.2f} (requested: ${requested_size:.2f}, available: ${max_buy_size:.2f})")
-                    trade_result = trading_bot.place_buy_order("BTC/USD", actual_size, 1.0)
+                    trade_result = trading_bot.place_buy_order("XXBTZUSD", actual_size, 1.0)
                     # Persist trade to ledger (best-effort)
                     try:
                         if LEDGER_AVAILABLE and isinstance(trade_result, dict) and trade_result.get('status') == 'success':
@@ -2061,7 +2242,7 @@ async def auto_trade(token: str = Form(...)):
                 else:
                     actual_size = min(requested_size, max_sell_size)
                     logger.info(f"💰 Executing sell: ${actual_size:.2f} (requested: ${requested_size:.2f}, available: ${max_sell_size:.2f})")
-                    trade_result = trading_bot.place_sell_order("BTC/USD", actual_size)
+                    trade_result = trading_bot.place_sell_order("XXBTZUSD", actual_size)
                     # Persist trade to ledger (best-effort)
                     try:
                         if LEDGER_AVAILABLE and isinstance(trade_result, dict) and trade_result.get('status') == 'success':
@@ -2249,6 +2430,8 @@ async def _execute_auto_trade_scheduled():
                 trading_bot.trade_cooldown_hours = current_settings["trade_cooldown_hours"]
                 trading_bot.rebalance_threshold_pct = current_settings["min_trade_delta"]
                 trading_bot.min_trade_delta_usd = current_settings["min_trade_delta_usd"]
+                trading_bot.min_trade_delta_pct = current_settings["min_trade_delta_pct"]
+                trading_bot.no_fee_mode = current_settings["no_fee_mode"]
         except Exception as e:
             logger.warning(f"Failed to update trading components with settings: {e}")
         
@@ -2366,7 +2549,7 @@ async def _execute_auto_trade_scheduled():
                 else:
                     actual_size = min(requested_size, max_buy_size)
                     logger.info(f"💰 Executing buy: ${actual_size:.2f} (requested: ${requested_size:.2f}, available: ${max_buy_size:.2f})")
-                    trade_result = trading_bot.place_buy_order("BTC/USD", actual_size, 1.0)
+                    trade_result = trading_bot.place_buy_order("XXBTZUSD", actual_size, 1.0)
                     
             elif signal['action'] == 'sell':
                 if max_sell_size < 10.0:  # Minimum $10 trade
@@ -2375,18 +2558,79 @@ async def _execute_auto_trade_scheduled():
                 else:
                     actual_size = min(requested_size, max_sell_size)
                     logger.info(f"💰 Executing sell: ${actual_size:.2f} (requested: ${requested_size:.2f}, available: ${max_sell_size:.2f})")
-                    trade_result = trading_bot.place_sell_order("BTC/USD", actual_size)
+                    trade_result = trading_bot.place_sell_order("XXBTZUSD", actual_size)
                     
             logger.info(f"✅ Scheduled trade result: {trade_result}")
         else:
             logger.info("⏸️ No scheduled trade executed - conditions not met")
 
+        # Execute grid trading if enabled
+        grid_result = None
+        if grid_executor and grid_executor.enabled:
+            try:
+                # Initialize grid if not already done
+                if not grid_executor.grid_state:
+                    # Use LLM bias as grid bias (convert action to bias allocation)
+                    bias_allocation = 0.0
+                    if signal.get('action') == 'buy':
+                        bias_allocation = min(signal.get('confidence', 0.5), 0.8)  # Max 80% bias
+                    elif signal.get('action') == 'sell':
+                        bias_allocation = -min(signal.get('confidence', 0.5), 0.8)  # Max -80% bias
+                    
+                    grid_executor.initialize_grid(current_price, bias_allocation)
+                    logger.info(f"🔧 Grid initialized with bias: {bias_allocation:.3f}")
+                else:
+                    # Update grid bias based on latest LLM signal
+                    bias_allocation = 0.0
+                    if signal.get('action') == 'buy':
+                        bias_allocation = min(signal.get('confidence', 0.5), 0.8)
+                    elif signal.get('action') == 'sell':
+                        bias_allocation = -min(signal.get('confidence', 0.5), 0.8)
+                    
+                    grid_executor.update_bias(bias_allocation)
+                    logger.info(f"🔧 Grid bias updated: {bias_allocation:.3f}")
+                
+                # Check if grid trade should be executed
+                grid_action = grid_executor.should_grid_trade(current_price)
+                if grid_action:
+                    logger.info(f"🔧 Grid trade triggered: {grid_action.upper()}")
+                    
+                    # Get current equity and BTC balance for grid trade
+                    equity = float(account_balance.get('equity', 0.0)) if account_balance else 1000.0
+                    btc_qty = float(account_balance.get('btc_qty', 0.0)) if account_balance else 0.0
+                    
+                    # Execute grid trade
+                    grid_result = grid_executor.execute_grid_trade(grid_action, equity, btc_qty, current_price)
+                    logger.info(f"🔧 Grid trade result: {grid_result}")
+                else:
+                    logger.info("🔧 No grid trade triggered (price movement or time constraints)")
+                    
+            except Exception as grid_error:
+                logger.error(f"❌ Grid trading failed: {grid_error}")
+                grid_result = {"status": "error", "reason": str(grid_error)}
+
+        # Save current LLM bias for grid trading
+        if signal and signal.get('action') in ['buy', 'sell']:
+            bias_allocation = 0.0
+            if signal.get('action') == 'buy':
+                bias_allocation = min(signal.get('confidence', 0.5), 0.8)  # Max 80% bias
+            elif signal.get('action') == 'sell':
+                bias_allocation = -min(signal.get('confidence', 0.5), 0.8)  # Max 80% bias
+            
+            try:
+                from db import write_setting
+                write_setting("current_llm_bias", str(bias_allocation))
+                logger.info(f"💾 Saved LLM bias for grid trading: {bias_allocation:.2f}")
+            except Exception as e:
+                logger.warning(f"Failed to save LLM bias: {e}")
+        
         # Log the automated trade
         trade_log.append({
             "action": "SCHEDULED_AUTO_TRADE",
             "signal": signal,
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "trade_result": trade_result
+            "trade_result": trade_result,
+            "grid_result": grid_result
         })
 
         # Snapshot equity (best-effort)

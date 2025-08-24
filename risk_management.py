@@ -13,6 +13,42 @@ import json
 
 logger = logging.getLogger(__name__)
 
+# Exchange constants
+EXCHANGE_MIN_NOTIONAL_USD = 10.0  # Kraken spot floor-ish
+
+def effective_min_delta_usd(equity: float, settings) -> float:
+    """
+    Calculate effective minimum delta USD based on settings and equity.
+    
+    Args:
+        equity: Current portfolio equity in USD
+        settings: Settings object with no_fee_mode, min_trade_delta_usd, min_trade_delta_pct
+        
+    Returns:
+        Effective minimum delta USD for trade execution
+    """
+    # Determine floor based on fee mode
+    floor = EXCHANGE_MIN_NOTIONAL_USD if settings.get('no_fee_mode', True) else max(EXCHANGE_MIN_NOTIONAL_USD, settings.get('min_trade_delta_usd', 30.0))
+    
+    # Calculate percentage-based minimum
+    pct = max(0.0, settings.get('min_trade_delta_pct', 0.0)) * equity
+    
+    # Return the maximum of floor and percentage-based minimum
+    return max(floor, pct)
+
+def get_effective_min_delta_from_runtime_settings(equity: float, runtime_settings: dict) -> float:
+    """
+    Calculate effective minimum delta USD using runtime settings.
+    
+    Args:
+        equity: Current portfolio equity in USD
+        runtime_settings: Runtime settings dictionary from load_runtime_settings()
+        
+    Returns:
+        Effective minimum delta USD for trade execution
+    """
+    return effective_min_delta_usd(equity, runtime_settings)
+
 @dataclass
 class RiskAssessment:
     """Risk assessment result"""

@@ -18,6 +18,17 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta
 from typing import Dict, Optional, Tuple, List
 
+# Boolean parsing utility
+try:
+    from utils_bool import parse_bool
+except ImportError:
+    # Fallback if utils_bool is not available
+    def parse_bool(v, default=False):
+        if isinstance(v, bool): return v
+        if v is None: return default
+        s = str(v).strip().lower()
+        return s in {"1","true","t","yes","y","on","enabled","enable"}
+
 
 DB_PATH = os.getenv("TRADING_DB_PATH", "/opt/btc-trading/trades.db")
 
@@ -441,7 +452,13 @@ def init_default_settings() -> None:
         "max_exposure": float(os.getenv("MAX_EXPOSURE", "0.8")),
         "trade_cooldown_hours": float(os.getenv("TRADE_COOLDOWN_HOURS", "3")),
         "min_trade_delta": float(os.getenv("MIN_TRADE_DELTA", "0.05")),
-        "min_trade_delta_usd": float(os.getenv("MIN_TRADE_DELTA_USD", "30.0")),
+        "min_trade_delta_usd": float(os.getenv("MIN_TRADE_DELTA_USD", "10.0")),  # Updated to 10.0 for no-fee mode
+        "min_trade_delta_pct": float(os.getenv("MIN_TRADE_DELTA_PCT", "0.00")),  # New: 0% = allow micro-deltas
+        "no_fee_mode": parse_bool(os.getenv("NO_FEE_MODE", "True")),  # New: No-fee mode enabled by default
+        "grid_executor_enabled": parse_bool(os.getenv("GRID_EXECUTOR_ENABLED", "True")),  # Grid executor enabled by default
+        "grid_step_pct": float(os.getenv("GRID_STEP_PCT", "0.25")),  # 0.25% price move triggers grid trade
+        "grid_order_usd": float(os.getenv("GRID_ORDER_USD", "12.0")),  # $12 per grid trade
+        "max_grid_exposure": float(os.getenv("MAX_GRID_EXPOSURE", "0.1")),  # Max 10% exposure from grid
         "auto_trade_enabled": True,
         "safety_skip_degraded": True,
         "safety_max_price_staleness_sec": 120.0,

@@ -16,6 +16,13 @@ from pydantic import BaseModel, Field, validator
 from pydantic import model_validator
 from strategy_core import decide_target_allocation
 
+# Add database import for bias persistence
+try:
+    from db import write_setting, read_setting
+    DB_AVAILABLE = True
+except ImportError:
+    DB_AVAILABLE = False
+
 logger = logging.getLogger(__name__)
 
 class LLMResponseSchema(BaseModel):
@@ -90,6 +97,50 @@ class LLMTradingStrategy:
         
         logger.info("LLM trading strategy initialized successfully")
         logger.info(f"Min confidence: {self.min_confidence}, Max risk level: {self.max_risk_level}")
+    
+    def clamp(self, value: float, min_val: float, max_val: float) -> float:
+        """Clamp a value between min and max"""
+        return max(min_val, min(value, max_val))
+    
+    def persist_bias(self, symbol: str, bias: float, ts: datetime = None) -> bool:
+        """Persist bias allocation to database"""
+        try:
+            if not DB_AVAILABLE:
+                logger.warning("Database not available for bias persistence")
+                return False
+            
+            if ts is None:
+                ts = datetime.now()
+            
+            bias_data = {
+                "bias": bias,
+                "timestamp": ts.isoformat(),
+                "symbol": symbol
+            }
+            
+            write_setting(f"llm_bias_{symbol}", json.dumps(bias_data))
+            logger.info(f"💾 Persisted LLM bias for {symbol}: {bias:.3f}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to persist bias: {e}")
+            return False
+    
+    def get_persisted_bias(self, symbol: str) -> Optional[float]:
+        """Get persisted bias allocation from database"""
+        try:
+            if not DB_AVAILABLE:
+                return None
+            
+            bias_data = read_setting(f"llm_bias_{symbol}")
+            if bias_data:
+                data = json.loads(bias_data)
+                return data.get("bias")
+            return None
+            
+        except Exception as e:
+            logger.error(f"Failed to get persisted bias: {e}")
+            return None
     
     def _sanitize_for_logging(self, text: str) -> str:
         """Sanitize text for logging by removing sensitive information"""
@@ -540,6 +591,12 @@ Remember: Return ONLY the JSON object, nothing else.
                 news_sentiment, technical_indicators
             )
             
+            # Convert LLM decision to bias_allocation only (e.g., +0.4 long, -0.3 short/flat)
+            bias = self.clamp(analysis.confidence * (+1 if analysis.recommended_action == "buy" else -1), -1, +1) * self.max_exposure
+            
+            # Persist bias for grid execution
+            self.persist_bias("BTC", bias, ts=datetime.now())
+            
             # Determine if trade should be executed
             should_trade, reason = self.should_execute_trade(analysis)
 
@@ -563,6 +620,8 @@ Remember: Return ONLY the JSON object, nothing else.
                 "position_size": None,
                 # New: target exposure [-max_exposure, +max_exposure]
                 "target_exposure": target_exposure,
+                # New: bias allocation for grid execution
+                "bias_allocation": bias,
                 "price_target": analysis.price_target,
                 "stop_loss": analysis.stop_loss,
                 "analysis": analysis.reasoning,

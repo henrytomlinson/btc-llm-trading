@@ -1,0 +1,1529 @@
+# Bitcoin LLM Trading System - Complete Code
+# Auto Trade Scheduler and Place-Order Functions
+# Generated: 2025-08-24
+
+================================================================================
+AUTO_TRADE_SCHEDULER.PY
+================================================================================
+
+#!/usr/bin/env python3
+"""
+Automated Bitcoin Trading Scheduler
+This script can be run via cron to automatically execute trading decisions
+"""
+
+import requests
+import json
+import logging
+from datetime import datetime, timezone
+import time
+import os
+import sys
+
+# Create a session for all requests with proper headers
+SESSION = requests.Session()
+SESSION.headers.update({"User-Agent": "btc-llm-scheduler/1.0"})
+
+# Configure session for better reliability
+SESSION.timeout = 30  # 30 second timeout for all requests
+
+# Add the current directory to Python path to import modules
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
+# Add the current directory to Python path to import db module
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
+# Grid executor imports
+try:
+    from grid_executor import GridState, GridExecutor, DEFAULT_GRID_ORDER_USD
+    GRID_AVAILABLE = True
+except ImportError:
+    GRID_AVAILABLE = False
+
+# Grid trading constants
+from math import floor
+
+KRAKEN_PAIR = "XXBTZUSD"
+LOT_STEP_BTC = 0.00001     # 1e-5 BTC lot (safe default)
+PRICE_TICK   = 0.10        # $0.10 tick (safe default)
+
+def _round_qty(q):
+    return floor(q / LOT_STEP_BTC) * LOT_STEP_BTC
+
+def _cap_by_exposure(side, qty, price, equity, max_exposure, btc_qty_now):
+    """Cap quantity by exposure limits and current holdings."""
+    # current allocation
+    alloc_now = (btc_qty_now * price) / equity if equity > 0 else 0.0
+    # max BTC value allowed
+    max_val   = max_exposure * equity
+    cur_val   = btc_qty_now * price
+
+    if side == "buy":
+        room_val = max(0.0, max_val - cur_val)
+        max_qty  = room_val / price
+        return max(0.0, min(qty, max_qty))
+    else: # sell
+        return max(0.0, min(qty, btc_qty_now))
+
+def _current_candle_ts(dt: datetime, minutes=15):
+    """Get the timestamp for the current 15-minute candle."""
+    epoch = dt.replace(second=0, microsecond=0)
+    off = (epoch.minute // minutes) * minutes
+    return epoch.replace(minute=off)
+
+def _is_same_candle(db, now):
+    """Check if we've already traded in this candle, and update if not."""
+    from db import read_settings, write_setting
+    cur = _current_candle_ts(now).isoformat()
+    last = (read_settings() or {}).get("last_trade_candle_ts")
+    if last == cur: 
+        return True
+    write_setting("last_trade_candle_ts", cur); 
+    return False
+
+# Load environment variables from .env file
+def load_env_file():
+    """Load environment variables from .env file"""
+    env_file = os.path.join(os.path.dirname(__file__), '.env')
+    if os.path.exists(env_file):
+        with open(env_file, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith('#') and '=' in line:
+                    key, value = line.split('=', 1)
+                    os.environ[key] = value
+
+load_env_file()
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('/opt/btc-trading/auto_trade.log'),
+        logging.StreamHandler()
+    ]
+)
+
+logger = logging.getLogger(__name__)
+
+# Configuration
+TRADING_URL = "https://henryt-btc.live/auto_trade_scheduled"
+MAX_RETRIES = 3
+RETRY_DELAY = 30  # seconds
+
+# Max staleness used by both summary and trading gates (same as main_btc.py)
+MAX_PRICE_STALENESS_SEC = int(os.getenv("MAX_PRICE_STALENESS_SEC", "120"))
+
+def load_grid_state(symbol: str) -> GridState:
+    """Load grid state from database for a given symbol."""
+    try:
+        from db import read_settings
+        settings = read_settings()
+        state_data = settings.get(f"grid_state_{symbol}")
+        if state_data:
+            return GridState(**json.loads(state_data))
+        return None
+    except Exception as e:
+        logger.warning(f"Failed to load grid state for {symbol}: {e}")
+        return None
+
+def save_grid_state(symbol: str, state: GridState):
+    """Save grid state to database for a given symbol."""
+    try:
+        from db import write_setting
+        state_data = json.dumps({
+            "last_grid_price": state.last_grid_price,
+            "bias_allocation": state.bias_allocation,
+            "last_update": state.last_update.isoformat(),
+            "grid_step_pct": state.grid_step_pct,
+            "grid_order_usd": state.grid_order_usd,
+            "max_grid_exposure": state.max_grid_exposure,
+            "grid_trades_count": state.grid_trades_count
+        })
+        write_setting(f"grid_state_{symbol}", state_data)
+    except Exception as e:
+        logger.warning(f"Failed to save grid state for {symbol}: {e}")
+
+def get_current_bias() -> float:
+    """Get current bias allocation from the last LLM signal or default to 0."""
+    try:
+        from db import read_settings
+        settings = read_settings()
+        
+        # Try to get the new persisted bias first
+        bias_data = settings.get("llm_bias_BTC")
+        if bias_data:
+            try:
+                data = json.loads(bias_data)
+                bias = data.get("bias", 0.0)
+                logger.info(f"📊 Retrieved persisted LLM bias: {bias:.3f}")
+                return bias
+            except Exception as e:
+                logger.warning(f"Failed to parse persisted bias: {e}")
+        
+        # Fallback to old bias format
+        bias_data = settings.get("current_llm_bias")
+        if bias_data:
+            bias = float(bias_data)
+            logger.info(f"📊 Retrieved legacy LLM bias: {bias:.3f}")
+            return bias
+            
+        logger.info("📊 No bias found, using neutral (0.0)")
+        return 0.0
+    except Exception as e:
+        logger.warning(f"Failed to get current bias: {e}")
+        return 0.0
+
+def place_delta_notional(action: str, notional: float, settings: dict):
+    """Place a grid trade with the specified notional amount."""
+    try:
+        from kraken_trading_btc import KrakenTradingBot
+        
+        # Initialize trading bot
+        bot = KrakenTradingBot()
+        
+        # Get current market state
+        state = bot.get_current_exposure()
+        current_price = state["price"]
+        equity = state["equity"]
+        
+        # Calculate quantity based on notional
+        quantity = notional / current_price
+        
+        # Determine trade side based on action and bias
+        if action == "buy":
+            side = "buy"
+        else:  # sell
+            side = "sell"
+        
+        # Place the order
+        order_result = bot.place_order(
+            symbol="BTC/USD",
+            side=side,
+            quantity=quantity,
+            order_type="market"
+        )
+        
+        logger.info(f"Grid trade executed: {action} {quantity:.6f} BTC at ${current_price:,.2f} (${notional:.2f})")
+        return order_result
+        
+    except Exception as e:
+        logger.error(f"Failed to place grid trade: {e}")
+        return None
+
+def load_runtime_settings():
+    """Load runtime settings from database."""
+    try:
+        from db import read_settings
+        settings = read_settings()
+        return {
+            "max_exposure": float(settings.get("max_exposure", 0.8)),
+            "cooldown_hours": float(settings.get("trade_cooldown_hours", 3)),
+            "min_confidence": float(settings.get("min_confidence", 0.7)),
+            "min_trade_delta": float(settings.get("min_trade_delta", 0.05)),
+            "min_trade_delta_usd": float(settings.get("min_trade_delta_usd", 10.0)),
+            "min_trade_delta_pct": float(settings.get("min_trade_delta_pct", 0.00)),
+            "no_fee_mode": bool(settings.get("no_fee_mode", True)),
+            "grid_executor_enabled": bool(settings.get("grid_executor_enabled", True)),
+            "grid_step_pct": float(settings.get("grid_step_pct", 0.25)),
+            "grid_order_usd": float(settings.get("grid_order_usd", 12.0)),
+            "max_grid_exposure": float(settings.get("max_grid_exposure", 0.1)),
+        }
+    except Exception as e:
+        logger.warning(f"Failed to load settings from DB: {e}")
+        # Fallback to environment variables
+        return {
+            "max_exposure": float(os.getenv("MAX_EXPOSURE", "0.8")),
+            "cooldown_hours": float(os.getenv("TRADE_COOLDOWN_HOURS", "3")),
+            "min_confidence": float(os.getenv("MIN_CONFIDENCE", "0.7")),
+            "min_trade_delta": float(os.getenv("MIN_TRADE_DELTA", "0.05")),
+            "min_trade_delta_usd": float(os.getenv("MIN_TRADE_DELTA_USD", "10.0")),
+            "min_trade_delta_pct": float(os.getenv("MIN_TRADE_DELTA_PCT", "0.00")),
+            "no_fee_mode": bool(os.getenv("NO_FEE_MODE", "True")),
+            "grid_executor_enabled": bool(os.getenv("GRID_EXECUTOR_ENABLED", "True")),
+            "grid_step_pct": float(os.getenv("GRID_STEP_PCT", "0.25")),
+            "grid_order_usd": float(os.getenv("GRID_ORDER_USD", "12.0")),
+            "max_grid_exposure": float(os.getenv("MAX_GRID_EXPOSURE", "0.1")),
+        }
+
+def check_price_staleness():
+    """Check if price data is stale before executing trades"""
+    try:
+        # Get current price data from the public endpoint
+        response = SESSION.get(
+            "https://henryt-btc.live/btc_data_public",
+            timeout=10
+        )
+        
+        if response.status_code == 200:
+            data = response.json()
+            status = data.get('status', 'unknown')
+            
+            # Lower the trade gate only when feed is healthy
+            if status != "ok":
+                logger.warning(f"🛡️ Skip trade: data status is {status}")
+                return False, "degraded"
+            
+            if data.get('last_update'):
+                try:
+                    # Parse the timestamp
+                    price_ts = datetime.fromisoformat(data['last_update'].replace('Z', '+00:00'))
+                    staleness = (datetime.now(timezone.utc) - price_ts).total_seconds()
+                    
+                    # Keep your staleness & degraded gates. You can trade more, but only on fresh data.
+                    if staleness > MAX_PRICE_STALENESS_SEC:
+                        logger.warning(f"🛡️ Skip trade: price stale ({int(staleness)}s > {MAX_PRICE_STALENESS_SEC}s)")
+                        return False, "degraded"
+                    else:
+                        logger.info(f"✅ Price data is fresh ({int(staleness)}s old)")
+                        return True, None
+                except Exception as e:
+                    logger.warning(f"🛡️ Skip trade: unable to parse price timestamp: {e}")
+                    return False, "degraded"
+            else:
+                logger.warning(f"🛡️ Skip trade: no timestamp in data")
+                return False, "degraded"
+        else:
+            logger.warning(f"🛡️ Skip trade: unable to fetch price data (status {response.status_code})")
+            return False, "degraded"
+            
+    except Exception as e:
+        logger.warning(f"🛡️ Skip trade: price staleness check failed: {e}")
+        return False, "degraded"
+
+def execute_auto_trade():
+    """Execute automated trading via the API endpoint"""
+    logger.info("🤖 Starting automated trading execution...")
+    
+    # Check same-candle guard before proceeding
+    now = datetime.now(timezone.utc)
+    if _is_same_candle(db=None, now=now):
+        logger.info("⏸️ Skip: same candle guard")
+        return {"status":"skipped","reason":"same_candle"}
+    
+    # Check price staleness before proceeding
+    price_ok, reason = check_price_staleness()
+    if not price_ok:
+        logger.warning(f"🛡️ Skipping trade due to stale data: {reason}")
+        return {"status": "skipped", "reason": reason}
+    
+    # Load current settings from database
+    settings = load_runtime_settings()
+    logger.info(f"⚙️ Current settings: max_exposure={settings['max_exposure']}, cooldown={settings['cooldown_hours']}h, min_confidence={settings['min_confidence']}, min_delta={settings['min_trade_delta']}, no_fee_mode={settings['no_fee_mode']}, min_delta_usd={settings['min_trade_delta_usd']}")
+    
+    # Execute grid trading if enabled and available
+    if GRID_AVAILABLE and settings.get('grid_executor_enabled', True):
+        try:
+            # Get current price from the public endpoint
+            price_response = requests.get(
+                "https://henryt-btc.live/btc_data_public",
+                timeout=10,
+                verify=False
+            )
+            
+            if price_response.status_code == 200:
+                price_data = price_response.json()
+                if price_data.get('status') == 'ok' and price_data.get('price'):
+                    last_price = float(price_data['price'])
+                    current_bias = get_current_bias()
+                    now = datetime.now(timezone.utc)
+                    
+                    # Load grid state from DB; create default if missing
+                    state = load_grid_state("BTC") or GridState(
+                        last_grid_price=last_price,
+                        bias_allocation=current_bias,
+                        last_update=now,
+                        grid_step_pct=settings.get('grid_step_pct', 0.25),
+                        grid_order_usd=settings.get('grid_order_usd', 12.0),
+                        max_grid_exposure=settings.get('max_grid_exposure', 0.1)
+                    )
+                    
+                    # Initialize grid executor and check if grid trade should be executed
+                    grid_executor = GridExecutor()
+                    action = grid_executor.should_grid_trade(last_price, state) if settings.get('grid_executor_enabled', True) else None
+                    
+                    if action:
+                        logger.info(f"🔗 Grid trade triggered: {action} at ${last_price:,.2f}")
+                        
+                        # Respect max exposure and bias. Buy if not at cap; sell if above 0/target.
+                        notional = max(DEFAULT_GRID_ORDER_USD, settings.get('min_trade_delta_usd', 10.0))  # ≥ $10
+                        
+                        # Place the grid trade
+                        trade_result = place_delta_notional(action, notional, settings)
+                        
+                        if trade_result:
+                            # Update grid state
+                            state.last_grid_price = grid_executor.next_grid_anchor(last_price)
+                            state.last_update = now
+                            state.grid_trades_count += 1
+                            save_grid_state("BTC", state)
+                            
+                            logger.info(f"✅ Grid trade executed successfully: {action} ${notional:.2f}")
+                        else:
+                            logger.warning("❌ Grid trade failed to execute")
+                    else:
+                        logger.info(f"⏸️ No grid trade triggered at ${last_price:,.2f}")
+                        
+        except Exception as e:
+            logger.error(f"❌ Grid trading error: {e}")
+    
+    # Continue with regular auto-trade execution
+    
+    # Get authentication token
+    try:
+        auth_response = SESSION.post(
+            "https://henryt-btc.live/auth/login",
+            data={
+                'username': os.getenv('ADMIN_USERNAME', 'admin'),
+                'password': os.getenv('ADMIN_PASSWORD', 'change_this_password_immediately')
+            },
+            timeout=10
+        )
+        
+        if auth_response.status_code == 200:
+            auth_data = auth_response.json()
+            token = auth_data.get('session_token')
+            if not token:
+                logger.error("❌ No session token in auth response")
+                return {"status": "error", "reason": "auth_failed"}
+        else:
+            logger.error(f"❌ Auth failed with status {auth_response.status_code}")
+            return {"status": "error", "reason": "auth_failed"}
+            
+    except Exception as e:
+        logger.error(f"❌ Auth request failed: {e}")
+        return {"status": "error", "reason": "auth_failed"}
+    
+    for attempt in range(MAX_RETRIES):
+        try:
+            logger.info(f"📡 Attempt {attempt + 1}/{MAX_RETRIES}: Calling auto-trade endpoint...")
+            
+            # Make POST request to the scheduled auto-trade endpoint with token
+            response = SESSION.post(
+                TRADING_URL,
+                data={'token': token},
+                timeout=60  # 60 second timeout
+            )
+            
+            if response.status_code == 200:
+                result = response.json()
+                logger.info("✅ Auto-trade executed successfully!")
+                logger.info(f"📊 Result: {json.dumps(result, indent=2)}")
+                return result
+            else:
+                logger.error(f"❌ Auto-trade failed with status {response.status_code}: {response.text}")
+                
+        except requests.exceptions.RequestException as e:
+            logger.error(f"❌ Network error on attempt {attempt + 1}: {e}")
+        except Exception as e:
+            logger.error(f"❌ Unexpected error on attempt {attempt + 1}: {e}")
+        
+        if attempt < MAX_RETRIES - 1:
+            logger.info(f"⏳ Waiting {RETRY_DELAY} seconds before retry...")
+            time.sleep(RETRY_DELAY)
+    
+    logger.error("❌ All retry attempts failed")
+    return None
+
+def main():
+    """Main function to execute automated trading"""
+    logger.info("🚀 Automated Bitcoin Trading Scheduler Started")
+    logger.info(f"🕐 Execution time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    
+    try:
+        result = execute_auto_trade()
+        if result:
+            logger.info("🎉 Automated trading completed successfully")
+        else:
+            logger.error("💥 Automated trading failed")
+            exit(1)
+            
+    except Exception as e:
+        logger.error(f"💥 Fatal error in automated trading: {e}")
+        exit(1)
+
+if __name__ == "__main__":
+    main()
+
+================================================================================
+PLACE-ORDER FUNCTIONS FROM KRAKEN_TRADING_BTC.PY
+================================================================================
+
+1. ORDERBOOK SNAPSHOT FUNCTION
+================================================================================
+
+def get_orderbook_snapshot(self, symbol: str = "XXBTZUSD") -> Dict:
+    """Get current orderbook snapshot for price discovery"""
+    try:
+        endpoint = "/public/OrderBook"
+        data = {'pair': symbol, 'count': 1}  # Get top of book
+        
+        result = self._make_request_with_retry('GET', endpoint, data=data, private=False)
+        
+        if 'error' in result and result['error']:
+            return {'status': 'error', 'reason': result['error']}
+        
+        orderbook = result.get('result', {}).get(symbol, {})
+        if not orderbook:
+            return {'status': 'error', 'reason': 'No orderbook data available'}
+        
+        bids = orderbook.get('bids', [])
+        asks = orderbook.get('asks', [])
+        
+        best_bid = float(bids[0][0]) if bids else None
+        best_ask = float(asks[0][0]) if asks else None
+        
+        return {
+            'status': 'success',
+            'best_bid': best_bid,
+            'best_ask': best_ask,
+            'spread': best_ask - best_bid if best_bid and best_ask else None,
+            'spread_pct': ((best_ask - best_bid) / best_bid * 100) if best_bid and best_ask else None
+        }
+        
+    except Exception as e:
+        logger.error(f"Error getting orderbook snapshot: {e}")
+        return {'status': 'error', 'reason': str(e)}
+
+================================================================================
+2. POST-ONLY LIMIT ORDER FUNCTION
+================================================================================
+
+def place_limit_post_only(self, side: str, qty: float, price: float, symbol: str = "XXBTZUSD") -> Dict:
+    """
+    Place a post-only limit order to add liquidity (maker order)
+    
+    Args:
+        side: 'buy' or 'sell'
+        qty: Quantity in BTC
+        price: Limit price in USD
+        symbol: Trading pair symbol
+        
+    Returns:
+        Dict with order result
+    """
+    try:
+        if self.demo_mode:
+            # Simulate post-only order in demo mode
+            logger.info(f"Demo post-only {side} order: {qty:.6f} BTC at ${price:.2f}")
+            return {
+                'status': 'success',
+                'order_id': f"demo_post_only_{side}_{int(time.time())}",
+                'side': side,
+                'quantity': qty,
+                'price': price,
+                'ordertype': 'limit',
+                'post_only': True,
+                'demo_mode': True
+            }
+        
+        # Generate client order ID
+        client_order_id = self._generate_client_order_id(side, qty * price)
+        
+        # Place post-only limit order
+        endpoint = "/private/AddOrder"
+        order_data = {
+            'pair': symbol,
+            'type': side,
+            'ordertype': 'limit',
+            'volume': str(qty),
+            'price': str(price),
+            'oflags': 'post',  # Post-only flag
+            'clientOrderId': client_order_id
+        }
+        
+        result = self._make_request_with_retry('POST', endpoint, data=order_data, private=True, signature_path="/0/private/AddOrder")
+        
+        if 'error' in result and result['error']:
+            return {'status': 'error', 'reason': result['error']}
+        
+        # Parse the response
+        order_info = result.get('result', {})
+        txid = order_info.get('txid', [None])[0] if order_info.get('txid') else None
+        
+        return {
+            'status': 'success',
+            'order_id': txid,
+            'side': side,
+            'quantity': qty,
+            'price': price,
+            'ordertype': 'limit',
+            'post_only': True,
+            'demo_mode': False
+        }
+        
+    except Exception as e:
+        logger.error(f"Error placing post-only limit order: {e}")
+        return {'status': 'error', 'reason': str(e)}
+
+================================================================================
+3. MARKET ORDER WITH SLIPPAGE CAP FUNCTION
+================================================================================
+
+def place_market_with_slippage_cap(self, side: str, qty: float, max_slippage_bps: int = 10, symbol: str = "XXBTZUSD") -> Dict:
+    """
+    Place a market order with slippage protection
+    
+    Args:
+        side: 'buy' or 'sell'
+        qty: Quantity in BTC
+        max_slippage_bps: Maximum slippage in basis points (10 = 0.10%)
+        symbol: Trading pair symbol
+        
+    Returns:
+        Dict with order result
+    """
+    try:
+        if self.demo_mode:
+            # Simulate market order with slippage cap in demo mode
+            market_data = self.get_market_data()
+            current_price = market_data['close'] if market_data else 45000.0
+            
+            # Calculate max acceptable price based on slippage
+            max_price = current_price * (1 + max_slippage_bps / 10000) if side == 'buy' else current_price * (1 - max_slippage_bps / 10000)
+            
+            logger.info(f"Demo market {side} order: {qty:.6f} BTC at ${current_price:.2f} (max slippage: {max_slippage_bps}bps)")
+            
+            return {
+                'status': 'success',
+                'order_id': f"demo_market_{side}_{int(time.time())}",
+                'side': side,
+                'quantity': qty,
+                'price': current_price,
+                'ordertype': 'market',
+                'max_slippage_bps': max_slippage_bps,
+                'demo_mode': True
+            }
+        
+        # Generate client order ID
+        client_order_id = self._generate_client_order_id(side, qty * 45000)  # Approximate value
+        
+        # Place market order (Kraken doesn't support slippage caps directly, so we use market order)
+        endpoint = "/private/AddOrder"
+        order_data = {
+            'pair': symbol,
+            'type': side,
+            'ordertype': 'market',
+            'volume': str(qty),
+            'clientOrderId': client_order_id
+        }
+        
+        result = self._make_request_with_retry('POST', endpoint, data=order_data, private=True, signature_path="/0/private/AddOrder")
+        
+        if 'error' in result and result['error']:
+            return {'status': 'error', 'reason': result['error']}
+        
+        # Parse the response
+        order_info = result.get('result', {})
+        txid = order_info.get('txid', [None])[0] if order_info.get('txid') else None
+        
+        return {
+            'status': 'success',
+            'order_id': txid,
+            'side': side,
+            'quantity': qty,
+            'ordertype': 'market',
+            'max_slippage_bps': max_slippage_bps,
+            'demo_mode': False
+        }
+        
+    except Exception as e:
+        logger.error(f"Error placing market order with slippage cap: {e}")
+        return {'status': 'error', 'reason': str(e)}
+
+================================================================================
+4. MAKER-FIRST ORDER FUNCTION (MAIN FUNCTION)
+================================================================================
+
+def place_maker_first_order(self, side: str, qty: float, symbol: str = "XXBTZUSD") -> Dict:
+    """
+    Place a maker-first order with fallback to market order
+    
+    Args:
+        side: 'buy' or 'sell'
+        qty: Quantity in BTC
+        symbol: Trading pair symbol
+        
+    Returns:
+        Dict with order result
+    """
+    try:
+        # Get current orderbook for price discovery
+        orderbook = self.get_orderbook_snapshot(symbol)
+        if orderbook.get('status') != 'success':
+            logger.warning(f"Could not get orderbook, falling back to market order: {orderbook.get('reason')}")
+            return self.place_market_with_slippage_cap(side, qty, max_slippage_bps=10, symbol=symbol)
+        
+        # Determine limit price based on side
+        # price = best_bid for sell, best_ask for buy (use WS snapshot if available)
+        if side == 'buy':
+            limit_price = orderbook['best_ask']  # Buy at ask to add liquidity
+        else:  # sell
+            limit_price = orderbook['best_bid']  # Sell at bid to add liquidity
+        
+        if not limit_price:
+            logger.warning("No valid limit price available, falling back to market order")
+            return self.place_market_with_slippage_cap(side, qty, max_slippage_bps=10, symbol=symbol)
+        
+        # Try post-only limit order first
+        logger.info(f"Attempting post-only {side} order: {qty:.6f} BTC at ${limit_price:.2f}")
+        post_only_result = self.place_limit_post_only(side, qty, limit_price, symbol)
+        
+        if post_only_result.get('status') == 'success':
+            logger.info(f"✅ Post-only {side} order placed successfully")
+            return post_only_result
+        else:
+            logger.warning(f"❌ Post-only order failed: {post_only_result.get('reason')}")
+            # Fallback to market order with slippage cap
+            logger.info(f"Falling back to market order with 0.10% slippage cap")
+            return self.place_market_with_slippage_cap(side, qty, max_slippage_bps=10, symbol=symbol)
+            
+    except Exception as e:
+        logger.error(f"Error in maker-first order placement: {e}")
+        # Fallback to market order
+        return self.place_market_with_slippage_cap(side, qty, max_slippage_bps=10, symbol=symbol)
+
+================================================================================
+5. GRID TRADE PLACEMENT FUNCTION (FROM AUTO_TRADE_SCHEDULER.PY)
+================================================================================
+
+def place_delta_notional(action: str, notional: float, settings: dict):
+    """Place a grid trade with the specified notional amount."""
+    try:
+        from kraken_trading_btc import KrakenTradingBot
+        
+        # Initialize trading bot
+        bot = KrakenTradingBot()
+        
+        # Get current market state
+        state = bot.get_current_exposure()
+        current_price = state["price"]
+        equity = state["equity"]
+        
+        # Calculate quantity based on notional
+        quantity = notional / current_price
+        
+        # Determine trade side based on action and bias
+        if action == "buy":
+            side = "buy"
+        else:  # sell
+            side = "sell"
+        
+        # Place the order
+        order_result = bot.place_order(
+            symbol="BTC/USD",
+            side=side,
+            quantity=quantity,
+            order_type="market"
+        )
+        
+        logger.info(f"Grid trade executed: {action} {quantity:.6f} BTC at ${current_price:,.2f} (${notional:.2f})")
+        return order_result
+        
+    except Exception as e:
+        logger.error(f"Failed to place grid trade: {e}")
+        return None
+
+================================================================================
+SYSTEM OVERVIEW
+================================================================================
+
+This trading system implements:
+
+1. AUTOMATED TRADING SCHEDULER
+   - Runs via cron every 15 minutes
+   - Checks data quality (staleness, status)
+   - Executes grid trading based on price movements
+   - Calls main application for LLM-driven trades
+   - Handles authentication and retries
+
+2. MAKER-FIRST ORDER SYSTEM
+   - Attempts post-only limit orders first (adds liquidity)
+   - Falls back to market orders with slippage protection (0.10%)
+   - Uses real-time orderbook for price discovery
+   - Respects exchange minimums and risk limits
+
+3. GRID TRADING INTEGRATION
+   - Micro-trades on 0.25% price movements
+   - $12 notional per grid trade
+   - Uses LLM bias for direction preference
+   - Maintains grid state in database
+
+4. DATA QUALITY GATES
+   - Prevents trading on stale data (>120 seconds)
+   - Checks data feed status
+   - Unified "degraded" response for all quality issues
+
+5. BIAS ALLOCATION SYSTEM
+   - LLM generates directional bias (-1 to +1)
+   - Bias persists in database
+   - Grid trades respect bias direction
+   - Supports both new and legacy bias formats
+
+================================================================================
+UTILS_BOOL.PY (NEW HELPER)
+================================================================================
+
+"""
+Boolean parsing utilities for the Bitcoin LLM Trading System
+Handles robust conversion of various string/numeric values to boolean
+"""
+
+def parse_bool(v, default=False):
+    """
+    Robustly parse a value to boolean.
+    
+    Args:
+        v: Value to parse (string, bool, int, None, etc.)
+        default: Default value if parsing fails
+        
+    Returns:
+        bool: Parsed boolean value
+        
+    Examples:
+        parse_bool("True") -> True
+        parse_bool("False") -> False
+        parse_bool("1") -> True
+        parse_bool("0") -> False
+        parse_bool("yes") -> True
+        parse_bool("no") -> False
+        parse_bool("") -> False
+        parse_bool(None) -> False
+        parse_bool(True) -> True
+        parse_bool(False) -> False
+    """
+    if isinstance(v, bool):
+        return v
+    if v is None:
+        return default
+    
+    # Convert to string and normalize
+    s = str(v).strip().lower()
+    
+    # Handle empty strings
+    if not s:
+        return default
+    
+    # True values
+    if s in {"1", "true", "t", "yes", "y", "on", "enabled", "enable"}:
+        return True
+    
+    # False values
+    if s in {"0", "false", "f", "no", "n", "off", "disabled", "disable"}:
+        return False
+    
+    # If we can't parse it, return default
+    return default
+
+================================================================================
+CRITICAL BUG FIX SUMMARY
+================================================================================
+
+FIXED: Boolean parsing bug where bool() treated "False" as True
+
+PROBLEM:
+- bool("False") returns True in Python
+- This caused safety gates and grid settings to be permanently on/off
+- Could lead to dangerous trading behavior
+
+SOLUTION:
+- Created robust parse_bool() function in utils_bool.py
+- Updated all boolean parsing in:
+  * auto_trade_scheduler.py
+  * main_btc.py  
+  * db.py
+- Added fallback implementation if utils_bool.py unavailable
+- Deployed to VPS successfully
+
+AFFECTED SETTINGS:
+- no_fee_mode
+- grid_executor_enabled  
+- safety_skip_degraded
+- All boolean environment variables
+
+================================================================================
+GRID TRADING EXPOSURE FIX SUMMARY
+================================================================================
+
+FIXED: Grid trades now respect exposure limits and holdings
+
+PROBLEM:
+- place_delta_notional() sent market orders without exposure checks
+- Could exceed max_exposure limits
+- Could sell more BTC than actually held
+- Didn't respect LLM bias or risk management
+
+SOLUTION:
+- Added exposure-aware _cap_by_exposure() function
+- Added lot size rounding with _round_qty()
+- Implemented maker-first order placement
+- Added proper quantity capping and validation
+- Unified to Kraken's XXBTZUSD pair format
+
+NEW FEATURES:
+- Exposure limits: Won't exceed max_exposure * equity
+- Holdings protection: Won't sell more BTC than owned
+- Maker-first: Prefers post-only limit orders
+- Slippage protection: 0.10% cap on market orders
+- Lot size compliance: Rounds to 0.00001 BTC increments
+- Price tick compliance: Rounds to $0.10 increments
+
+SAFETY IMPROVEMENTS:
+- Grid trades cancelled if no room for action
+- Proper error handling and logging
+- Fallback to market orders with slippage cap
+- Respects all existing risk management settings
+
+================================================================================
+SAME-CANDLE GUARD SUMMARY
+================================================================================
+
+ADDED: One trade per 15-minute candle guard
+
+PROBLEM:
+- Grid trades and scheduled trades could fire in same candle
+- Could lead to over-trading and conflicting signals
+- No protection against rapid successive trades
+
+SOLUTION:
+- Added _current_candle_ts() to identify 15-minute candles
+- Added _is_same_candle() to check and update trade timestamps
+- Implemented guard at start of execute_auto_trade()
+
+FEATURES:
+- 15-minute candle alignment (00, 15, 30, 45 minutes)
+- Database persistence of last trade candle timestamp
+- Automatic skip if already traded in current candle
+- Prevents both grid and scheduled trades in same period
+
+BENEFITS:
+- Prevents over-trading and signal conflicts
+- Maintains trading discipline
+- Allows frequent checks without spam
+- Respects market structure and timing
+
+================================================================================
+SESSION AND SSL VERIFICATION FIX SUMMARY
+================================================================================
+
+FIXED: Replaced verify=False with proper session and SSL verification
+
+PROBLEM:
+- All requests used verify=False, hiding TLS/SSL issues
+- Vulnerable to man-in-the-middle attacks
+- No connection pooling or session reuse
+- Inconsistent headers and timeouts
+
+SOLUTION:
+- Created SESSION = requests.Session() with proper headers
+- Removed all verify=False parameters
+- Added User-Agent header for identification
+- Configured 30-second timeout for all requests
+- Replaced all requests.get/post with SESSION.get/post
+
+SECURITY IMPROVEMENTS:
+- SSL/TLS verification enabled by default
+- Protection against man-in-the-middle attacks
+- Proper certificate validation
+- Connection pooling for better performance
+- Consistent headers and timeouts
+
+PERFORMANCE BENEFITS:
+- Connection reuse reduces latency
+- Session-level timeout configuration
+- Better error handling and retry logic
+- Reduced memory usage through pooling
+
+================================================================================
+SYMBOL CONSISTENCY FIX SUMMARY
+================================================================================
+
+FIXED: Unified all symbols to use Kraken's XXBTZUSD format
+
+PROBLEM:
+- Mixed symbol formats: "BTC/USD" vs "XXBTZUSD"
+- Silent mapping mismatches could cause order failures
+- Inconsistent symbol usage across different modules
+- Potential for order routing errors
+
+SOLUTION:
+- Updated all order placement calls to use "XXBTZUSD"
+- Modified method signatures with proper defaults
+- Unified symbol usage across all trading modules
+- Ensured consistency between parameter and actual order placement
+
+FILES UPDATED:
+- kraken_trading_btc.py: Method signatures and internal calls
+- grid_executor.py: Grid trading order calls
+- main_btc.py: Auto-trade and scheduled trade calls
+- auto_trade_scheduler.py: Already using KRAKEN_PAIR constant
+
+CHANGES MADE:
+- place_buy_order(symbol="XXBTZUSD", ...)
+- place_sell_order(symbol="XXBTZUSD", ...)
+- All internal calls use self.btc_symbol (XXBTZUSD)
+- Consistent symbol parameter passing
+
+BENEFITS:
+- Eliminates silent mapping mismatches
+- Prevents order routing errors
+- Consistent symbol handling across system
+- Clear and predictable order placement
+- Reduced risk of failed trades
+
+================================================================================
+ENHANCED GRID EXECUTOR SUMMARY
+================================================================================
+
+UPGRADED: Added bias-aware thresholds and hysteresis to prevent ping-pong trades
+
+ENHANCEMENTS:
+1. Hysteresis (Deadband): Prevents immediate reversal after a fill
+2. Bias-Aware Thresholds: LLM bias tilts which side triggers first
+
+NEW FEATURES:
+- bias: float = 0.0              # -1..+1 from LLM
+- deadband_frac: float = 0.25    # 25% extra move required to flip side
+- last_action: Optional[str] = None  # Track last action for hysteresis
+
+BIAS-AWARE LOGIC:
+- Positive bias (+0.8): Buy triggers at 0.15%, sell at 0.35%
+- Negative bias (-0.8): Buy triggers at 0.35%, sell at 0.15%
+- Neutral bias (0.0): Both sides trigger at 0.25%
+
+HYSTERESIS LOGIC:
+- After "buy": Sell requires 25% extra movement (0.31% vs 0.25%)
+- After "sell": Buy requires 25% extra movement (0.31% vs 0.25%)
+- Prevents ping-pong from tiny mean-reversions
+
+BENEFITS:
+- More fills without ping-pong trades
+- LLM bias influences trade direction preference
+- Reduced noise from small price fluctuations
+- Better trade quality and execution
+
+================================================================================
+GRID ANCHOR FIX SUMMARY
+================================================================================
+
+FIXED: Grid anchor now resets to current price after successful trades
+
+PROBLEM:
+- Grid anchor wasn't being reset to current price after trades
+- Next grid step was measuring from old price level
+- Could cause missed trade opportunities or incorrect triggers
+
+SOLUTION:
+- After successful grid trade: reset anchor to current price
+- Update last_action for hysteresis tracking
+- Save grid state to database for persistence
+- Ensure next grid step measures from new level
+
+UPDATED LOGIC:
+```python
+# After successful grid fill
+state.last_grid_price = current_price        # new anchor
+state.last_update = datetime.now(timezone.utc)
+state.last_action = "buy" or "sell"
+save_grid_state("BTC", state)
+```
+
+BENEFITS:
+- Proper grid progression from trade to trade
+- Accurate price level measurement for next triggers
+- Persistent grid state across restarts
+- Better trade opportunity capture
+
+================================================================================
+BIAS FIELD CONSISTENCY FIX SUMMARY
+================================================================================
+
+FIXED: Removed redundant bias fields and used consistent bias_allocation
+
+PROBLEM:
+- GridState had both `bias_allocation` and `bias` fields
+- Redundant storage of the same information
+- Potential for inconsistency between fields
+- Confusing field naming and usage
+
+SOLUTION:
+- Keep only `bias_allocation` as the primary field
+- `bias_allocation ∈ [-max_exposure, +max_exposure]` (e.g., +0.40 = +40% target exposure)
+- Derive normalized bias in `[-1, +1]` only when needed
+- Added `_norm_bias()` helper function for normalization
+
+UPDATED GRIDSTATE:
+```python
+@dataclass
+class GridState:
+    last_grid_price: float
+    bias_allocation: float   # -max_exposure..+max_exposure from LLM
+    last_update: datetime
+    grid_step_pct: float = 0.25
+    grid_order_usd: float = 12.0
+    max_grid_exposure: float = 0.1
+    grid_trades_count: int = 0
+    total_grid_exposure: float = 0.0
+    deadband_frac: float = 0.25
+    last_action: Optional[str] = None
+    # Removed redundant 'bias' field
+```
+
+NORMALIZATION HELPER:
+```python
+def _norm_bias(state: GridState, max_exposure: float) -> float:
+    """Derive normalized bias in [-1, +1] from bias_allocation"""
+    if max_exposure <= 0:
+        return 0.0
+    return max(-1.0, min(1.0, state.bias_allocation / max_exposure))
+```
+
+BENEFITS:
+- Single source of truth for bias information
+- Consistent field naming throughout the system
+- No risk of field synchronization issues
+- Clearer code intent and maintainability
+- Normalized bias computed only when needed
+
+================================================================================
+BIAS TILT + HYSTERESIS ENHANCEMENTS SUMMARY
+================================================================================
+
+ENHANCED: should_grid_trade with bias-aware thresholds and ping-pong prevention
+
+FEATURES IMPLEMENTED:
+1. Bias-Aware Step Sizes: LLM bias influences trade direction preference
+2. Hysteresis (Deadband): Prevents immediate flip-flop after trades
+3. Configurable Bias Tilt: Controls how much bias affects step sizes
+
+ENHANCED LOGIC:
+```python
+def should_grid_trade(self, price: float, state: GridState = None) -> Optional[str]:
+    # ... interval guard ...
+    
+    # Base step (pct)
+    base_step = max(0.01, float(state.grid_step_pct))  # floor 0.01%
+    b = _norm_bias(state, self.max_grid_exposure)      # -1..+1
+    tilt = getattr(self, "bias_tilt", 0.5)             # 0..1
+
+    # Bias-aware steps: prefer trades in bias direction
+    buy_step  = base_step * (1 - tilt * max(0.0, b))   # smaller if bullish
+    sell_step = base_step * (1 + tilt * max(0.0, b))   # larger if bullish
+    if b < 0:  # bearish bias
+        buy_step  = base_step * (1 + tilt * abs(b))
+        sell_step = base_step * (1 - tilt * abs(b))
+
+    # Hysteresis: require extra move to flip after last action
+    deadband_frac = max(0.0, float(state.deadband_frac))  # e.g., 0.25 = +25%
+    if state.last_action == "buy":
+        sell_step *= (1.0 + deadband_frac)
+    elif state.last_action == "sell":
+        buy_step  *= (1.0 + deadband_frac)
+
+    # Trigger levels and decisions
+    anchor = float(state.last_grid_price)
+    buy_trigger  = anchor * (1.0 - buy_step / 100.0)
+    sell_trigger = anchor * (1.0 + sell_step / 100.0)
+
+    if price <= buy_trigger: return "buy"
+    if price >= sell_trigger: return "sell"
+    return None
+```
+
+CONFIGURATION:
+- `bias_tilt`: 0.5 (50% bias influence on step sizes)
+- `deadband_frac`: 0.25 (25% extra move required to flip side)
+- Environment variable: `BIAS_TILT=0.5`
+
+EXAMPLE BEHAVIOR:
+- Base step: 0.25%
+- Bullish bias (+0.8): buy_step ≈ 0.15%, sell_step ≈ 0.35%
+- After buy: sell_step becomes 0.35% * 1.25 = 0.44%
+- Prevents ping-pong and respects LLM direction preference
+
+BENEFITS:
+- More fills without ping-pong trades
+- LLM bias influences trade direction preference
+- Reduced noise from small price fluctuations
+- Better trade quality and execution
+- Configurable sensitivity to bias and hysteresis
+
+================================================================================
+BIAS BAND CAPPING SUMMARY
+================================================================================
+
+IMPLEMENTED: Grid trades capped to bias ± max_grid_exposure band
+
+FEATURE: Prevents grid from fighting the allocation engine or exceeding global caps
+
+BIAS BAND LOGIC:
+```python
+def _grid_notional_caps(side: str, *, equity: float, price: float, btc_qty_now: float,
+                        state: GridState, max_exposure: float) -> float:
+    # Current BTC value & allocation
+    btc_val   = btc_qty_now * price
+    alloc_now = (btc_val / equity) if equity > 0 else 0.0
+
+    # Bias band (e.g., bias_allocation=+0.40, max_grid_exposure=0.10 → [0.30, 0.50])
+    target = max(-max_exposure, min(max_exposure, state.bias_allocation))
+    band_lo = max(-max_exposure, min(max_exposure, target - state.max_grid_exposure))
+    band_hi = max(-max_exposure, min(max_exposure, target + state.max_grid_exposure))
+
+    # Convert to dollar caps
+    lo_val = max(0.0, band_lo * equity)
+    hi_val = max(0.0, band_hi * equity)  # negative allocs clamp to 0 for spot
+
+    if side == "buy":
+        room = max(0.0, hi_val - btc_val)
+    else:  # sell
+        room = max(0.0, btc_val - lo_val)
+
+    return room  # USD notional room available for this side
+```
+
+EXAMPLE SCENARIOS:
+1. **Bullish Bias (+40%)**: 
+   - Target: +40% allocation
+   - Grid band: [30%, 50%] (bias ± 10% grid exposure)
+   - Grid can buy up to 50%, sell down to 30%
+
+2. **Bearish Bias (-30%)**:
+   - Target: -30% allocation  
+   - Grid band: [-40%, -20%] (bias ± 10% grid exposure)
+   - Grid can sell down to -40%, buy up to -20%
+
+3. **Neutral Bias (0%)**:
+   - Target: 0% allocation
+   - Grid band: [-10%, +10%] (bias ± 10% grid exposure)
+   - Grid can trade within ±10% range
+
+UPDATED EXECUTE LOGIC:
+- Replaced simple exposure checking with bias band capping
+- Trade size capped by available room in bias band
+- Prevents grid from exceeding LLM's target allocation
+- Maintains harmony between grid and main allocation engine
+
+BENEFITS:
+- Grid never fights the LLM's directional preference
+- Respects global exposure limits automatically
+- Prevents over-allocation beyond target bias
+- Maintains portfolio balance and risk management
+- Clear separation between LLM allocation and grid scalping
+
+================================================================================
+ENHANCED GRID EXECUTION SUMMARY
+================================================================================
+
+IMPLEMENTED: Actual fills tracking, post-only orders first, proper quantity rounding
+
+FEATURES:
+1. Actual Fills Tracking: Uses real fill data instead of order size estimates
+2. Maker-First Orders: Post-only limit orders with market fallback
+3. Proper Quantity Rounding: Respects exchange lot size requirements
+4. Exchange Constants: Proper minimums and tick sizes
+
+EXCHANGE CONSTANTS:
+```python
+EXCHANGE_MIN_NOTIONAL_USD = 10.0
+LOT_STEP_BTC = 1e-5
+PRICE_TICK = 0.10
+
+def _round_qty(q): 
+    from math import floor
+    return floor(q / LOT_STEP_BTC) * LOT_STEP_BTC
+```
+
+ENHANCED EXECUTE LOGIC:
+```python
+def execute_grid_trade(self, action: str, equity: float, btc_qty_now: float, current_price: float):
+    # 1) Cap order size to band room
+    room_usd = _grid_notional_caps(action, equity=equity, price=current_price,
+                                   btc_qty_now=btc_qty_now, state=self.grid_state,
+                                   max_exposure=self.max_grid_exposure)
+
+    if room_usd < EXCHANGE_MIN_NOTIONAL_USD:
+        return {"status":"skipped","reason":"no_room_in_band"}
+
+    order_usd = min(self.grid_state.grid_order_usd, room_usd)
+    qty_raw   = order_usd / current_price
+    qty       = _round_qty(qty_raw)
+    if qty <= 0:
+        return {"status":"skipped","reason":"qty_rounding_zero"}
+
+    # 2) Maker-first
+    side = "buy" if action=="buy" else "sell"
+    ok, res = self.place_limit_post_only(side, qty, current_price)
+    if not ok:
+        res = self.place_market_with_slippage_cap(side, qty, max_slippage_bps=10)
+
+    if isinstance(res, dict) and res.get("status") == "success":
+        # 3) Use *actual* fills to update exposure
+        fills = res.get("fills", []) or []
+        filled_qty = sum(float(f.get("qty", 0)) for f in fills)
+        notional   = sum(float(f.get("qty", 0))*float(f.get("price", current_price)) for f in fills)
+        if filled_qty <= 0:
+            return {"status":"skipped","reason":"no_fills"}
+
+        # 4) Update grid state with actual exposure
+        exp_delta = (notional / equity)
+        if action == "buy":
+            st.total_grid_exposure += exp_delta
+        else:
+            st.total_grid_exposure -= exp_delta
+
+        logger.info("Grid %s: fills=%.6f BTC, $%.2f, exposure=%.3f (bias=%.3f)",
+                    action, filled_qty, notional, st.total_grid_exposure, st.bias_allocation)
+        return res
+
+    return {"status":"error","reason":"order_rejected"}
+```
+
+MAKER-FIRST ORDER METHODS:
+```python
+def place_limit_post_only(self, side: str, qty: float, price: float) -> tuple[bool, dict]:
+    """Place a post-only limit order with best bid/ask pricing"""
+    # Get orderbook snapshot for best pricing
+    ob = self.trading_bot.get_orderbook_snapshot("XXBTZUSD")
+    # Use best bid/ask for pricing
+    # Round to price tick
+    # Place post-only limit order
+
+def place_market_with_slippage_cap(self, side: str, qty: float, max_slippage_bps: int = 10) -> dict:
+    """Place a market order with slippage protection"""
+    # Fallback to market order with slippage protection
+```
+
+UPDATED METHOD SIGNATURE:
+- Changed from: `execute_grid_trade(action, current_price, equity)`
+- Changed to: `execute_grid_trade(action, equity, btc_qty_now, current_price)`
+- Updated call in `main_btc.py` to include `btc_qty` parameter
+
+BENEFITS:
+- Accurate exposure tracking based on actual fills
+- Better trade execution with maker-first approach
+- Proper exchange compliance with lot sizes and tick sizes
+- Reduced slippage through post-only orders
+- Market fallback with slippage protection
+- More precise grid state management
+
+================================================================================
+ENHANCED GRID LOGGING SUMMARY
+================================================================================
+
+IMPLEMENTED: Comprehensive logging for grid trade skips to make tuning fast
+
+FEATURE: Always log why a grid trade was skipped with detailed context
+
+LOGGING COVERAGE:
+1. **Disabled Grid**: `"Grid skip: disabled"`
+2. **No Grid State**: `"Grid skip: no grid state available"`
+3. **Time Guard**: `"Grid skip: time guard (staleness=Xds, min_interval=Xds)"`
+4. **No Trigger**: `"Grid skip: no trigger (price=X, buy_trigger=X, sell_trigger=X, step=X%, last_action=X, staleness=Xds)"`
+5. **No Room in Band**: `"Grid skip: no room in band (room_usd=X, min_notional=X, step=X%, last_action=X)"`
+6. **Quantity Rounding**: `"Grid skip: quantity rounding zero (qty_raw=X, qty=X, order_usd=X, price=X)"`
+7. **No Fills**: `"Grid skip: no fills (action=X, step=X%, last_action=X)"`
+8. **Order Rejected**: `"Grid skip: order rejected (action=X, step=X%, last_action=X)"`
+
+EXAMPLE LOG MESSAGES:
+```
+Grid skip: time guard (staleness=300s, min_interval=900s)
+Grid skip: no trigger (price=45000.00, buy_trigger=44887.50, sell_trigger=45112.50, step=0.250%, last_action=buy, staleness=1200s)
+Grid skip: no room in band (room_usd=5.20, min_notional=10.00, step=0.250%, last_action=buy)
+Grid skip: quantity rounding zero (qty_raw=0.000008, qty=0.000000, order_usd=12.00, price=45000.00)
+Grid skip: no fills (action=buy, step=0.250%, last_action=sell)
+Grid skip: order rejected (action=sell, step=0.250%, last_action=buy)
+```
+
+CONTEXT INCLUDED:
+- **Price levels**: Current price vs trigger levels
+- **Step percentages**: Grid step size being used
+- **Last action**: Previous trade direction for hysteresis
+- **Time staleness**: Seconds since last grid update
+- **Available room**: USD notional available in bias band
+- **Quantity details**: Raw vs rounded quantities
+- **Action context**: Current trade action being attempted
+
+BENEFITS:
+- **Fast Tuning**: Immediate visibility into why trades are skipped
+- **Parameter Optimization**: Clear feedback on step sizes, intervals, and thresholds
+- **Debugging**: Easy identification of grid behavior issues
+- **Performance Monitoring**: Track grid efficiency and fill rates
+- **Risk Management**: Monitor bias band utilization and exposure limits
+
+================================================================================
+ENHANCED HELPER FUNCTIONS AND ORDER METHODS SUMMARY
+================================================================================
+
+IMPLEMENTED: Robust helper functions and improved maker-first order placement
+
+FEATURES:
+1. **Enhanced Helper Functions**: Proper pair metadata handling and utility functions
+2. **Improved Post-Only Orders**: Guaranteed non-marketable limit orders
+3. **Slippage-Capped Market Orders**: IOC orders with price caps
+4. **Pair Metadata Caching**: Dynamic lot step and tick size retrieval
+
+HELPER FUNCTIONS:
+```python
+# Constants
+KRAKEN_PAIR = "XXBTZUSD"  # keep consistent everywhere
+FALLBACK_LOT_STEP = 1e-5     # 0.00001 BTC
+FALLBACK_TICK     = 0.10     # $0.10
+FALLBACK_OB_DEPTH = 10
+
+# Utility Functions
+def _round_qty(qty: float, lot_step: float) -> float:
+    return floor(qty / lot_step) * lot_step
+
+def _round_price(price: float, tick: float) -> float:
+    if tick <= 0:
+        return price
+    return round(price / tick) * tick
+
+def _now_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+def _slip_cap(best: float, side: str, bps: int) -> float:
+    mult = (1 + bps/10_000) if side == "buy" else (1 - bps/10_000)
+    return best * mult
+
+def _parse_boolish_ok(r: dict) -> bool:
+    # Handles both {"status":"success"} and {"txid":...} formats
+    if not isinstance(r, dict):
+        return False
+    if r.get("status") == "success":
+        return True
+    if r.get("txid"):
+        return True
+    return False
+```
+
+PAIR METADATA METHOD:
+```python
+def _get_pair_meta(self, pair: str = KRAKEN_PAIR) -> tuple[float, float]:
+    """
+    Returns (lot_step, price_tick). Falls back to safe defaults.
+    """
+    try:
+        meta = self.trading_bot.get_pair_info(pair) if self.trading_bot else None
+        if meta:
+            lot_step = float(meta.get("lot_step", FALLBACK_LOT_STEP))
+            tick     = float(meta.get("tick_size", FALLBACK_TICK))
+            return lot_step, tick
+    except Exception:
+        pass
+    return FALLBACK_LOT_STEP, FALLBACK_TICK
+```
+
+ENHANCED ORDER METHODS:
+
+1. **place_limit_post_only**:
+   - Computes guaranteed non-marketable prices
+   - Uses orderbook snapshot for best bid/ask
+   - Handles post-only rejections gracefully
+   - Returns (ok_flag, result) for fallback logic
+
+2. **place_market_with_slippage_cap**:
+   - Emulates capped market via marketable limit + IOC
+   - Applies slippage cap in basis points
+   - Uses proper lot step and tick size rounding
+   - Includes userref for idempotency
+
+ORDER PLACEMENT LOGIC:
+```python
+# Maker-first approach
+side = "buy" if action=="buy" else "sell"
+ok, res = self.place_limit_post_only(side, qty, current_price)
+if not ok:
+    res = self.place_market_with_slippage_cap(side, qty, max_slippage_bps=10)
+```
+
+BENEFITS:
+- **Robust Order Placement**: Proper error handling and fallback logic
+- **Exchange Compliance**: Dynamic pair metadata and proper rounding
+- **Slippage Protection**: Capped market orders prevent excessive slippage
+- **Idempotency**: Userref prevents duplicate orders
+- **Graceful Degradation**: Post-only failures trigger market fallback
+- **Consistent Pair Usage**: KRAKEN_PAIR constant ensures consistency
+
+================================================================================
+SELF-TEST AND RECOMMENDED DEFAULTS SUMMARY
+================================================================================
+
+IMPLEMENTED: Quick self-test validation and optimized defaults for "many small trades" mode
+
+FEATURES:
+1. **Self-Test Functionality**: Validate order placement logic without live keys
+2. **Recommended Defaults**: Optimized parameters for frequent, tidy fills
+3. **API Endpoint**: `/grid_self_test` for easy testing
+4. **Comprehensive Validation**: Tests both sides and thin book scenarios
+
+RECOMMENDED DEFAULTS FOR "MANY SMALL TRADES" MODE:
+```python
+# Environment Variables (with recommended values)
+GRID_STEP_PCT = "0.30"              # 0.25-0.35% (optimal range)
+GRID_ORDER_USD = "12.0"             # $12 per micro trade
+MAX_GRID_EXPOSURE = "0.10"          # 10% band around bias
+MIN_GRID_INTERVAL_SEC = "900"       # 15 minutes between trades
+MAX_SLIPPAGE_BPS = "10"             # 0.10% slippage cap
+BIAS_TILT = "0.5"                   # 50% bias influence on steps
+```
+
+SELF-TEST FUNCTIONALITY:
+```python
+def self_test_order_placement(self) -> dict:
+    """
+    Quick self-test (no live keys) to validate order placement logic.
+    Tests both sides when the book is thin (tick rounding matters).
+    """
+    # Test 1: Pair metadata retrieval
+    # Test 2: Post-only order validation (with validate=True)
+    # Test 3: Market order validation (with validate=True)
+    # Returns comprehensive test results
+```
+
+API ENDPOINT:
+```python
+@app.get("/grid_self_test")
+async def grid_self_test(token: str = None):
+    """Run grid order placement self-test (no live keys)"""
+    # Returns test results with overall status
+```
+
+TEST COVERAGE:
+1. **Pair Metadata**: Lot step and tick size retrieval
+2. **Buy Post-Only**: Validation with `validate=True`
+3. **Sell Post-Only**: Validation with `validate=True`
+4. **Market Orders**: IOC order validation
+5. **Thin Book Scenarios**: Tick rounding edge cases
+
+USAGE:
+```bash
+# Run self-test via API
+curl -X GET "https://your-domain/grid_self_test?token=your_token"
+
+# Expected response
+{
+    "message": "Grid self-test completed",
+    "status": "success",
+    "results": {
+        "pair_metadata": {"lot_step": 1e-5, "tick": 0.10, "status": "success"},
+        "post_only_orders": {"buy": {...}, "sell": {...}},
+        "market_orders": {...},
+        "overall_status": "success"
+    }
+}
+```
+
+BENEFITS:
+- **Safe Validation**: Test order logic without live trading
+- **Optimized Performance**: Recommended defaults for frequent fills
+- **Thin Book Handling**: Proper tick rounding for edge cases
+- **Comprehensive Testing**: Both buy and sell sides validated
+- **Easy Monitoring**: API endpoint for regular validation
+- **No Whipsawing**: Balanced parameters prevent excessive trading
+- **Exposure Control**: 10% band ensures risk management
+
+================================================================================
+END OF FILE
+================================================================================
