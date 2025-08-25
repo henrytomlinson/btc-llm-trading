@@ -130,7 +130,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('/opt/btc-trading/auto_trade.log'),
+        logging.FileHandler('/app/auto_trade.log'),
         logging.StreamHandler()
     ]
 )

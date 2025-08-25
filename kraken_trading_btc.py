@@ -84,22 +84,22 @@ class KrakenTradingBot:
         self.api_url = f"{self.base_url}/0"
         
         # Trading configuration for Bitcoin
-        self.position_size = float(os.getenv('POSITION_SIZE', '1000'))  # Default $1000 per trade
-        self.max_positions = int(os.getenv('MAX_POSITIONS', '3'))  # Maximum concurrent positions
-        self.stop_loss_pct = float(os.getenv('STOP_LOSS_PCT', '0.05'))  # 5% stop loss
-        self.take_profit_pct = float(os.getenv('TAKE_PROFIT_PCT', '0.10'))  # 10% take profit
+        self.position_size = float(os.getenv('POSITION_SIZE') or '1000')  # Default $1000 per trade
+        self.max_positions = int(os.getenv('MAX_POSITIONS') or '3')  # Maximum concurrent positions
+        self.stop_loss_pct = float(os.getenv('STOP_LOSS_PCT') or '0.05')  # 5% stop loss
+        self.take_profit_pct = float(os.getenv('TAKE_PROFIT_PCT') or '0.10')  # 10% take profit
         
         # Bitcoin spot trading symbol
         self.btc_symbol = "XXBTZUSD"  # Bitcoin/USD pair on Kraken
         self.btc_gbp_symbol = "XXBTZGBP"  # Bitcoin/GBP pair on Kraken
-        self.min_trade_amount = float(os.getenv('MIN_TRADE_AMOUNT_USD', '10.0'))  # Minimum trade amount in USD
-        self.max_slippage_pct = float(os.getenv('MAX_SLIPPAGE_PCT', '0.02'))  # 2% max slippage
-        self.max_retries = int(os.getenv('MAX_RETRIES', '3'))
-        self.retry_delay_base = float(os.getenv('RETRY_DELAY_BASE', '1.0'))  # Base delay in seconds
+        self.min_trade_amount = float(os.getenv('MIN_TRADE_AMOUNT_USD') or '10.0')  # Minimum trade amount in USD
+        self.max_slippage_pct = float(os.getenv('MAX_SLIPPAGE_PCT') or '0.02')  # 2% max slippage
+        self.max_retries = int(os.getenv('MAX_RETRIES') or '3')
+        self.retry_delay_base = float(os.getenv('RETRY_DELAY_BASE') or '1.0')  # Base delay in seconds
         # Allocation logic parameters
         # Prefer MIN_TRADE_DELTA if provided, otherwise fall back to REALLOC_THRESHOLD_PCT
-        self.rebalance_threshold_pct = float(os.getenv('MIN_TRADE_DELTA', os.getenv('REALLOC_THRESHOLD_PCT', '0.05')))
-        self.trade_cooldown_hours = float(os.getenv('TRADE_COOLDOWN_HOURS', '1'))
+        self.rebalance_threshold_pct = float(os.getenv('MIN_TRADE_DELTA') or os.getenv('REALLOC_THRESHOLD_PCT') or '0.05')
+        self.trade_cooldown_hours = float(os.getenv('TRADE_COOLDOWN_HOURS') or '1')
         self._last_trade_ts = 0.0
         # Track executed orders to prevent duplicates
         self._executed_orders = set()

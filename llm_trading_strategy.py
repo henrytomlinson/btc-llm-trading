@@ -82,9 +82,9 @@ class LLMTradingStrategy:
         self.model = "command"  # Cohere's latest model
         
         # Trading parameters
-        self.min_confidence = float(os.getenv('MIN_CONFIDENCE', '0.8'))  # Minimum confidence for trades
-        self.max_risk_level = os.getenv('MAX_RISK_LEVEL', 'medium')  # Maximum risk level to accept
-        self.max_exposure = float(os.getenv('MAX_EXPOSURE', '0.8'))  # cap allocation at 80% of equity
+        self.min_confidence = float(os.getenv('MIN_CONFIDENCE') or '0.8')  # Minimum confidence for trades
+        self.max_risk_level = os.getenv('MAX_RISK_LEVEL') or 'medium'  # Maximum risk level to accept
+        self.max_exposure = float(os.getenv('MAX_EXPOSURE') or '0.8')  # cap allocation at 80% of equity
         self.position_size_multiplier = {
             "low": 1.0,
             "medium": 0.7,
@@ -92,8 +92,8 @@ class LLMTradingStrategy:
         }
         
         # Logging configuration
-        self.log_prompts = os.getenv('LOG_LLM_PROMPTS', 'true').lower() == 'true'
-        self.log_responses = os.getenv('LOG_LLM_RESPONSES', 'true').lower() == 'true'
+        self.log_prompts = (os.getenv('LOG_LLM_PROMPTS') or 'true').lower() == 'true'
+        self.log_responses = (os.getenv('LOG_LLM_RESPONSES') or 'true').lower() == 'true'
         
         logger.info("LLM trading strategy initialized successfully")
         logger.info(f"Min confidence: {self.min_confidence}, Max risk level: {self.max_risk_level}")

@@ -164,14 +164,12 @@ JWT_ALGORITHM = "HS256"
 JWT_EXPIRY_HOURS = 24
 
 # Load environment variables
-binance_api_key = os.getenv('BINANCE_API_KEY')
-binance_secret_key = os.getenv('BINANCE_SECRET_KEY')
 kraken_api_key = os.getenv('KRAKEN_API_KEY')
 kraken_secret_key = os.getenv('KRAKEN_PRIVATE_KEY')  # Updated to use KRAKEN_PRIVATE_KEY
 news_api_key = os.getenv('NEWS_API_KEY')
 cohere_key = os.getenv('COHERE_KEY')
 
-# Initialize Trading Bot (Priority: Kraken > Binance)
+# Initialize Trading Bot (Kraken only)
 trading_bot = None
 exchange_name = None
 
@@ -186,18 +184,10 @@ if kraken_api_key and kraken_secret_key:
         logger.warning(f"Kraken not available: {e}")
         trading_bot = None
 
-# If Kraken not available, try Binance
+# If Kraken not available, log error
 if not trading_bot:
-    try:
-        from binance_trading_btc import BinanceTradingBot
-        trading_bot = BinanceTradingBot()
-        exchange_name = "binance"
-        logger.info("✅ Binance trading bot initialized successfully (Bitcoin spot trading)")
-    except Exception as e:
-        logger.warning(f"Binance not available: {e}")
-        logger.error(f"❌ No trading bot available: {e}")
-        trading_bot = None
-        exchange_name = None
+    logger.error(f"❌ No trading bot available: Kraken initialization failed")
+    exchange_name = None
 
 # Initialize LLM Trading Strategy
 try:
@@ -2148,12 +2138,6 @@ async def login(username: str = Form(...), password: str = Form(...)):
 async def test_apis():
     """Test API connectivity"""
     results = {}
-    
-    # Test Binance
-    if trading_bot and exchange_name == "binance":
-        results["binance"] = "✅ Connected successfully"
-    else:
-        results["binance"] = "❌ Not configured"
     
     # Test Kraken
     if trading_bot and exchange_name == "kraken":

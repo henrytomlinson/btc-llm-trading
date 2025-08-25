@@ -36,4 +36,4 @@ streamlit>=1.28.0
 
 # Additional Utilities
 schedule>=1.2.0
-python-binance>=1.0.19 
+ 
