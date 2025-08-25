@@ -269,10 +269,10 @@ def load_runtime_settings():
         logger.warning(f"Failed to load settings from DB: {e}")
         # Fallback to environment variables
         return {
-            "max_exposure": float(os.getenv("MAX_EXPOSURE", "0.8")),
-            "cooldown_hours": float(os.getenv("TRADE_COOLDOWN_HOURS", "3")),
-            "min_confidence": float(os.getenv("MIN_CONFIDENCE", "0.7")),
-            "min_trade_delta": float(os.getenv("MIN_TRADE_DELTA", "0.05")),
+                    "max_exposure": float(os.getenv("MAX_EXPOSURE", "0.8")),
+        "cooldown_hours": float(os.getenv("TRADE_COOLDOWN_HOURS", "1")),
+        "min_confidence": float(os.getenv("MIN_CONFIDENCE", "0.8")),
+            "min_trade_delta": float(os.getenv("MIN_TRADE_DELTA", "0.0")),
             "min_trade_delta_usd": float(os.getenv("MIN_TRADE_DELTA_USD", "10.0")),
             "min_trade_delta_pct": float(os.getenv("MIN_TRADE_DELTA_PCT", "0.00")),
             "no_fee_mode": parse_bool(os.getenv("NO_FEE_MODE", "True")),

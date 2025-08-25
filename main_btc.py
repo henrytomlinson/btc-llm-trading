@@ -703,7 +703,7 @@ def load_runtime_settings():
                 "max_grid_exposure": float(settings.get("max_grid_exposure", 0.1)),
                 "safety_skip_degraded": parse_bool(settings.get("safety_skip_degraded", True)),
                 "safety_max_price_staleness_sec": float(settings.get("safety_max_price_staleness_sec", 120.0)),
-                "safety_min_expected_move_pct": float(settings.get("safety_min_expected_move_pct", 0.1)),
+                "safety_min_expected_move_pct": float(settings.get("safety_min_expected_move_pct", 0.02)),
                 "safety_daily_pnl_limit_usd": float(settings.get("safety_daily_pnl_limit_usd", -5.0)),
                 "safety_daily_equity_drop_pct": float(settings.get("safety_daily_equity_drop_pct", 3.0)),
             }
@@ -712,10 +712,10 @@ def load_runtime_settings():
     
     # Fallback to environment variables
     return {
-        "min_confidence": float(os.getenv("MIN_CONFIDENCE") or "0.7"),
+        "min_confidence": float(os.getenv("MIN_CONFIDENCE") or "0.8"),
         "max_exposure": float(os.getenv("MAX_EXPOSURE") or "0.8"),
-        "trade_cooldown_hours": float(os.getenv("TRADE_COOLDOWN_HOURS") or "3"),
-        "min_trade_delta": float(os.getenv("MIN_TRADE_DELTA") or "0.05"),
+        "trade_cooldown_hours": float(os.getenv("TRADE_COOLDOWN_HOURS") or "1"),
+        "min_trade_delta": float(os.getenv("MIN_TRADE_DELTA") or "0.0"),
         "min_trade_delta_usd": float(os.getenv("MIN_TRADE_DELTA_USD") or "10.0"),
         "min_trade_delta_pct": float(os.getenv("MIN_TRADE_DELTA_PCT") or "0.00"),
         "no_fee_mode": parse_bool(os.getenv("NO_FEE_MODE") or "True"),
@@ -725,7 +725,7 @@ def load_runtime_settings():
         "max_grid_exposure": float(os.getenv("MAX_GRID_EXPOSURE") or "0.1"),
         "safety_skip_degraded": True,
         "safety_max_price_staleness_sec": 120.0,
-        "safety_min_expected_move_pct": 0.1,
+        "safety_min_expected_move_pct": 0.02,
         "safety_daily_pnl_limit_usd": -5.0,
         "safety_daily_equity_drop_pct": 3.0,
     }
@@ -1469,7 +1469,7 @@ async def dashboard():
                 document.getElementById('min-trade-delta-usd').value = s.min_trade_delta_usd || 30;
                 document.getElementById('safety-skip-degraded').checked = !!s.safety_skip_degraded;
                 document.getElementById('safety-max-staleness').value = s.safety_max_price_staleness_sec || 120;
-                document.getElementById('safety-min-move').value = s.safety_min_expected_move_pct || 0.1;
+                document.getElementById('safety-min-move').value = s.safety_min_expected_move_pct || 0.02;
                 document.getElementById('safety-daily-pnl').value = s.safety_daily_pnl_limit_usd || -5;
                 document.getElementById('safety-daily-equity').value = s.safety_daily_equity_drop_pct || 3;
             }
@@ -2509,7 +2509,7 @@ async def _check_safety_conditions(current_price, last_update, signal_confidence
             return False, "Unable to parse price timestamp"
     
     # 2. Check if expected move is worth the round-trip fee
-    if settings.get("safety_min_expected_move_pct", 0.1):
+    if settings.get("safety_min_expected_move_pct", 0.02):
         exposure_change = abs(target_exposure - current_exposure)
         if exposure_change < (settings["safety_min_expected_move_pct"] / 100):
             return False, f"Expected move too small ({exposure_change*100:.2f}% < {settings['safety_min_expected_move_pct']}%)"

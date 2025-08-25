@@ -99,7 +99,7 @@ class KrakenTradingBot:
         # Allocation logic parameters
         # Prefer MIN_TRADE_DELTA if provided, otherwise fall back to REALLOC_THRESHOLD_PCT
         self.rebalance_threshold_pct = float(os.getenv('MIN_TRADE_DELTA', os.getenv('REALLOC_THRESHOLD_PCT', '0.05')))
-        self.trade_cooldown_hours = float(os.getenv('TRADE_COOLDOWN_HOURS', '3'))
+        self.trade_cooldown_hours = float(os.getenv('TRADE_COOLDOWN_HOURS', '1'))
         self._last_trade_ts = 0.0
         # Track executed orders to prevent duplicates
         self._executed_orders = set()

@@ -448,23 +448,25 @@ def init_default_settings() -> None:
     """Initialize default settings if they don't exist."""
     import os
     defaults = {
-        "min_confidence": float(os.getenv("MIN_CONFIDENCE", "0.7")),
-        "max_exposure": float(os.getenv("MAX_EXPOSURE", "0.8")),
-        "trade_cooldown_hours": float(os.getenv("TRADE_COOLDOWN_HOURS", "3")),
-        "min_trade_delta": float(os.getenv("MIN_TRADE_DELTA", "0.05")),
-        "min_trade_delta_usd": float(os.getenv("MIN_TRADE_DELTA_USD", "10.0")),  # Updated to 10.0 for no-fee mode
-        "min_trade_delta_pct": float(os.getenv("MIN_TRADE_DELTA_PCT", "0.00")),  # New: 0% = allow micro-deltas
-        "no_fee_mode": parse_bool(os.getenv("NO_FEE_MODE", "True")),  # New: No-fee mode enabled by default
-        "grid_executor_enabled": parse_bool(os.getenv("GRID_EXECUTOR_ENABLED", "True")),  # Grid executor enabled by default
-        "grid_step_pct": float(os.getenv("GRID_STEP_PCT", "0.25")),  # 0.25% price move triggers grid trade
-        "grid_order_usd": float(os.getenv("GRID_ORDER_USD", "12.0")),  # $12 per grid trade
-        "max_grid_exposure": float(os.getenv("MAX_GRID_EXPOSURE", "0.1")),  # Max 10% exposure from grid
-        "auto_trade_enabled": True,
-        "safety_skip_degraded": True,
-        "safety_max_price_staleness_sec": 120.0,
-        "safety_min_expected_move_pct": 0.1,
-        "safety_daily_pnl_limit_usd": -5.0,
-        "safety_daily_equity_drop_pct": 3.0,
+        # Trading Settings - Updated to recommended values
+        "min_confidence": float(os.getenv("MIN_CONFIDENCE") or "0.8"),  # Raised from 0.7 to 0.8
+        "max_exposure": float(os.getenv("MAX_EXPOSURE") or "0.8"),  # Keep at 0.8 (aggressive)
+        "trade_cooldown_hours": float(os.getenv("TRADE_COOLDOWN_HOURS") or "1"),  # Reduced from 3 to 1
+        "min_trade_delta": float(os.getenv("MIN_TRADE_DELTA") or "0.0"),  # Reduced from 0.05 to 0.0
+        "min_trade_delta_usd": float(os.getenv("MIN_TRADE_DELTA_USD") or "10.0"),  # Keep at 10.0 (exchange minimum)
+        "min_trade_delta_pct": float(os.getenv("MIN_TRADE_DELTA_PCT") or "0.00"),  # Keep at 0.00
+        "no_fee_mode": parse_bool(os.getenv("NO_FEE_MODE") or "True"),  # Keep no-fee mode enabled
+        "grid_executor_enabled": parse_bool(os.getenv("GRID_EXECUTOR_ENABLED") or "True"),  # Keep grid executor enabled
+        "grid_step_pct": float(os.getenv("GRID_STEP_PCT") or "0.25"),  # Keep at 0.25%
+        "grid_order_usd": float(os.getenv("GRID_ORDER_USD") or "12.0"),  # Keep at $12 per grid trade
+        "max_grid_exposure": float(os.getenv("MAX_GRID_EXPOSURE") or "0.1"),  # Keep at 10% max grid exposure
+        "auto_trade_enabled": True,  # Keep auto-trade enabled
+        # Safety Settings - Updated to recommended values
+        "safety_skip_degraded": True,  # Keep skip trades if data degraded
+        "safety_max_price_staleness_sec": 120.0,  # Keep at 120s
+        "safety_min_expected_move_pct": 0.02,  # Reduced from 0.1 to 0.02 (spread guard handles micro-chop)
+        "safety_daily_pnl_limit_usd": -5.0,  # Keep at -$5 (stop for the day after losing $5)
+        "safety_daily_equity_drop_pct": 3.0,  # Keep at 3%
     }
     
     current_settings = read_settings()

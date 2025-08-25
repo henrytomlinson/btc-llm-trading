@@ -82,7 +82,7 @@ class LLMTradingStrategy:
         self.model = "command"  # Cohere's latest model
         
         # Trading parameters
-        self.min_confidence = float(os.getenv('MIN_CONFIDENCE', '0.7'))  # Minimum confidence for trades
+        self.min_confidence = float(os.getenv('MIN_CONFIDENCE', '0.8'))  # Minimum confidence for trades
         self.max_risk_level = os.getenv('MAX_RISK_LEVEL', 'medium')  # Maximum risk level to accept
         self.max_exposure = float(os.getenv('MAX_EXPOSURE', '0.8'))  # cap allocation at 80% of equity
         self.position_size_multiplier = {
