@@ -1,0 +1,17 @@
+# never upload local junk
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.so
+.DS_Store
+.git/
+node_modules/
+.mypy_cache/
+.pytest_cache/
+.ipynb_checkpoints/
+*.log
+logs/
+data/
+backtest_env/

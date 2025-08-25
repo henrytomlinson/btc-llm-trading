@@ -6,7 +6,7 @@ Specialized for Bitcoin trading with Kraken API (futures demo environment).
 
 import os
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, Optional, List, Tuple
 import requests
 import time
@@ -16,10 +16,18 @@ import base64
 import urllib.parse
 import uuid
 import random
+from math import floor
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Trading constants
+KRAKEN_PAIR = "XXBTZUSD"
+FALLBACK_LOT_STEP = 1e-5
+FALLBACK_TICK     = 0.10
+FALLBACK_OB_DEPTH = 10
+EXCHANGE_MIN_NOTIONAL_USD = 10.0
 
 # Asset code normalization for Kraken
 _ASSET_MAP = {
@@ -28,6 +36,25 @@ _ASSET_MAP = {
     "ZEUR": "EUR", "EUR": "EUR",
     "ZGBP": "GBP", "GBP": "GBP",
 }
+
+# Helper functions
+def _now_iso(): 
+    return datetime.now(timezone.utc).isoformat()
+
+def _round_qty(q, step): 
+    return floor(float(q) / step) * step
+
+def _round_price(p, tick): 
+    return round(float(p) / tick) * tick if tick > 0 else float(p)
+
+def _slip_cap(best, side, bps): 
+    m = (1 + bps/10_000) if side == "buy" else (1 - bps/10_000)
+    return best * m
+
+def _parse_ok(resp: dict) -> bool:
+    if not isinstance(resp, dict): 
+        return False
+    return resp.get("status") == "success" or bool(resp.get("txid"))
 
 def _normalize_asset(symbol: str) -> str:
     return _ASSET_MAP.get(symbol, symbol)
@@ -85,6 +112,21 @@ class KrakenTradingBot:
             self.demo_mode = False
         
         logger.info("Kraken Bitcoin trading bot initialized successfully")
+    
+    def _get_pair_meta(self, pair=KRAKEN_PAIR):
+        """Get pair metadata for lot step and tick size"""
+        try:
+            # Try to get from Kraken API
+            endpoint = "/public/AssetPairs"
+            result = self._make_request_with_retry('GET', endpoint, private=False)
+            if result and 'result' in result:
+                pair_info = result['result'].get(pair, {})
+                lot_step = float(pair_info.get("lot_step", FALLBACK_LOT_STEP))
+                tick = float(pair_info.get("tick_size", FALLBACK_TICK))
+                return lot_step, tick
+        except Exception:
+            pass
+        return FALLBACK_LOT_STEP, FALLBACK_TICK
     
     def _generate_signature(self, endpoint: str, data: Dict, nonce: str) -> str:
         """Generate Kraken API signature for real API"""
@@ -739,165 +781,137 @@ class KrakenTradingBot:
             logger.error(f"Error getting orderbook snapshot: {e}")
             return {'status': 'error', 'reason': str(e)}
 
-    def place_limit_post_only(self, side: str, qty: float, price: float, symbol: str = "XXBTZUSD") -> Dict:
-        """
-        Place a post-only limit order to add liquidity (maker order)
+    def place_limit_post_only(self, side: str, qty: float, price: float) -> tuple[bool, dict]:
+        """Place a post-only limit order with proper price positioning"""
+        pair = KRAKEN_PAIR
+        lot_step, tick = self._get_pair_meta(pair)
         
-        Args:
-            side: 'buy' or 'sell'
-            qty: Quantity in BTC
-            price: Limit price in USD
-            symbol: Trading pair symbol
-            
-        Returns:
-            Dict with order result
-        """
-        try:
-            if self.demo_mode:
-                # Simulate post-only order in demo mode
-                logger.info(f"Demo post-only {side} order: {qty:.6f} BTC at ${price:.2f}")
-                return {
-                    'status': 'success',
-                    'order_id': f"demo_post_only_{side}_{int(time.time())}",
-                    'side': side,
-                    'quantity': qty,
-                    'price': price,
-                    'ordertype': 'limit',
-                    'post_only': True,
-                    'demo_mode': True
-                }
-            
-            # Generate client order ID
-            client_order_id = self._generate_client_order_id(side, qty * price)
-            
-            # Place post-only limit order
-            endpoint = "/private/AddOrder"
-            order_data = {
-                'pair': symbol,
-                'type': side,
+        # Get orderbook for price positioning
+        ob = self.get_orderbook_snapshot(pair, depth=FALLBACK_OB_DEPTH) or {}
+        best_bid, best_ask = float(ob.get("best_bid", 0)), float(ob.get("best_ask", 0))
+        if best_bid <= 0 or best_ask <= 0: 
+            return (False, {"status": "error", "reason": "no_orderbook"})
+
+        # Ensure non-marketable post-only price
+        if side == "buy":  
+            po = min(best_bid, best_ask - tick, price)
+        else:            
+            po = max(best_ask, best_bid + tick, price)
+        po = _round_price(po, tick)
+        if side == "buy" and po >= best_ask: 
+            po = best_ask - tick
+        if side == "sell" and po <= best_bid: 
+            po = best_bid + tick
+
+        vol = _round_qty(qty, lot_step)
+        if vol <= 0: 
+            return (False, {"status": "skipped", "reason": "qty_rounding_zero"})
+        
+        userref = f"grid-po-{side}-{_now_iso()}"
+
+        if self.demo_mode:
+            # Simulate post-only order in demo mode
+            logger.info(f"Demo post-only {side} order: {vol:.6f} BTC at ${po:.2f}")
+            return (True, {
+                'status': 'success',
+                'order_id': f"demo_post_only_{side}_{int(time.time())}",
+                'side': side,
+                'quantity': vol,
+                'price': po,
                 'ordertype': 'limit',
-                'volume': str(qty),
-                'price': str(price),
-                'oflags': 'post',  # Post-only flag
-                'clientOrderId': client_order_id
-            }
+                'mode': 'post_only',
+                'price_used': po,
+                'userref': userref,
+                'demo_mode': True
+            })
+
+        payload = {
+            "pair": pair, "type": side, "ordertype": "limit", "price": f"{po:.10f}",
+            "volume": f"{vol:.10f}", "oflags": "post", "userref": userref
+        }
+        
+        try:
+            endpoint = "/private/AddOrder"
+            result = self._make_request_with_retry('POST', endpoint, data=payload, private=True, signature_path="/0/private/AddOrder")
             
-            result = self._make_request_with_retry('POST', endpoint, data=order_data, private=True, signature_path="/0/private/AddOrder")
+            err = (result or {}).get("error") or []
+            if any("post" in str(e).lower() and "take" in str(e).lower() for e in err):
+                return (False, {"status": "rejected", "reason": "postonly_would_take", "payload": payload})
             
-            if 'error' in result and result['error']:
-                return {'status': 'error', 'reason': result['error']}
+            if _parse_ok(result):
+                result.update({"status": "success", "mode": "post_only", "price_used": po, "userref": userref})
+                return (True, result)
             
-            # Parse the response
-            order_info = result.get('result', {})
-            txid = order_info.get('txid', [None])[0] if order_info.get('txid') else None
+            return (False, {"status": "error", "reason": "kraken_reject", "resp": result, "payload": payload})
+        except Exception as e:
+            return (False, {"status": "error", "reason": str(e)})
+
+    def place_market_with_slippage_cap(self, side: str, qty: float, max_slippage_bps: int = 10) -> dict:
+        """Place a market order with slippage protection using IOC limit"""
+        pair = KRAKEN_PAIR
+        lot_step, tick = self._get_pair_meta(pair)
+        
+        # Get orderbook for slippage calculation
+        ob = self.get_orderbook_snapshot(pair, depth=FALLBACK_OB_DEPTH) or {}
+        best_bid, best_ask = float(ob.get("best_bid", 0)), float(ob.get("best_ask", 0))
+        if best_bid <= 0 or best_ask <= 0: 
+            return {"status": "error", "reason": "no_orderbook"}
+
+        cap = _slip_cap(best_ask if side == "buy" else best_bid, side, max_slippage_bps)
+        px = _round_price(cap, tick)
+        vol = _round_qty(qty, lot_step)
+        if vol <= 0: 
+            return {"status": "skipped", "reason": "qty_rounding_zero"}
+        
+        userref = f"grid-mkcap-{side}-{_now_iso()}"
+
+        if self.demo_mode:
+            # Simulate market order with slippage cap in demo mode
+            market_data = self.get_market_data()
+            current_price = market_data['close'] if market_data else 45000.0
+            
+            logger.info(f"Demo market {side} order: {vol:.6f} BTC at ${px:.2f} (max slippage: {max_slippage_bps}bps)")
             
             return {
                 'status': 'success',
-                'order_id': txid,
+                'order_id': f"demo_market_{side}_{int(time.time())}",
                 'side': side,
-                'quantity': qty,
-                'price': price,
+                'quantity': vol,
+                'price': px,
                 'ordertype': 'limit',
-                'post_only': True,
-                'demo_mode': False
+                'mode': 'mk_slip_cap',
+                'price_cap': px,
+                'userref': userref,
+                'demo_mode': True
             }
-            
-        except Exception as e:
-            logger.error(f"Error placing post-only limit order: {e}")
-            return {'status': 'error', 'reason': str(e)}
 
-    def place_market_with_slippage_cap(self, side: str, qty: float, max_slippage_bps: int = 10, symbol: str = "XXBTZUSD") -> Dict:
-        """
-        Place a market order with slippage protection
+        payload = {
+            "pair": pair, "type": side, "ordertype": "limit", "price": f"{px:.10f}",
+            "volume": f"{vol:.10f}", "timeinforce": "IOC", "userref": userref
+        }
         
-        Args:
-            side: 'buy' or 'sell'
-            qty: Quantity in BTC
-            max_slippage_bps: Maximum slippage in basis points (10 = 0.10%)
-            symbol: Trading pair symbol
-            
-        Returns:
-            Dict with order result
-        """
         try:
-            if self.demo_mode:
-                # Simulate market order with slippage cap in demo mode
-                market_data = self.get_market_data()
-                current_price = market_data['close'] if market_data else 45000.0
-                
-                # Calculate max acceptable price based on slippage
-                max_price = current_price * (1 + max_slippage_bps / 10000) if side == 'buy' else current_price * (1 - max_slippage_bps / 10000)
-                
-                logger.info(f"Demo market {side} order: {qty:.6f} BTC at ${current_price:.2f} (max slippage: {max_slippage_bps}bps)")
-                
-                return {
-                    'status': 'success',
-                    'order_id': f"demo_market_{side}_{int(time.time())}",
-                    'side': side,
-                    'quantity': qty,
-                    'price': current_price,
-                    'ordertype': 'market',
-                    'max_slippage_bps': max_slippage_bps,
-                    'demo_mode': True
-                }
-            
-            # Generate client order ID
-            client_order_id = self._generate_client_order_id(side, qty * 45000)  # Approximate value
-            
-            # Place market order (Kraken doesn't support slippage caps directly, so we use market order)
             endpoint = "/private/AddOrder"
-            order_data = {
-                'pair': symbol,
-                'type': side,
-                'ordertype': 'market',
-                'volume': str(qty),
-                'clientOrderId': client_order_id
-            }
+            result = self._make_request_with_retry('POST', endpoint, data=payload, private=True, signature_path="/0/private/AddOrder")
             
-            result = self._make_request_with_retry('POST', endpoint, data=order_data, private=True, signature_path="/0/private/AddOrder")
+            if _parse_ok(result):
+                result.update({"status": "success", "mode": "mk_slip_cap", "price_cap": px, "userref": userref})
+                return result
             
-            if 'error' in result and result['error']:
-                return {'status': 'error', 'reason': result['error']}
-            
-            # Parse the response
-            order_info = result.get('result', {})
-            txid = order_info.get('txid', [None])[0] if order_info.get('txid') else None
-            
-            return {
-                'status': 'success',
-                'order_id': txid,
-                'side': side,
-                'quantity': qty,
-                'ordertype': 'market',
-                'max_slippage_bps': max_slippage_bps,
-                'demo_mode': False
-            }
-            
+            return {"status": "error", "reason": "kraken_reject", "resp": result, "payload": payload}
         except Exception as e:
-            logger.error(f"Error placing market order with slippage cap: {e}")
-            return {'status': 'error', 'reason': str(e)}
+            return {"status": "error", "reason": str(e)}
 
-    def place_maker_first_order(self, side: str, qty: float, symbol: str = "XXBTZUSD") -> Dict:
-        """
-        Place a maker-first order with fallback to market order
-        
-        Args:
-            side: 'buy' or 'sell'
-            qty: Quantity in BTC
-            symbol: Trading pair symbol
-            
-        Returns:
-            Dict with order result
-        """
+    def place_maker_first_order(self, side: str, qty: float) -> dict:
+        """Place a maker-first order with fallback to market order"""
         try:
             # Get current orderbook for price discovery
-            orderbook = self.get_orderbook_snapshot(symbol)
+            orderbook = self.get_orderbook_snapshot(KRAKEN_PAIR)
             if orderbook.get('status') != 'success':
                 logger.warning(f"Could not get orderbook, falling back to market order: {orderbook.get('reason')}")
-                return self.place_market_with_slippage_cap(side, qty, max_slippage_bps=10, symbol=symbol)
+                return self.place_market_with_slippage_cap(side, qty, max_slippage_bps=10)
             
             # Determine limit price based on side
-            # price = best_bid for sell, best_ask for buy (use WS snapshot if available)
             if side == 'buy':
                 limit_price = orderbook['best_ask']  # Buy at ask to add liquidity
             else:  # sell
@@ -905,25 +919,25 @@ class KrakenTradingBot:
             
             if not limit_price:
                 logger.warning("No valid limit price available, falling back to market order")
-                return self.place_market_with_slippage_cap(side, qty, max_slippage_bps=10, symbol=symbol)
+                return self.place_market_with_slippage_cap(side, qty, max_slippage_bps=10)
             
             # Try post-only limit order first
             logger.info(f"Attempting post-only {side} order: {qty:.6f} BTC at ${limit_price:.2f}")
-            post_only_result = self.place_limit_post_only(side, qty, limit_price, symbol)
+            ok, post_only_result = self.place_limit_post_only(side, qty, limit_price)
             
-            if post_only_result.get('status') == 'success':
+            if ok and post_only_result.get('status') == 'success':
                 logger.info(f"✅ Post-only {side} order placed successfully")
                 return post_only_result
             else:
                 logger.warning(f"❌ Post-only order failed: {post_only_result.get('reason')}")
                 # Fallback to market order with slippage cap
                 logger.info(f"Falling back to market order with 0.10% slippage cap")
-                return self.place_market_with_slippage_cap(side, qty, max_slippage_bps=10, symbol=symbol)
+                return self.place_market_with_slippage_cap(side, qty, max_slippage_bps=10)
                 
         except Exception as e:
             logger.error(f"Error in maker-first order placement: {e}")
             # Fallback to market order
-            return self.place_market_with_slippage_cap(side, qty, max_slippage_bps=10, symbol=symbol)
+            return self.place_market_with_slippage_cap(side, qty, max_slippage_bps=10)
 
     def get_trading_summary(self) -> Dict:
         """Get comprehensive trading summary"""

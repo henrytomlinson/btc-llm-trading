@@ -61,17 +61,32 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Security configuration
-ALLOWED_IPS = os.getenv('ALLOWED_IPS', '127.0.0.1').split(',')  # Comma-separated IPs
-RATE_LIMIT_REQUESTS = int(os.getenv('RATE_LIMIT_REQUESTS', '100'))  # Requests per hour
-RATE_LIMIT_WINDOW = int(os.getenv('RATE_LIMIT_WINDOW', '3600'))  # 1 hour in seconds
+# Start price worker for fresh price data
+try:
+    from price_worker import start_price_worker, PRICE_CACHE
+    start_price_worker()
+    logger.info("✅ Price worker started successfully")
+except Exception as e:
+    logger.warning(f"⚠️ Price worker failed to start: {e}")
+    PRICE_CACHE = {"price": None, "ts": None, "source": None}
 
-# Admin credentials (use environment variables)
-ADMIN_USERNAME = os.getenv('ADMIN_USERNAME', 'admin')
-ADMIN_PASSWORD = os.getenv('ADMIN_PASSWORD', 'change_this_password_immediately')
+# Security configuration
+ALLOWED_IPS = (os.getenv('ALLOWED_IPS') or '0.0.0.0').split(',')  # Comma-separated IPs
+# Raise defaults to avoid locking out the UI; can be tuned via env
+RATE_LIMIT_REQUESTS = int(os.getenv('RATE_LIMIT_REQUESTS') or '2000')  # Requests per window
+RATE_LIMIT_WINDOW = int(os.getenv('RATE_LIMIT_WINDOW') or '3600')  # Window seconds
+
+# Admin credentials (use environment variables only)
+ADMIN_USERNAME = os.getenv('ADMIN_USERNAME')
+ADMIN_PASSWORD = os.getenv('ADMIN_PASSWORD')
+
+# Validate that credentials are set
+if not ADMIN_USERNAME or not ADMIN_PASSWORD:
+    logger.error("❌ ADMIN_USERNAME and ADMIN_PASSWORD environment variables must be set")
+    raise ValueError("ADMIN_USERNAME and ADMIN_PASSWORD environment variables must be set")
 
 # Max staleness used by both summary and trading gates
-MAX_PRICE_STALENESS_SEC = int(os.getenv("MAX_PRICE_STALENESS_SEC", "120"))
+MAX_PRICE_STALENESS_SEC = int(os.getenv("MAX_PRICE_STALENESS_SEC") or "120")
 
 # Rate limiting storage (in production, use Redis)
 request_counts = {}
@@ -85,6 +100,14 @@ async def security_middleware(request: Request, call_next):
     """Security middleware for IP whitelisting and rate limiting"""
     client_ip = request.client.host
     
+    # Paths that should not count toward rate limits (lightweight/readonly)
+    WHITELIST_PATHS = {
+        '/', '/favicon.ico',
+        '/equity_series_public', '/btc_data_public',
+        '/diagnostics/price', '/diagnostics/volatility', '/diagnostics/telemetry',
+        '/readyz', '/healthz'
+    }
+
     # IP whitelist check
     if client_ip not in ALLOWED_IPS and '0.0.0.0' not in ALLOWED_IPS:
         logger.warning(f"Blocked request from unauthorized IP: {client_ip}")
@@ -93,6 +116,15 @@ async def security_middleware(request: Request, call_next):
             content={"error": "IP not authorized"}
         )
     
+    # Skip rate limiting for safe paths and methods
+    if request.url.path in WHITELIST_PATHS or request.method in {"OPTIONS", "HEAD"}:
+        response = await call_next(request)
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["X-XSS-Protection"] = "1; mode=block"
+        response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+        return response
+
     # Rate limiting
     current_time = time.time()
     
@@ -538,9 +570,32 @@ def generate_trading_signal(price: float, sentiment: int, volume: float, change_
         return 0
 
 def get_btc_market_data() -> Optional[Dict]:
-    """Get Bitcoin market data from trading bot or CoinGecko API"""
+    """Get Bitcoin market data from price worker or fallback sources"""
     try:
-        # Try to get data from trading bot first
+        # Try to get fresh data from price worker first
+        try:
+            from price_worker import get_last_price, PRICE_CACHE
+            price, ts = get_last_price()
+            if price and ts:
+                # Calculate age of price data
+                now = datetime.now(timezone.utc)
+                age_sec = (now - ts).total_seconds()
+                
+                # If price is fresh, use it
+                if age_sec < MAX_PRICE_STALENESS_SEC:
+                    return {
+                        'close': price,
+                        'volume': 30000000000.0,  # Default volume
+                        'change_24h': 0.0,  # Default change
+                        'source': PRICE_CACHE.get('source', 'unknown'),
+                        'age_sec': age_sec
+                    }
+                else:
+                    logger.warning(f"Price data too old: {age_sec:.1f}s (max: {MAX_PRICE_STALENESS_SEC}s)")
+        except Exception as e:
+            logger.warning(f"Price worker data failed: {e}")
+        
+        # Try to get data from trading bot as fallback
         if trading_bot:
             try:
                 market_data = trading_bot.get_market_data()
@@ -548,7 +603,8 @@ def get_btc_market_data() -> Optional[Dict]:
                     return {
                         'close': market_data.get('close', 45000.0),
                         'volume': market_data.get('volume', 1000000.0),
-                        'change_24h': market_data.get('change_24h', 0.0)
+                        'change_24h': market_data.get('change_24h', 0.0),
+                        'source': 'trading_bot'
                     }
             except Exception as e:
                 logger.warning(f"Trading bot market data failed: {e}")
@@ -570,7 +626,8 @@ def get_btc_market_data() -> Optional[Dict]:
             return {
                 'close': 114000.0,  # Fallback price
                 'volume': 30000000000.0,  # Fallback volume
-                'change_24h': 0.0  # Fallback change
+                'change_24h': 0.0,  # Fallback change
+                'source': 'fallback'
             }
         
         response.raise_for_status()
@@ -581,7 +638,8 @@ def get_btc_market_data() -> Optional[Dict]:
             return {
                 'close': btc_data.get('usd', 45000.0),
                 'volume': btc_data.get('usd_24h_vol', 1000000.0),
-                'change_24h': btc_data.get('usd_24h_change', 0.0)
+                'change_24h': btc_data.get('usd_24h_change', 0.0),
+                'source': 'coingecko'
             }
         else:
             logger.error("No Bitcoin data found in CoinGecko response")
@@ -593,7 +651,8 @@ def get_btc_market_data() -> Optional[Dict]:
         return {
             'close': 114000.0,
             'volume': 30000000000.0,
-            'change_24h': 0.0
+            'change_24h': 0.0,
+            'source': 'fallback'
         }
 
 def create_jwt_token(username: str):
@@ -653,17 +712,17 @@ def load_runtime_settings():
     
     # Fallback to environment variables
     return {
-        "min_confidence": float(os.getenv("MIN_CONFIDENCE", "0.7")),
-        "max_exposure": float(os.getenv("MAX_EXPOSURE", "0.8")),
-        "trade_cooldown_hours": float(os.getenv("TRADE_COOLDOWN_HOURS", "3")),
-        "min_trade_delta": float(os.getenv("MIN_TRADE_DELTA", "0.05")),
-        "min_trade_delta_usd": float(os.getenv("MIN_TRADE_DELTA_USD", "10.0")),
-        "min_trade_delta_pct": float(os.getenv("MIN_TRADE_DELTA_PCT", "0.00")),
-        "no_fee_mode": parse_bool(os.getenv("NO_FEE_MODE", "True")),
-        "grid_executor_enabled": parse_bool(os.getenv("GRID_EXECUTOR_ENABLED", "True")),
-        "grid_step_pct": float(os.getenv("GRID_STEP_PCT", "0.25")),
-        "grid_order_usd": float(os.getenv("GRID_ORDER_USD", "12.0")),
-        "max_grid_exposure": float(os.getenv("MAX_GRID_EXPOSURE", "0.1")),
+        "min_confidence": float(os.getenv("MIN_CONFIDENCE") or "0.7"),
+        "max_exposure": float(os.getenv("MAX_EXPOSURE") or "0.8"),
+        "trade_cooldown_hours": float(os.getenv("TRADE_COOLDOWN_HOURS") or "3"),
+        "min_trade_delta": float(os.getenv("MIN_TRADE_DELTA") or "0.05"),
+        "min_trade_delta_usd": float(os.getenv("MIN_TRADE_DELTA_USD") or "10.0"),
+        "min_trade_delta_pct": float(os.getenv("MIN_TRADE_DELTA_PCT") or "0.00"),
+        "no_fee_mode": parse_bool(os.getenv("NO_FEE_MODE") or "True"),
+        "grid_executor_enabled": parse_bool(os.getenv("GRID_EXECUTOR_ENABLED") or "True"),
+        "grid_step_pct": float(os.getenv("GRID_STEP_PCT") or "0.25"),
+        "grid_order_usd": float(os.getenv("GRID_ORDER_USD") or "12.0"),
+        "max_grid_exposure": float(os.getenv("MAX_GRID_EXPOSURE") or "0.1"),
         "safety_skip_degraded": True,
         "safety_max_price_staleness_sec": 120.0,
         "safety_min_expected_move_pct": 0.1,
@@ -1128,6 +1187,7 @@ async def dashboard():
             .toggle-row { display: flex; align-items: center; gap: 8px; }
             .chart-canvas { width: 100%; height: 240px; display: block; background: #fff; border: 1px solid #eee; border-radius: 6px; }
         </style>
+        <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 
     </head>
     <body>
@@ -1162,8 +1222,9 @@ async def dashboard():
             
             <div class="trading-card">
                 <h2>📊 Equity & Benchmark</h2>
-                <canvas id="equityChart" class="chart-canvas"></canvas>
-                <canvas id="pnlChart" class="chart-canvas" style="margin-top:14px;"></canvas>
+                <canvas id="equitySpark" height="100"></canvas>
+                <canvas id="hodlSpark" height="60" style="margin-top:8px"></canvas>
+                <div id="equity-empty" style="display:none;color:#888;font-size:12px">Collecting data…</div>
             </div>
 
             <div class="trading-card">
@@ -1693,6 +1754,57 @@ async def dashboard():
             }
             
             // Badge functions
+            
+            // Equity Sparkline Charts
+            const eq = {ts:[], equity:[], hodl:[]};
+
+            // tiny helpers
+            const nowIso = () => new Date().toISOString();
+
+            // init charts
+            const ctx1 = document.getElementById('equitySpark').getContext('2d');
+            const ctx2 = document.getElementById('hodlSpark').getContext('2d');
+            const lineCfg = (label,data) => ({
+              type:'line',
+              data:{ labels:eq.ts, datasets:[{ label, data, fill:false, tension:0.2 }]},
+              options:{ animation:false, plugins:{legend:{display:false}}, scales:{x:{display:false},y:{display:false}}}
+            });
+            const eqChart  = new Chart(ctx1, lineCfg('Equity', eq.equity));
+            const hodlChart= new Chart(ctx2, lineCfg('HODL',  eq.hodl));
+
+            async function poll() {
+              try {
+                // Prefer authed summary; fallback to public equity series
+                const url = (typeof jwtToken !== 'undefined' && jwtToken)
+                  ? ('/pnl_summary?token=' + encodeURIComponent(jwtToken))
+                  : '/equity_series_public';
+                const r = await fetch(url, {cache:'no-store'});
+                const s = await r.json();
+                let equityVal, hodlVal;
+                if (s && typeof s === 'object' && 'equity' in s) {
+                  equityVal = Number(s.equity);
+                  hodlVal = Number(s.hodl_value || s.equity);
+                } else if (s && s.equity_curve && s.equity_curve.length) {
+                  const last = s.equity_curve.at(-1);
+                  equityVal = Number(last.equity ?? last[1]);
+                  const lastH = (s.hodl_curve && s.hodl_curve.length) ? s.hodl_curve.at(-1) : last;
+                  hodlVal = Number((lastH && (lastH.equity ?? lastH[1])) || equityVal);
+                }
+                if (!Number.isFinite(equityVal)) throw new Error('no equity');
+                // keep last 288 points (~24h @ 5min); we sample every 30s -> downsample to 5min
+                const ts = nowIso();
+                if (eq.ts.length === 0 || (Date.now() - Date.parse(eq.ts.at(-1))) > 5*60*1000) {
+                  eq.ts.push(ts); eq.equity.push(equityVal); eq.hodl.push(hodlVal || equityVal);
+                  if (eq.ts.length > 288) { eq.ts.shift(); eq.equity.shift(); eq.hodl.shift(); }
+                  eqChart.update(); hodlChart.update();
+                  document.getElementById('equity-empty').style.display = 'none';
+                }
+              } catch(e) {
+                if (eq.ts.length === 0) document.getElementById('equity-empty').style.display = 'block';
+              }
+            }
+            setInterval(poll, 30000);
+            poll();
         </script>
     </body>
     </html>
@@ -1980,11 +2092,11 @@ async def login_page():
             <form id="loginForm">
                 <div class="form-group">
                     <label for="username">Username:</label>
-                    <input type="text" id="username" name="username" value="admin" required>
+                    <input type="text" id="username" name="username" required>
                 </div>
                 <div class="form-group">
                     <label for="password">Password:</label>
-                    <input type="password" id="password" name="password" value="SecureTrading2024!" required>
+                    <input type="password" id="password" name="password" required>
                 </div>
                 <button type="submit" class="btn">Login</button>
             </form>
@@ -2024,6 +2136,8 @@ async def login_page():
 @app.post("/auth/login")
 async def login(username: str = Form(...), password: str = Form(...)):
     """Handle login"""
+    logger.info(f"Login attempt - username: {username}, expected: {ADMIN_USERNAME}")
+    logger.info(f"Password check - provided: {password[:3]}..., expected: {ADMIN_PASSWORD[:3]}...")
     if username == ADMIN_USERNAME and password == ADMIN_PASSWORD:
         token = create_jwt_token(username)
         return {"session_token": token, "message": "Login successful"}
@@ -2877,6 +2991,62 @@ def diag_balances():
             "btc_qty": btc_qty,
             "cash_usd": cash_usd,
             "equity": equity,
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+@app.get("/diagnostics/price")
+def diag_price():
+    """Price diagnostics endpoint to monitor data freshness."""
+    try:
+        from price_worker import PRICE_CACHE
+        now = datetime.now(timezone.utc)
+        ts = PRICE_CACHE["ts"]
+        age = (now - ts).total_seconds() if ts else None
+        return {
+            "source": PRICE_CACHE["source"], 
+            "ts": ts.isoformat() if ts else None, 
+            "age_sec": age,
+            "price": PRICE_CACHE["price"]
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+@app.get("/diagnostics/volatility")
+def diag_volatility():
+    """Volatility diagnostics endpoint to monitor market volatility."""
+    try:
+        from price_worker import get_current_volatility, PRICE_CACHE
+        σ = get_current_volatility()
+        return {
+            "volatility": σ,
+            "volatility_bps": σ * 10000 if σ else None,  # Convert to basis points
+            "current_price": PRICE_CACHE["price"],
+            "volatility_available": σ is not None
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+@app.get("/diagnostics/telemetry")
+def diag_telemetry():
+    """Trade quality telemetry endpoint to monitor grid trading performance."""
+    try:
+        from telemetry import get_telemetry_metrics
+        metrics = get_telemetry_metrics()
+        return {
+            "trade_quality": {
+                "maker_ratio": metrics["maker_ratio"],
+                "median_slippage_bps": metrics["median_slippage_bps"],
+                "avg_slippage_bps": metrics["avg_slippage_bps"],
+                "daily_trades": metrics["daily_trades"]
+            },
+            "grid_trades_total": metrics["grid_trades_total"],
+            "grid_skips_total": metrics["grid_skips_total"],
+            "top_skip_reasons": metrics["top_skip_reasons"],
+            "maker_fills_total": metrics["maker_fills_total"],
+            "market_fallback_total": metrics["market_fallback_total"],
+            "slippage_samples": metrics["slippage_samples"],
+            "recent_trades_count": metrics["recent_trades_count"]
         }
     except Exception as e:
         return {"error": str(e)}

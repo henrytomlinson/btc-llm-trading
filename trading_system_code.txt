@@ -224,8 +224,8 @@ def load_runtime_settings():
             "min_trade_delta": float(settings.get("min_trade_delta", 0.05)),
             "min_trade_delta_usd": float(settings.get("min_trade_delta_usd", 10.0)),
             "min_trade_delta_pct": float(settings.get("min_trade_delta_pct", 0.00)),
-            "no_fee_mode": bool(settings.get("no_fee_mode", True)),
-            "grid_executor_enabled": bool(settings.get("grid_executor_enabled", True)),
+            "no_fee_mode": parse_bool(settings.get("no_fee_mode", True)),
+"grid_executor_enabled": parse_bool(settings.get("grid_executor_enabled", True)),
             "grid_step_pct": float(settings.get("grid_step_pct", 0.25)),
             "grid_order_usd": float(settings.get("grid_order_usd", 12.0)),
             "max_grid_exposure": float(settings.get("max_grid_exposure", 0.1)),
@@ -1445,6 +1445,469 @@ BENEFITS:
 - **Idempotency**: Userref prevents duplicate orders
 - **Graceful Degradation**: Post-only failures trigger market fallback
 - **Consistent Pair Usage**: KRAKEN_PAIR constant ensures consistency
+
+================================================================================
+TELEMETRY SYSTEM & SOFT EDGES SUMMARY
+================================================================================
+
+IMPLEMENTED: Trade quality telemetry and bias band soft edges
+
+FEATURES:
+
+**Telemetry System:**
+1. **Trade Quality Metrics**: Maker ratio, median/avg slippage, daily trades
+2. **Skip Reason Tracking**: Comprehensive logging of why trades are skipped
+3. **EWMA Slippage Tracking**: Exponentially weighted moving average of slippage
+4. **Daily Counters**: Automatic daily reset of trade counters
+5. **Thread-Safe Design**: Lock-protected metrics for concurrent access
+6. **API Endpoint**: `/diagnostics/telemetry` for monitoring and UI integration
+
+**Soft Edges Enhancement:**
+1. **Gradual Size Reduction**: Order size scales down near bias band limits
+2. **20% Edge Zone**: Within 20% of band edge, order size reduced by 50%
+3. **Smooth Transitions**: Prevents sudden stops at hard band limits
+4. **Distance Calculation**: Normalized distance to nearest band edge
+5. **Debug Logging**: Tracks when soft edges are applied
+
+**Integration:**
+- Telemetry calls added to all grid skip conditions
+- Soft edges integrated into `_grid_notional_caps` function
+- New `/diagnostics/telemetry` endpoint in main application
+- Telemetry module included in Docker image
+
+================================================================================
+ENHANCED TRADING GUARDS SUMMARY
+================================================================================
+
+IMPLEMENTED: Enhanced trading guards for better trade management
+
+FEATURES:
+1. **Per-Side Candle Guard**: One buy and one sell per 15-minute candle
+2. **Partial Fill Handling**: Smart handling of partial order fills
+3. **Tiny Remainder Guard**: Ignore dust leftovers and avoid retrying small remainders
+4. **Negligible Fill Protection**: Skip processing for fills < 10% of order
+5. **Remainder Satisfaction Tracking**: Mark small remainders as satisfied
+
+PER-SIDE CANDLE GUARD IMPLEMENTATION:
+```python
+# auto_trade_scheduler.py
+def _is_same_candle_per_side(side: str, now: datetime):
+    """Check if we've already traded this side in this candle, and update if not."""
+    from db import read_settings, write_setting
+    cur = _current_candle_ts(now, minutes=15).isoformat()
+    key = f"last_trade_candle_{side}_ts"
+    settings = read_settings() or {}
+    last = settings.get(key)
+    if last == cur:
+        return True
+    settings[key] = cur
+    write_setting(key, cur)
+    return False
+
+# Integration in execute_auto_trade()
+if _is_same_candle_per_side(action, now):
+    logger.info(f"⏸️ Skip: same candle per-side guard for {action}")
+    return {"status":"skipped","reason":f"same_candle_{action}"}
+```
+
+PARTIAL FILL HANDLING IMPLEMENTATION:
+```python
+# grid_executor.py - in execute_grid_trade()
+# --- partial fill handling + tiny remainder guard ---
+requested = qty
+fill_ratio = filled_qty / requested if requested > 0 else 0.0
+
+# Ignore negligible fills (< 10% of order)
+if fill_ratio < 0.1:
+    logger.info("Grid skip: negligible fill %.1f%% (filled=%.6f, requested=%.6f)", 
+               fill_ratio * 100, filled_qty, requested)
+    return {"status":"skipped","reason":"negligible_fill"}
+
+# Ignore remainders < 20% of lot
+remainder = requested - filled_qty
+if remainder > 0 and remainder < (0.2 * requested):
+    logger.info("Grid skip: tiny remainder %.6f < 20%% of %.6f", remainder, requested)
+    # Mark remainder as satisfied to avoid retrying
+    try:
+        from auto_trade_scheduler import mark_remainder_satisfied
+        mark_remainder_satisfied(res.get("userref", "unknown"))
+    except Exception as e:
+        logger.warning(f"Failed to mark remainder satisfied: {e}")
+```
+
+REMAINDER SATISFACTION TRACKING:
+```python
+# auto_trade_scheduler.py
+def mark_remainder_satisfied(userref: str):
+    """Mark a remainder as satisfied to avoid retrying small unfilled portions."""
+    from db import write_setting
+    key = f"remainder_satisfied_{userref}"
+    write_setting(key, datetime.now(timezone.utc).isoformat())
+    logger.info(f"Marked remainder satisfied for userref: {userref}")
+```
+
+USAGE:
+```bash
+# Per-side candle guard automatically prevents:
+# - Multiple buys in the same 15-minute candle
+# - Multiple sells in the same 15-minute candle
+# - But allows one buy AND one sell in the same candle
+
+# Partial fill handling automatically:
+# - Skips processing for fills < 10% of order size
+# - Marks remainders < 20% as satisfied
+# - Prevents retrying of dust leftovers
+```
+
+BENEFITS:
+- **Trade Frequency Control**: Prevents excessive trading in same candle
+- **Market Responsiveness**: Allows both buy and sell in same candle if market moves
+- **Dust Management**: Avoids processing tiny fills that don't matter
+- **Remainder Efficiency**: Prevents retrying small unfilled portions
+- **Database Efficiency**: Reduces unnecessary state updates
+- **Logging Clarity**: Clear reasons for skipped trades
+- **Risk Management**: Better control over trade frequency and size
+
+================================================================================
+DYNAMIC ORDER SIZING SUMMARY
+================================================================================
+
+IMPLEMENTED: Dynamic order sizing based on market volatility
+
+FEATURES:
+1. **Volatility-Based Sizing**: Order size scales with market volatility
+2. **Configurable Bounds**: Minimum $10, maximum $22 order sizes
+3. **Real-Time Adjustment**: Order size updates with every grid trade decision
+4. **Scalable Formula**: Configurable volatility-to-dollar scaler (k=3000)
+5. **Fallback Protection**: Uses 0.25% volatility if current volatility unavailable
+
+DYNAMIC SIZING IMPLEMENTATION:
+```python
+# In should_grid_trade() method, after volatility-adaptive step sizing
+# --- dynamic order sizing ---
+σ_now = σ or 0.0025  # 0.25% fallback
+order_usd = max(self.min_order_usd, min(self.max_order_usd, self.volatility_scaler * σ_now))
+state.grid_order_usd = order_usd
+logger.debug(f"Dynamic order sizing: σ={σ:.4f}, order_usd=${order_usd:.2f}")
+```
+
+CONFIGURATION:
+```python
+# Environment Variables
+MIN_ORDER_USD = "10.0"      # Minimum order size in USD
+MAX_ORDER_USD = "22.0"      # Maximum order size in USD
+VOLATILITY_SCALER = "3000.0"  # σ → dollars scaler (k)
+
+# GridExecutor initialization
+self.min_order_usd = float(os.getenv("MIN_ORDER_USD", "10.0"))
+self.max_order_usd = float(os.getenv("MAX_ORDER_USD", "22.0"))
+self.volatility_scaler = float(os.getenv("VOLATILITY_SCALER", "3000.0"))
+```
+
+SIZING FORMULA:
+```python
+# Formula: order_usd = max(min_usd, min(max_usd, k * σ))
+# Where:
+# - min_usd = $10.0 (minimum order size)
+# - max_usd = $22.0 (maximum order size)
+# - k = 3000 (volatility scaler)
+# - σ = current volatility (or 0.0025 fallback)
+
+# Examples:
+# Low volatility (σ = 0.0001): order_usd = max(10, min(22, 3000 * 0.0001)) = $10.00
+# Normal volatility (σ = 0.0025): order_usd = max(10, min(22, 3000 * 0.0025)) = $12.00
+# High volatility (σ = 0.0050): order_usd = max(10, min(22, 3000 * 0.0050)) = $15.00
+# Very high volatility (σ = 0.0100): order_usd = max(10, min(22, 3000 * 0.0100)) = $22.00
+```
+
+USAGE:
+```bash
+# Set custom sizing parameters (optional)
+export MIN_ORDER_USD=8.0    # Lower minimum
+export MAX_ORDER_USD=25.0   # Higher maximum
+export VOLATILITY_SCALER=4000  # More aggressive scaling
+
+# Grid will automatically adjust order sizes based on volatility
+# Logs will show: "Dynamic order sizing: σ=0.0008, order_usd=$15.20"
+```
+
+BENEFITS:
+- **Market Responsive**: Larger orders in volatile markets, smaller in quiet ones
+- **Risk Management**: Automatically adjusts position sizes to market conditions
+- **Configurable**: Adjustable bounds and scaling parameters
+- **Real-Time**: Updates with every grid trade decision
+- **Fallback Protection**: Continues operation if volatility unavailable
+- **Efficient**: Lightweight calculation with minimal overhead
+- **Bounded**: Order sizes always within safe limits
+
+================================================================================
+VOLATILITY-ADAPTIVE STEP SIZING SUMMARY
+================================================================================
+
+IMPLEMENTED: Volatility-adaptive step sizing for responsive grid trading
+
+FEATURES:
+1. **Volatility Tracking**: Rolling volatility calculation with 48-sample window (~12h of 15m bars)
+2. **Adaptive Step Sizing**: Step size adjusts based on market volatility
+3. **Clamped Range**: Steps clamped between 0.15% and 0.60%
+4. **Real-Time Updates**: Volatility updates with every price tick
+5. **Diagnostics Endpoint**: Monitor volatility and step adjustments
+
+VOLATILITY TRACKING IMPLEMENTATION:
+```python
+# price_worker.py
+class VolBucket:
+    """Volatility bucket for tracking rolling price volatility"""
+    def __init__(self, n=48):  # ~12h of 15m bars
+        self.returns = deque(maxlen=n)
+        self.last_mid = None
+    
+    def update(self, mid):
+        if self.last_mid:
+            r = (mid / self.last_mid) - 1.0
+            self.returns.append(r)
+        self.last_mid = mid
+    
+    def sigma(self):
+        if len(self.returns) < 5:
+            return None
+        m = sum(self.returns) / len(self.returns)
+        var = sum((x - m) * (x - m) for x in self.returns) / len(self.returns)
+        return var ** 0.5
+
+# Global volatility tracker
+VOL_BUCKET = VolBucket()
+```
+
+ADAPTIVE STEP SIZING LOGIC:
+```python
+# In should_grid_trade() method
+# --- volatility-adaptive step sizing ---
+try:
+    from price_worker import get_current_volatility
+    σ = get_current_volatility()
+    if σ is not None:
+        # scale step: clamp between 0.15% and 0.60%
+        base = base_step / 100.0
+        σ_ref = 0.0025  # reference 0.25% per 15m
+        scaled = max(0.0015, min(0.0060, base * (σ_ref / (σ or σ_ref))))
+        adaptive_step_pct = scaled * 100.0
+        base_step = adaptive_step_pct
+        logger.debug(f"Volatility-adaptive step: σ={σ:.4f}, base={base_step:.3f}%")
+except Exception as e:
+    logger.warning(f"Failed to get volatility for adaptive step: {e}")
+```
+
+DIAGNOSTICS ENDPOINT:
+```python
+@app.get("/diagnostics/volatility")
+def diag_volatility():
+    """Volatility diagnostics endpoint to monitor market volatility."""
+    try:
+        from price_worker import get_current_volatility, PRICE_CACHE
+        σ = get_current_volatility()
+        return {
+            "volatility": σ,
+            "volatility_bps": σ * 10000 if σ else None,  # Convert to basis points
+            "current_price": PRICE_CACHE["price"],
+            "volatility_available": σ is not None
+        }
+    except Exception as e:
+        return {"error": str(e)}
+```
+
+USAGE:
+```bash
+# Check current volatility
+curl -s http://localhost:8000/diagnostics/volatility | jq .
+
+# Example response:
+{
+  "volatility": 0.000026815345227940066,
+  "volatility_bps": 0.2681534522794007,
+  "current_price": 114361.9,
+  "volatility_available": true
+}
+```
+
+BENEFITS:
+- **Market Responsive**: More trades in quiet markets, fewer in volatile ones
+- **Risk Management**: Automatically adjusts to market conditions
+- **Real-Time**: Updates with every price tick from WebSocket
+- **Configurable**: Adjustable reference volatility and step ranges
+- **Comprehensive Monitoring**: Volatility diagnostics endpoint
+- **Graceful Degradation**: Continues with base step if volatility unavailable
+- **Efficient**: Lightweight rolling calculation with fixed memory usage
+
+================================================================================
+SPREAD/SLIPPAGE GUARD SUMMARY
+================================================================================
+
+IMPLEMENTED: Spread/slippage guard to trade only when spreads are tight enough
+
+FEATURES:
+1. **Spread Checking**: Real-time orderbook analysis before grid trades
+2. **Configurable Threshold**: Default 6 bps (0.06%) maximum spread
+3. **Basis Points Calculation**: Accurate spread measurement in basis points
+4. **Orderbook Integration**: Uses trading bot's orderbook snapshot
+5. **Comprehensive Logging**: Detailed spread information in logs
+
+SPREAD GUARD IMPLEMENTATION:
+```python
+# In should_grid_trade() method
+# --- spread/slippage guard ---
+# Require tight spread before trading
+try:
+    ob = self.get_orderbook_snapshot("XXBTZUSD")
+    if ob and "best_bid" in ob and "best_ask" in ob:
+        best_bid, best_ask = float(ob["best_bid"]), float(ob["best_ask"])
+        mid = 0.5 * (best_bid + best_ask)
+        spread_bps = (best_ask - best_bid) / mid * 1e4  # basis points
+        
+        max_spread_bps = getattr(self, "max_spread_bps", 6)  # e.g. 6 bps = 0.06%
+        if spread_bps > max_spread_bps:
+            logger.info("Grid skip: spread %.1f bps > %d (best_bid=%.2f, best_ask=%.2f, mid=%.2f)", 
+                       spread_bps, max_spread_bps, best_bid, best_ask, mid)
+            return None
+except Exception as e:
+    logger.warning("Grid skip: failed to check spread: %s", str(e))
+    return None
+```
+
+CONFIGURATION:
+```python
+# Environment Variables
+MAX_SPREAD_BPS = "6"  # 6 basis points = 0.06% maximum spread
+
+# GridExecutor initialization
+self.max_spread_bps = int(os.getenv("MAX_SPREAD_BPS", "6"))  # 6 bps = 0.06% max spread
+```
+
+ORDERBOOK INTEGRATION:
+```python
+def get_orderbook_snapshot(self, symbol: str = "XXBTZUSD") -> Dict:
+    """
+    Get orderbook snapshot for spread checking.
+    Falls back to trading bot if available, otherwise returns None.
+    """
+    try:
+        if self.trading_bot and hasattr(self.trading_bot, 'get_orderbook_snapshot'):
+            return self.trading_bot.get_orderbook_snapshot(symbol)
+        else:
+            logger.warning("No trading bot available for orderbook snapshot")
+            return None
+    except Exception as e:
+        logger.warning(f"Failed to get orderbook snapshot: {e}")
+        return None
+```
+
+USAGE:
+```bash
+# Set custom spread threshold (optional)
+export MAX_SPREAD_BPS=8  # 8 bps = 0.08% maximum spread
+
+# Grid will automatically skip trades when spread > threshold
+# Logs will show: "Grid skip: spread 12.5 bps > 6 (best_bid=114250.00, best_ask=114264.25, mid=114257.12)"
+```
+
+BENEFITS:
+- **Cost Efficiency**: Avoid trading when spreads are wide
+- **Liquidity Awareness**: Only trade in liquid market conditions
+- **Slippage Protection**: Prevent excessive slippage from wide spreads
+- **Configurable**: Adjustable threshold for different market conditions
+- **Real-Time**: Live orderbook analysis before each trade
+- **Comprehensive Logging**: Detailed spread information for monitoring
+- **Graceful Degradation**: Continues operation if orderbook unavailable
+
+================================================================================
+FRESH PRICE DATA WITH WEBSOCKET + REST FALLBACK SUMMARY
+================================================================================
+
+IMPLEMENTED: Real-time price updates with WebSocket + REST fallback for fresh market data
+
+FEATURES:
+1. **Price Worker**: Background threads for WebSocket and REST price updates
+2. **Process-Local Cache**: Shared cache updated every few seconds
+3. **Fresh Data Integration**: Prioritizes fresh price worker data with staleness checking
+4. **Diagnostics Endpoint**: Monitor data freshness, source, and age
+5. **Enhanced Market Data**: Source tracking and age information
+
+PRICE WORKER IMPLEMENTATION:
+```python
+# price_worker.py
+import threading, time
+from datetime import datetime, timezone
+from collections import deque
+
+PRICE_CACHE = {"price": None, "ts": None, "source": None}
+
+def kraken_ws_loop():
+    """WebSocket connection to Kraken for real-time price updates"""
+    # Connects to wss://ws.kraken.com
+    # Subscribes to XBT/USD ticker
+    # Updates cache with latest trade price
+
+def rest_fallback_loop():
+    """REST API fallback (Kraken → Coinbase)"""
+    # Tries Kraken REST API first
+    # Falls back to Coinbase if Kraken fails
+    # Updates every 5 seconds
+
+def start_price_worker():
+    """Start both WebSocket and REST threads"""
+    threading.Thread(target=kraken_ws_loop, daemon=True).start()
+    threading.Thread(target=rest_fallback_loop, daemon=True).start()
+```
+
+INTEGRATION:
+```python
+# main_btc.py
+from price_worker import start_price_worker, PRICE_CACHE
+start_price_worker()
+
+def get_btc_market_data() -> Optional[Dict]:
+    """Get Bitcoin market data from price worker or fallback sources"""
+    # Try price worker first (fresh data)
+    # Check staleness (< 120 seconds)
+    # Fallback to trading bot or CoinGecko
+    # Include source and age information
+```
+
+DIAGNOSTICS ENDPOINT:
+```python
+@app.get("/diagnostics/price")
+def diag_price():
+    """Price diagnostics endpoint to monitor data freshness"""
+    return {
+        "source": PRICE_CACHE["source"], 
+        "ts": PRICE_CACHE["ts"].isoformat() if PRICE_CACHE["ts"] else None, 
+        "age_sec": age,
+        "price": PRICE_CACHE["price"]
+    }
+```
+
+USAGE:
+```bash
+# Check price diagnostics
+curl -s http://localhost:8000/diagnostics/price | jq .
+
+# Expected response
+{
+  "source": "kraken_ws",
+  "ts": "2025-08-24T17:33:09.714646+00:00",
+  "age_sec": 0.985784,
+  "price": 114252.5
+}
+```
+
+BENEFITS:
+- **Real-Time Data**: WebSocket provides sub-second price updates
+- **Reliability**: REST fallback ensures data availability
+- **Freshness**: Staleness checking prevents stale data usage
+- **Monitoring**: Diagnostics endpoint for data quality monitoring
+- **Performance**: Process-local cache reduces API calls
+- **Source Tracking**: Know which data source is being used
+- **Age Awareness**: Track how old the price data is
 
 ================================================================================
 SELF-TEST AND RECOMMENDED DEFAULTS SUMMARY

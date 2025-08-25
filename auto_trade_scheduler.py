@@ -32,6 +32,13 @@ try:
 except ImportError:
     GRID_AVAILABLE = False
 
+# Price worker import for fresh data
+try:
+    from price_worker import get_last_price, PRICE_CACHE
+    PRICE_WORKER_AVAILABLE = True
+except ImportError:
+    PRICE_WORKER_AVAILABLE = False
+
 # Boolean parsing utility
 try:
     from utils_bool import parse_bool
@@ -83,6 +90,26 @@ def _is_same_candle(db, now):
         return True
     write_setting("last_trade_candle_ts", cur); 
     return False
+
+def _is_same_candle_per_side(side: str, now: datetime):
+    """Check if we've already traded this side in this candle, and update if not."""
+    from db import read_settings, write_setting
+    cur = _current_candle_ts(now, minutes=15).isoformat()
+    key = f"last_trade_candle_{side}_ts"
+    settings = read_settings() or {}
+    last = settings.get(key)
+    if last == cur:
+        return True
+    settings[key] = cur
+    write_setting(key, cur)
+    return False
+
+def mark_remainder_satisfied(userref: str):
+    """Mark a remainder as satisfied to avoid retrying small unfilled portions."""
+    from db import write_setting
+    key = f"remainder_satisfied_{userref}"
+    write_setting(key, datetime.now(timezone.utc).isoformat())
+    logger.info(f"Marked remainder satisfied for userref: {userref}")
 
 # Load environment variables from .env file
 def load_env_file():
@@ -352,6 +379,12 @@ def execute_auto_trade():
                     
                     if action:
                         logger.info(f"🔗 Grid trade triggered: {action} at ${last_price:,.2f}")
+                        
+                        # Check per-side candle guard
+                        now = datetime.now(timezone.utc)
+                        if _is_same_candle_per_side(action, now):
+                            logger.info(f"⏸️ Skip: same candle per-side guard for {action}")
+                            return {"status":"skipped","reason":f"same_candle_{action}"}
                         
                         # Respect max exposure and bias. Buy if not at cap; sell if above 0/target.
                         notional = max(DEFAULT_GRID_ORDER_USD, settings.get('min_trade_delta_usd', 10.0))  # ≥ $10
