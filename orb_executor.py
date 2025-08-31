@@ -322,25 +322,6 @@ def is_new_5m_close(now: datetime, state: Dict[str, Any]) -> bool:
     cur = to_five_min_bucket(now).isoformat()
     return state.get("last_five_bucket") != cur
 
-def get_market_data() -> Dict[str, Any]:
-    """
-    Get market data using Kraken Depth API for accurate spread calculation.
-    Return: {'best_bid':float,'best_ask':float,'mid':float,'age_sec':float}
-    """
-    try:
-        from kraken_trading_btc import KrakenTradingBot
-        bot = KrakenTradingBot()
-        
-        # Use Kraken Depth API for accurate spread calculation
-        bid, ask, mid = bot.get_top_of_book("XBTUSD")
-        
-        # Use a default age since we don't have timestamp info
-        age_sec = 0.0
-        return {"best_bid": bid, "best_ask": ask, "mid": mid, "age_sec": age_sec}
-    except Exception as e:
-        logger.warning(f"Failed to get market data: {e}")
-        return {"best_bid": 0.0, "best_ask": 0.0, "mid": 0.0, "age_sec": 999.0}
-
 
 def best_quotes() -> tuple[float, float, float, float]:
     """
