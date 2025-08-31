@@ -2592,8 +2592,9 @@ def diag_telemetry():
 async def orb_status():
     try:
         from db import get_setting
-        from orb_executor import load_orb_state
-        s = load_orb_state() or {}
+        from orb_executor import ORBExecutor, resolve_session, floor_5m
+        from auto_trade_scheduler import load_runtime_settings
+        from datetime import datetime, timezone
         
         # Safe float conversion helper (same as PnL endpoints)
         def _f(v, d=0.0):
@@ -2618,42 +2619,72 @@ async def orb_status():
             from orb_executor import get_spread_bps
             current_spread = get_spread_bps()
         except Exception:
-            current_spread = s.get("spread_bps", 0.0)
+            current_spread = 0.0
+        
+        # Unify session logic with the executor
+        now_utc = datetime.now(timezone.utc)
+        settings = load_runtime_settings()
+        session_name, open_utc, close_utc = resolve_session(now_utc, settings)
+        
+        # Create executor instance to get current state
+        executor = ORBExecutor()
+        
+        # Determine phase based on session and state
+        if session_name is None:
+            phase = "PRE"
+        elif executor.state and executor.state.orb_high is not None:
+            phase = executor.state.phase or "WAIT_CONFIRM"
+        else:
+            phase = "ORB_BUILD"
+        
+        # Get bar counts for debugging
+        bars_1m = 0
+        bars_5m = 0
+        try:
+            from orb_executor import fetch_ohlc
+            bars_1m = len(fetch_ohlc("XXBTZUSD", interval_min=1) or [])
+            bars_5m = len(fetch_ohlc("XXBTZUSD", interval_min=5) or [])
+        except Exception:
+            pass
         
         return {
             "mode": get_setting("strategy_mode"),
             "enabled": bool(get_setting("orb_enabled", False)),
-            "day": s.get("day"),
-            "phase": s.get("phase"),
-            "orb_high": s.get("orb_high"),
-            "orb_low": s.get("orb_low"),
-            "adds_done": s.get("adds_done"),
-            "avg_price": s.get("avg_price"),
-            "qty": s.get("qty"),
-            "stop": s.get("stop"),
+            "day": getattr(executor.state, "day", None) if executor.state else None,
+            "session": session_name,
+            "phase": phase,
+            "orb_high": getattr(executor.state, "orb_high", None) if executor.state else None,
+            "orb_low": getattr(executor.state, "orb_low", None) if executor.state else None,
+            "adds_done": getattr(executor.state, "adds_done", None) if executor.state else None,
+            "avg_price": getattr(executor.state, "avg_price", None) if executor.state else None,
+            "qty": getattr(executor.state, "qty", None) if executor.state else None,
+            "stop": getattr(executor.state, "stop", None) if executor.state else None,
             # NEW diagnostics if present
-            "last_close": s.get("last_close"),
-            "ema9": s.get("ema9"),
-            "ema20": s.get("ema20"),
-            "ema50": s.get("ema50"),
+            "last_close": executor.last_close,
+            "ema9": executor.last_ema9,
+            "ema20": executor.last_ema20,
+            "ema50": executor.last_ema50,
             "spread_bps": current_spread,
-            "confirm_reason": s.get("confirm_reason"),
-            "last_five_bucket": s.get("last_five_bucket"),
+            "confirm_reason": executor.last_reason,
+            "last_five_bucket": getattr(executor.state, "last_five_bucket", None).isoformat() if getattr(executor.state, "last_five_bucket", None) else None,
             # Skip reason context with real balances
             "btc_balance": btc_bal,
             "usd_balance": usd_bal,
-            "skip_reason": s.get("skip_reason"),
-            "signal": s.get("signal"),
-            "ema_ok": s.get("ema_ok"),
-            "break_ok": s.get("break_ok"),
-            "risk_qty": s.get("risk_qty"),
-            "final_qty": s.get("final_qty"),
+            "skip_reason": None,  # Not used in new implementation
+            "signal": executor.last_signal,
+            "ema_ok": executor.last_ema_ok,
+            "break_ok": executor.last_break_ok,
+            "risk_qty": executor.last_risk_qty,
+            "final_qty": executor.last_final_qty,
             # Last confirmation values
-            "last_signal": s.get("last_signal"),
-            "last_ema_ok": s.get("last_ema_ok"),
-            "last_break_ok": s.get("last_break_ok"),
-            "last_reason": s.get("last_reason"),
-            "last_risk_qty": s.get("last_risk_qty")
+            "last_signal": executor.last_signal,
+            "last_ema_ok": executor.last_ema_ok,
+            "last_break_ok": executor.last_break_ok,
+            "last_reason": executor.last_reason,
+            "last_risk_qty": executor.last_risk_qty,
+            # Debug info
+            "bars_1m": bars_1m,
+            "bars_5m": bars_5m
         }
     except Exception as e:
         return {"status": "error", "reason": str(e)}

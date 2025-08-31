@@ -276,8 +276,8 @@ class KrakenTradingBot:
             r.raise_for_status()
             data = r.json()["result"]
             book = next(iter(data.values()))
-            bid = float(book["b"][0][0])
-            ask = float(book["a"][0][0])
+            bid = float(book["b"][0])  # First element is the bid price
+            ask = float(book["a"][0])  # First element is the ask price
             mid = (bid + ask) / 2.0
             return bid, ask, mid
         except Exception as e:

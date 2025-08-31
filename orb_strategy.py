@@ -2,32 +2,41 @@
 """
 Opening Range Breakout (ORB) deterministic strategy module.
 
-Session-bounded logic for BTC/USD using America/New_York session times.
+Multi-session support for BTC/USD using London and New York session times.
 Keeps state minimal and deterministic; integrates with existing Kraken plumbing.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, time, timezone
+from datetime import datetime, date, time, timedelta, timezone
 from typing import List, Dict, Optional, Tuple
-
 import pytz
 
-NY_TZ = pytz.timezone("America/New_York")
+NY = pytz.timezone("America/New_York")
+LDN = pytz.timezone("Europe/London")
+
+
+@dataclass
+class SessionDef:
+    label: str                 # "LONDON" | "NY"
+    tz: str                    # "Europe/London" | "America/New_York"
+    open_t: time               # local open
+    close_t: time              # local close
+    orb_minutes: int = 15
+    confirm_minutes: int = 5
 
 
 @dataclass
 class ORBParams:
-    orb_minutes: int = 15
-    confirm_minutes: int = 5
+    sessions: list[SessionDef]
     ema_fast: int = 9
     ema_mid: int = 20
     ema_slow: int = 50
-    min_orb_pct: float = 0.002  # 0.20%
+    min_orb_pct: float = 0.002
+    buffer_bps: int = 2
     risk_per_trade: float = 0.005
-    buffer_frac: float = 0.10   # 10% of range
-    max_spread_bps: int = 8
+    buffer_frac: float = 0.10
     max_adds: int = 2
     trail_atr_mult: float = 2.0
 
@@ -35,28 +44,51 @@ class ORBParams:
 @dataclass
 class ORBState:
     day: str
-    orb_high: Optional[float] = None
-    orb_low: Optional[float] = None
-    direction: Optional[str] = None  # "long" | "short" | None
+    session: str               # "LONDON" or "NY"
+    orb_high: float | None = None
+    orb_low: float | None = None
+    direction: str | None = None
     adds_done: int = 0
     in_position: bool = False
     avg_price: float = 0.0
     qty: float = 0.0
     stop: float = 0.0
+    last_five_bucket: datetime | None = None
+    phase: str = "PRE"
 
 
-def _to_ny(dt_utc: datetime) -> datetime:
-    return dt_utc.astimezone(NY_TZ)
+def localize(dt_utc: datetime, tzname: str):
+    return dt_utc.astimezone(pytz.timezone(tzname))
 
 
-def in_session(dt_utc: datetime) -> bool:
-    ny = _to_ny(dt_utc)
-    return time(9, 30) <= ny.time() <= time(16, 0)
+def in_local_window(dt_utc: datetime, tzname: str, start: time, end: time) -> bool:
+    loc = localize(dt_utc, tzname)
+    return start <= loc.time() <= end
 
 
-def session_bucket(dt_utc: datetime, start: time, end: time) -> bool:
-    ny = _to_ny(dt_utc)
-    return start <= ny.time() < end
+def build_orb_window(now_utc: datetime, s: SessionDef) -> tuple[datetime, datetime]:
+    loc = localize(now_utc, s.tz)
+    d = loc.date()
+    start = pytz.timezone(s.tz).localize(datetime(d.year, d.month, d.day, s.open_t.hour, s.open_t.minute))
+    orb_end = start + timedelta(minutes=s.orb_minutes)
+    return start.astimezone(timezone.utc), orb_end.astimezone(timezone.utc)
+
+
+def is_orb_build(now_utc: datetime, s: SessionDef) -> bool:
+    start_utc, orb_end_utc = build_orb_window(now_utc, s)
+    return start_utc <= now_utc < orb_end_utc
+
+
+def is_confirm_window(now_utc: datetime, s: SessionDef) -> bool:
+    _, orb_end_utc = build_orb_window(now_utc, s)
+    close_loc = localize(now_utc, s.tz).replace(hour=s.close_t.hour, minute=s.close_t.minute, second=0, microsecond=0)
+    close_utc = close_loc.astimezone(timezone.utc)
+    return orb_end_utc <= now_utc <= close_utc
+
+
+def weekday_allowed(now_utc: datetime, allowed: set[int]) -> bool:
+    # Python weekday: Mon=0..Sun=6. We map to 1..7 to match env
+    return (now_utc.weekday() + 1) in allowed
 
 
 def _ema(values: List[float], length: int) -> List[float]:
@@ -76,20 +108,21 @@ def _ema(values: List[float], length: int) -> List[float]:
 
 class ORBStrategy:
     def __init__(self, params: Optional[ORBParams] = None):
-        self.p = params or ORBParams()
+        self.p = params or ORBParams(sessions=[])
 
-    def build_orb(self, bars_1m: List[Dict], now_utc: datetime) -> Optional[Tuple[float, float]]:
-        """Compute ORB high/low from 09:30–09:45 ET window using 1m bars.
+    def build_orb(self, bars_1m: List[Dict], now_utc: datetime, session: SessionDef) -> Optional[Tuple[float, float]]:
+        """Compute ORB high/low from session window using 1m bars.
 
         bars_1m: list of {"ts": datetime (UTC), "high": float, "low": float}
         """
-        if not session_bucket(now_utc, time(9, 30), time(9, 45)):
+        if not is_orb_build(now_utc, session):
             return None
+        start_utc, orb_end_utc = build_orb_window(now_utc, session)
         highs: List[float] = []
         lows: List[float] = []
         for b in bars_1m:
             ts: datetime = b.get("ts")
-            if ts and session_bucket(ts, time(9, 30), time(9, 45)):
+            if ts and start_utc <= ts < orb_end_utc:
                 try:
                     highs.append(float(b["high"]))
                     lows.append(float(b["low"]))
