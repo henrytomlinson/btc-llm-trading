@@ -1,0 +1,195 @@
+ORB strategy — production blueprint
+
+Session & clocks
+	•	Session: New York cash session 09:30–16:00 ET.
+	•	Opening range: 09:30–09:45 ET (first 15-min candle).
+	•	Confirmation: First 5-min close outside the range (09:45+).
+	•	Your local time (London): NY open is 14:30 all year.
+
+Use tz-aware code: America/New_York for logic, store UTC in DB.
+
+Rules (deterministic)
+	1.	Build ORB:
+	•	orb_high = max(highs from 09:30–09:45 ET)
+	•	orb_low  = min(lows  from 09:30–09:45 ET)
+	•	orb_range = orb_high - orb_low
+	•	Filter: skip day if orb_range < 0.20% of price (too tight).
+	2.	Confirmation (after 09:45 ET):
+	•	Long: first 5-min candle closes > orb_high and EMAs aligned EMA9 > EMA20 > EMA50 (on 1-min or 5-min; pick one and be consistent).
+	•	Short: close < orb_low with EMA9 < EMA20 < EMA50.
+	•	Optional volume filter: close’s volume > 20-bar average.
+	3.	Entry & stop:
+	•	Enter at close of the confirming 5-min candle.
+	•	Invalidation stop: other side of range with buffer
+stop = orb_low - 0.1*orb_range (long) or stop = orb_high + 0.1*orb_range (short).
+	4.	Position sizing:
+	•	Risk 0.5% of equity per initial entry:
+qty = (0.005 * equity) / abs(entry - stop) (round to lot).
+	•	Spread/slippage guard: only trade if spread ≤ 8 bps.
+	5.	Laddering (max 3 adds):
+	•	Retest add: if price retests the breakout level (orb_high/low) and holds on a 1-min close.
+	•	Momentum add: at +0.5R and +1.0R; on each add, risk extra 0.25%.
+	•	After +1.0R total, move stop to breakeven on net position.
+	6.	Exits:
+	•	ATR trail once ≥ +1.0R: trail = entry/avg_price −/+ 2×ATR(14) on 1-min.
+	•	Time stop: flat all positions by 16:00 ET.
+	•	Daily breaker: stop trading for the day if realized PnL ≤ −$5 (your current limit).
+	7.	Only one direction per day (optional): if the first signal is long, ignore shorts that day (and vice versa).
+
+
+Minimal code skeleton (drop-in)
+
+Create orb_strategy.py:
+
+# orb_strategy.py
+from dataclasses import dataclass
+from datetime import datetime, time
+import pytz
+
+NY = pytz.timezone("America/New_York")
+
+@dataclass
+class ORBParams:
+    orb_minutes: int = 15
+    confirm_minutes: int = 5
+    ema_fast: int = 9
+    ema_mid: int = 20
+    ema_slow: int = 50
+    min_orb_pct: float = 0.002   # 0.20%
+    risk_per_trade: float = 0.005
+    buffer_frac: float = 0.10    # 10% of range
+    max_spread_bps: int = 8
+    max_adds: int = 2
+    trail_atr_mult: float = 2.0
+
+@dataclass
+class ORBState:
+    day: str
+    orb_high: float | None = None
+    orb_low: float | None = None
+    direction: str | None = None  # "long"|"short"|None
+    adds_done: int = 0
+    in_position: bool = False
+    avg_price: float = 0.0
+    qty: float = 0.0
+    stop: float = 0.0
+
+def in_session(dt_utc) -> bool:
+    ny = dt_utc.astimezone(NY)
+    return time(9,30) <= ny.time() <= time(16,0)
+
+def session_bucket(dt_utc, start: time, end: time) -> bool:
+    ny = dt_utc.astimezone(NY)
+    return start <= ny.time() < end
+
+def compute_emas(close_series, n):
+    # simple rolling EMA; use your existing TA util for speed
+    ...
+
+class ORBStrategy:
+    def __init__(self, params: ORBParams): self.p = params
+
+    def build_orb(self, bars_1m, now_utc) -> tuple[float,float] | None:
+        if not session_bucket(now_utc, time(9,30), time(9,45)): return None
+        highs = [b["high"] for b in bars_1m if session_bucket(b["ts"], time(9,30), time(9,45))]
+        lows  = [b["low"]  for b in bars_1m if session_bucket(b["ts"], time(9,30), time(9,45))]
+        if not highs or not lows: return None
+        return max(highs), min(lows)
+
+    def confirm_breakout(self, bars_5m, orb_high, orb_low) -> str | None:
+        last = bars_5m[-1]
+        close = last["close"]
+        # EMA alignment on 5m (or 1m consistently)
+        ema9  = compute_emas([b["close"] for b in bars_5m], self.p.ema_fast)[-1]
+        ema20 = compute_emas([b["close"] for b in bars_5m], self.p.ema_mid)[-1]
+        ema50 = compute_emas([b["close"] for b in bars_5m], self.p.ema_slow)[-1]
+        if close > orb_high and (ema9>ema20>ema50): return "long"
+        if close < orb_low  and (ema9<ema20<ema50): return "short"
+        return None
+
+Execution loop (in your scheduler):
+	•	Build 1-min and 5-min bars from your WS stream.
+	•	At 09:45 ET, set orb_high/low.
+	•	On every 5-min close ≥ 09:45, call confirm_breakout().
+	•	If a signal and spread ok, compute qty from risk and place a maker-first order (you already have this).
+	•	Maintain ORBState in DB; update stops and trailing on each 1-min bar; flat by 16:00 ET.
+
+Reuse your order, exposure, spread guard, idempotency, and telemetry modules.
+
+⸻
+
+Settings to put in your UI (with starting values) please set these also as defaults: 
+
+Group
+Setting
+Value
+ORB
+Mode
+ORB
+ORB
+Opening range minutes
+15
+ORB
+Confirmation minutes
+5
+ORB
+Min ORB % (range/price)
+0.20%
+ORB
+EMA fast/mid/slow
+9 / 20 / 50
+ORB
+Risk per trade
+0.50%
+ORB
+Buffer (of ORB range)
+10%
+ORB
+Max adds
+2
+ORB
+ATR trail ×
+2.0
+Execution
+Max spread (bps)
+8
+Execution
+Max exposure
+0.7–0.8
+Execution
+Min notional
+$10
+Safety
+Max price staleness
+120 s
+Safety
+Daily PnL limit
+−$5
+Safety
+Session close exit
+16:00 ET
+
+
+-----
+
+DevOps bits (keep it stable)
+	•	Timezones: store UTC; convert to America/New_York for session logic. Unit-test DST edge days.
+	•	State machine: PRE → ORB_BUILD → WAIT_CONFIRM → LONG/SHORT → EXIT → DONE. Persist daily.
+	•	Idempotency: one signal per day per side; tag orders with userref = f"orb-{date}-{side}".
+	•	Backtest first: run on 90 days of 1-min BTC/USD. Record win rate, avg R, max drawdown, equity vs HODL.
+	•	Telemetry: counters for orb_signals, orb_trades, skips{tight_orb,spread,ema_fail}, realized R per day.
+
+-----
+
+notes for not statrting again :
+
+Should you “start again”?
+
+No need to scrap the repo. Add ORB as a new strategy module and toggle it on. You’ll keep:
+	•	your Kraken adapter (maker-first + slippage-cap),
+	•	health/staleness checks,
+	•	PnL, exposure tiles,
+	•	settings UI,
+	•	logging & trade log.
+
+It will feel like a new, reliable bot because the decision logic is deterministic and session-bounded—much easier to test, monitor, and reason about than LLM/grid.

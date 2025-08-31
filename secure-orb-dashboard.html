@@ -1,0 +1,565 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Bitcoin ORB Bot — Secure Dashboard</title>
+  <link rel="icon"
+    href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='12' ry='12' fill='%23000000'/%3E%3Ccircle cx='32' cy='32' r='22' fill='%230D9488'/%3E%3Ctext x='32' y='38' font-family='Arial,Helvetica,sans-serif' font-size='22' text-anchor='middle' fill='white'%3E₿%3C/text%3E%3C/svg%3E" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      color-scheme: dark;
+    }
+
+    body {
+      font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, "Helvetica Neue", Arial, "Noto Sans", sans-serif;
+    }
+
+    .card {
+      @apply bg-neutral-900/60 backdrop-blur rounded-2xl border border-neutral-800 shadow-sm;
+    }
+
+    .chip {
+      @apply inline-flex items-center px-2.5 py-1 rounded-full text-xs font-medium;
+    }
+
+    .login-overlay {
+      position: fixed;
+      top: 0;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      background: rgba(0, 0, 0, 0.9);
+      z-index: 1000;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .login-form {
+      background: #1a1a1a;
+      border: 1px solid #333;
+      border-radius: 12px;
+      padding: 2rem;
+      width: 100%;
+      max-width: 400px;
+      margin: 1rem;
+    }
+  </style>
+</head>
+
+<body class="bg-neutral-950 text-neutral-100 min-h-screen">
+  <!-- Login Overlay -->
+  <div id="loginOverlay" class="login-overlay">
+    <div class="login-form">
+      <div class="text-center mb-6">
+        <h1 class="text-2xl font-bold mb-2">Bitcoin ORB Bot</h1>
+        <p class="text-neutral-400">Secure Trading Dashboard</p>
+      </div>
+      <form id="loginForm" class="space-y-4">
+        <div>
+          <label class="block text-sm font-medium mb-2">Username</label>
+          <input type="text" id="username" required
+            class="w-full px-3 py-2 bg-neutral-800 border border-neutral-700 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent">
+        </div>
+        <div>
+          <label class="block text-sm font-medium mb-2">Password</label>
+          <input type="password" id="password" required
+            class="w-full px-3 py-2 bg-neutral-800 border border-neutral-700 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent">
+        </div>
+        <button type="submit"
+          class="w-full py-2 px-4 bg-blue-600 hover:bg-blue-700 rounded-lg font-medium transition-colors">
+          Login
+        </button>
+      </form>
+      <div id="loginError" class="mt-4 p-3 bg-red-900/50 border border-red-700 rounded-lg text-red-300 text-sm hidden">
+      </div>
+    </div>
+  </div>
+
+  <!-- Main Dashboard (hidden until authenticated) -->
+  <div id="dashboard" class="hidden">
+    <div class="max-w-6xl mx-auto p-4 md:p-6 space-y-6">
+      <!-- Header -->
+      <header class="flex flex-col md:flex-row md:items-center md:justify-between gap-4">
+        <div>
+          <h1 class="text-2xl md:text-3xl font-semibold">Bitcoin ORB Bot</h1>
+          <p class="text-sm text-neutral-400">Secure dashboard for the Opening Range Breakout strategy</p>
+        </div>
+        <div class="flex flex-wrap items-center gap-2" id="headerChips">
+          <span id="modeChip" class="chip bg-emerald-500/15 text-emerald-300 border border-emerald-500/20">Mode:
+            ORB</span>
+          <span id="sessionChip" class="chip bg-neutral-800 text-neutral-300 border border-neutral-700">Session:
+            —</span>
+          <span id="priceChip" class="chip bg-neutral-800 text-neutral-300 border border-neutral-700">Price: —</span>
+          <button id="flatBtn"
+            class="chip bg-rose-500/15 text-rose-300 border border-rose-500/20 hover:bg-rose-500/25">Flat Now</button>
+          <button id="logoutBtn"
+            class="chip bg-neutral-700 text-neutral-300 border border-neutral-600 hover:bg-neutral-600">Logout</button>
+        </div>
+      </header>
+
+      <!-- KPI Grid -->
+      <section class="grid grid-cols-1 md:grid-cols-4 gap-4">
+        <div class="card p-4">
+          <p class="text-xs text-neutral-400">Equity</p>
+          <p id="equity" class="text-2xl font-semibold">$—</p>
+        </div>
+        <div class="card p-4">
+          <p class="text-xs text-neutral-400">Realized PnL</p>
+          <p id="realized" class="text-2xl font-semibold">$—</p>
+        </div>
+        <div class="card p-4">
+          <p class="text-xs text-neutral-400">Unrealized PnL</p>
+          <p id="unrealized" class="text-2xl font-semibold">$—</p>
+        </div>
+        <div class="card p-4">
+          <p class="text-xs text-neutral-400">Exposure</p>
+          <p id="exposure" class="text-2xl font-semibold">—%</p>
+        </div>
+      </section>
+
+      <!-- ORB Panel -->
+      <section class="card p-4">
+        <div class="flex items-center justify-between gap-2">
+          <h2 class="text-lg font-semibold">ORB Status</h2>
+          <span id="phaseChip" class="chip bg-neutral-800 text-neutral-300 border border-neutral-700">Phase: —</span>
+        </div>
+        <div class="grid grid-cols-2 md:grid-cols-6 gap-3 mt-4">
+          <div>
+            <p class="text-xs text-neutral-400">Opening Range High</p>
+            <p id="orbHigh" class="text-lg">—</p>
+          </div>
+          <div>
+            <p class="text-xs text-neutral-400">Opening Range Low</p>
+            <p id="orbLow" class="text-lg">—</p>
+          </div>
+          <div>
+            <p class="text-xs text-neutral-400">Range %</p>
+            <p id="orbPct" class="text-lg">—</p>
+          </div>
+          <div>
+            <p class="text-xs text-neutral-400">Position Qty</p>
+            <p id="qty" class="text-lg">—</p>
+          </div>
+          <div>
+            <p class="text-xs text-neutral-400">Avg Price</p>
+            <p id="avgPrice" class="text-lg">—</p>
+          </div>
+          <div>
+            <p class="text-xs text-neutral-400">Stop</p>
+            <p id="stop" class="text-lg">—</p>
+          </div>
+        </div>
+        <div class="mt-3 text-xs text-neutral-400" id="countdown">Next event: —</div>
+
+        <!-- Additional ORB Diagnostics -->
+        <div class="grid grid-cols-2 md:grid-cols-4 gap-3 mt-4 pt-4 border-t border-neutral-800">
+          <div>
+            <p class="text-xs text-neutral-400">Confirm Reason</p>
+            <p id="confirmReason" class="text-sm font-mono">—</p>
+          </div>
+          <div>
+            <p class="text-xs text-neutral-400">EMA9</p>
+            <p id="ema9" class="text-sm">—</p>
+          </div>
+          <div>
+            <p class="text-xs text-neutral-400">EMA20</p>
+            <p id="ema20" class="text-sm">—</p>
+          </div>
+          <div>
+            <p class="text-xs text-neutral-400">EMA50</p>
+            <p id="ema50" class="text-sm">—</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- Charts -->
+      <section class="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <div class="card p-4">
+          <div class="flex items-center justify-between">
+            <h3 class="font-medium">Equity (last 24h)</h3>
+            <span id="equityPts" class="text-xs text-neutral-500">— pts</span>
+          </div>
+          <canvas id="eqChart" class="mt-2 h-32"></canvas>
+          <div id="eqEmpty" class="text-xs text-neutral-500 mt-2">Collecting data…</div>
+        </div>
+        <div class="card p-4">
+          <div class="flex items-center justify-between">
+            <h3 class="font-medium">BTC Price (sparkline)</h3>
+            <span id="priceNow" class="text-xs text-neutral-500">—</span>
+          </div>
+          <canvas id="pxChart" class="mt-2 h-32"></canvas>
+        </div>
+      </section>
+
+      <!-- Trade Log (last 10) -->
+      <section class="card p-4">
+        <div class="flex items-center justify-between">
+          <h3 class="font-medium">Recent Trades</h3>
+          <button id="refreshBtn"
+            class="px-3 py-1.5 rounded-lg bg-neutral-800 hover:bg-neutral-700 text-sm">Refresh</button>
+        </div>
+        <div class="overflow-x-auto mt-3">
+          <table class="w-full text-sm">
+            <thead class="text-neutral-400">
+              <tr>
+                <th class="text-left py-2">Time</th>
+                <th class="text-left py-2">Side</th>
+                <th class="text-right py-2">Qty (BTC)</th>
+                <th class="text-right py-2">Price</th>
+                <th class="text-right py-2">PnL</th>
+                <th class="text-left py-2">Reason</th>
+              </tr>
+            </thead>
+            <tbody id="tradeBody"></tbody>
+          </table>
+          <div id="noTrades" class="text-xs text-neutral-500 mt-2">No trades yet.</div>
+        </div>
+      </section>
+
+      <footer class="text-xs text-neutral-500 py-6">© <span id="year"></span> ORB Bot — henryt-btc.live</footer>
+    </div>
+  </div>
+
+  <script>
+    // --- Authentication
+    let jwtToken = localStorage.getItem('jwt_token');
+    let isAuthenticated = false;
+
+    // --- config (using authenticated endpoints)
+    const EP = {
+      pnl: '/pnl_summary_public',
+      orb: '/orb/status',
+      price: '/diagnostics/price',
+      equity: '/equity_series_public?days=1',
+      trades: '/trade_log?limit=10'
+    };
+
+    // --- helpers
+    const fmt$ = v => (Number.isFinite(v) ? v.toLocaleString(undefined, { style: 'currency', currency: 'USD', maximumFractionDigits: 2 }) : '—');
+    const fmtPct = v => (Number.isFinite(v) ? (v * 100).toFixed(1) + '%' : '—');
+    const fnum = v => (Number.isFinite(v) ? v.toLocaleString(undefined, { maximumFractionDigits: 6 }) : '—');
+    const el = id => document.getElementById(id);
+
+    function nextFiveMinCountdown() {
+      const now = new Date();
+      const ms = 5 * 60 * 1000;
+      const next = new Date(Math.ceil(now.getTime() / ms) * ms);
+      const diff = (next - now) / 1000;
+      const mm = String(Math.floor(diff / 60)).padStart(2, '0');
+      const ss = String(Math.floor(diff % 60)).padStart(2, '0');
+      return `${mm}:${ss}`;
+    }
+
+    async function jget(url) {
+      const headers = {};
+      if (jwtToken) {
+        headers['Authorization'] = `Bearer ${jwtToken}`;
+      }
+      const r = await fetch(url, {
+        cache: 'no-store',
+        headers
+      });
+      if (!r.ok) throw new Error('' + r.status);
+      return r.json();
+    }
+
+    // --- Authentication functions
+    async function login() {
+      console.log('Login function called');
+      const username = el('username').value;
+      const password = el('password').value;
+
+      console.log('Username:', username);
+      console.log('Password length:', password.length);
+
+      try {
+        console.log('Making login request...');
+        const response = await fetch('/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: `username=${encodeURIComponent(username)}&password=${encodeURIComponent(password)}`
+        });
+
+        console.log('Response status:', response.status);
+
+        if (response.ok) {
+          const data = await response.json();
+          console.log('Login successful, token received');
+          jwtToken = data.access_token;
+          localStorage.setItem('jwt_token', jwtToken);
+          isAuthenticated = true;
+          showDashboard();
+        } else {
+          const errorData = await response.json();
+          console.log('Login failed:', errorData);
+          throw new Error('Login failed: ' + (errorData.detail || 'Unknown error'));
+        }
+      } catch (error) {
+        console.error('Login error:', error);
+        el('loginError').textContent = 'Login failed: ' + error.message;
+        el('loginError').classList.remove('hidden');
+      }
+    }
+
+    async function validateToken() {
+      if (!jwtToken || jwtToken.trim() === '') {
+        return false;
+      }
+
+      try {
+        const response = await fetch('/pnl_summary', {
+          headers: { 'Authorization': `Bearer ${jwtToken}` }
+        });
+        return response.ok;
+      } catch (error) {
+        console.log('Token validation failed:', error);
+        return false;
+      }
+    }
+
+    function logout() {
+      jwtToken = null;
+      localStorage.removeItem('jwt_token');
+      isAuthenticated = false;
+      showLogin();
+    }
+
+    function showDashboard() {
+      el('loginOverlay').classList.add('hidden');
+      el('dashboard').classList.remove('hidden');
+      loadAllData();
+    }
+
+    function showLogin() {
+      el('loginOverlay').classList.remove('hidden');
+      el('dashboard').classList.add('hidden');
+      el('loginError').classList.add('hidden');
+      el('username').value = '';
+      el('password').value = '';
+    }
+
+    // --- charts
+    let eqChart, pxChart;
+    function ensureCharts() {
+      if (!eqChart) {
+        eqChart = new Chart(document.getElementById('eqChart').getContext('2d'), {
+          type: 'line', data: { labels: [], datasets: [{ data: [], borderWidth: 1, tension: 0.2 }] },
+          options: { responsive: true, plugins: { legend: { display: false } }, scales: { x: { display: false }, y: { display: false } }, elements: { point: { radius: 0 } } }
+        });
+      }
+      if (!pxChart) {
+        pxChart = new Chart(document.getElementById('pxChart').getContext('2d'), {
+          type: 'line', data: { labels: [], datasets: [{ data: [], borderWidth: 1, tension: 0.2 }] },
+          options: { responsive: true, plugins: { legend: { display: false } }, scales: { x: { display: false }, y: { display: false } }, elements: { point: { radius: 0 } } }
+        });
+      }
+    }
+
+    async function loadKpis() {
+      try {
+        const s = await jget(EP.pnl);
+        el('equity').textContent = fmt$(s.equity);
+        el('realized').textContent = fmt$(s.realized_pnl ?? 0);
+        el('unrealized').textContent = fmt$(s.unrealized_pnl ?? 0);
+        el('exposure').textContent = (s.exposure_pct != null) ? (s.exposure_pct * 100).toFixed(1) + '%' : '—';
+      } catch (e) {/* noop */ }
+    }
+
+    async function loadOrb() {
+      try {
+        const s = await jget(EP.orb);
+        el('phaseChip').textContent = 'Phase: ' + (s.phase ?? '—');
+        el('orbHigh').textContent = s.orb_high ? fmt$(s.orb_high) : '—';
+        el('orbLow').textContent = s.orb_low ? fmt$(s.orb_low) : '—';
+        if (s.orb_high && s.orb_low) {
+          const pct = (s.orb_high - s.orb_low) / ((s.orb_high + s.orb_low) / 2);
+          el('orbPct').textContent = fmtPct(pct);
+        } else { el('orbPct').textContent = '—'; }
+        el('qty').textContent = s.qty != null ? fnum(s.qty) : '—';
+        el('avgPrice').textContent = s.avg_price ? fmt$(s.avg_price) : '—';
+        el('stop').textContent = s.stop ? fmt$(s.stop) : '—';
+
+        // Additional diagnostics
+        el('confirmReason').textContent = s.confirm_reason || '—';
+        el('ema9').textContent = s.ema9 ? fmt$(s.ema9) : '—';
+        el('ema20').textContent = s.ema20 ? fmt$(s.ema20) : '—';
+        el('ema50').textContent = s.ema50 ? fmt$(s.ema50) : '—';
+
+        // Color code confirm reason
+        const confirmEl = el('confirmReason');
+        if (s.confirm_reason) {
+          if (s.confirm_reason.includes('break_') && s.confirm_reason.includes('ema_ok')) {
+            confirmEl.className = 'text-sm font-mono text-emerald-400';
+          } else if (s.confirm_reason.includes('no_break')) {
+            confirmEl.className = 'text-sm font-mono text-amber-400';
+          } else if (s.confirm_reason.includes('ema_not_aligned')) {
+            confirmEl.className = 'text-sm font-mono text-rose-400';
+          } else {
+            confirmEl.className = 'text-sm font-mono text-neutral-400';
+          }
+        }
+
+        // session chip
+        const open = ['ORB_BUILD', 'WAIT_CONFIRM', 'LONG', 'SHORT', 'EXIT'].includes(s.phase);
+        el('sessionChip').textContent = open ? 'Session: OPEN' : 'Session: CLOSED';
+        el('sessionChip').className = 'chip ' + (open ? 'bg-emerald-500/15 text-emerald-300 border border-emerald-500/20' : 'bg-neutral-800 text-neutral-300 border border-neutral-700');
+
+        // countdown for next 5m close
+        el('countdown').textContent = 'Next 5‑min close in ' + nextFiveMinCountdown();
+      } catch (e) {/* noop */ }
+    }
+
+    async function loadPrice() {
+      try {
+        const s = await jget(EP.price);
+        el('priceChip').textContent = `Price: ${(s.age_sec != null) ? s.age_sec.toFixed(1) + 's' : '—'}`;
+      } catch (e) {/* noop */ }
+    }
+
+    async function loadEquitySeries() {
+      ensureCharts();
+      try {
+        const arr = await jget(EP.equity);
+        const pts = arr && arr.length ? arr : [];
+        if (pts.length) {
+          el('eqEmpty').style.display = 'none';
+          eqChart.data.labels = pts.map(p => p.ts);
+          eqChart.data.datasets[0].data = pts.map(p => p.equity);
+          eqChart.update();
+          el('equityPts').textContent = `${pts.length} pts`;
+        } else {
+          el('eqEmpty').style.display = 'block';
+        }
+      } catch (e) { el('eqEmpty').style.display = 'block'; }
+    }
+
+    async function loadPxSpark() {
+      ensureCharts();
+      try {
+        // lightweight: fall back to equity timestamps if no price series API
+        const pnl = await jget(EP.pnl);
+        const priceNow = pnl.last_price ?? pnl.price ?? null;
+        el('priceNow').textContent = priceNow ? fmt$(priceNow) : '—';
+        // keep last 60 points in a ring buffer using pnl_summary every 30s
+        const now = new Date().toISOString();
+        const ds = pxChart.data;
+        if (!ds.labels.length || (Date.now() - Date.parse(ds.labels.at(-1))) > 30000) {
+          ds.labels.push(now); ds.datasets[0].data.push(priceNow || null);
+          if (ds.labels.length > 120) { ds.labels.shift(); ds.datasets[0].data.shift(); }
+          pxChart.update();
+        }
+      } catch (e) {/* noop */ }
+    }
+
+    async function loadTrades() {
+      const body = el('tradeBody');
+      try {
+        const r = await fetch(EP.trades, { headers: jwtToken ? { 'Authorization': `Bearer ${jwtToken}` } : {} });
+        if (!r.ok) { body.innerHTML = ''; el('noTrades').style.display = 'block'; return; }
+        const rows = await r.json();
+        body.innerHTML = '';
+        if (rows && rows.length) {
+          el('noTrades').style.display = 'none';
+          rows.slice(0, 10).forEach(t => {
+            const tr = document.createElement('tr');
+            tr.innerHTML = `
+          <td class="py-1 pr-2">${t.ts ?? ''}</td>
+          <td class="py-1 pr-2">${(t.side || '').toUpperCase()}</td>
+          <td class="py-1 pr-2 text-right">${fnum(+t.qty || 0)}</td>
+          <td class="py-1 pr-2 text-right">${fmt$(+t.price || 0)}</td>
+          <td class="py-1 pr-2 text-right">${fmt$((+t.realized_pnl) || 0)}</td>
+          <td class="py-1 pr-2">${t.reason || ''}</td>`;
+            body.appendChild(tr);
+          });
+        } else {
+          el('noTrades').style.display = 'block';
+        }
+      } catch (e) { body.innerHTML = ''; el('noTrades').style.display = 'block'; }
+    }
+
+    function loadAllData() {
+      loadKpis(); loadOrb(); loadPrice(); loadEquitySeries(); loadPxSpark(); loadTrades();
+    }
+
+    // --- Initialize when DOM is ready
+    document.addEventListener('DOMContentLoaded', async function () {
+      console.log('DOM loaded, setting up event listeners');
+
+      // --- Event listeners
+      const loginForm = el('loginForm');
+      console.log('Login form element:', loginForm);
+
+      if (loginForm) {
+        loginForm.addEventListener('submit', async (e) => {
+          console.log('Form submit event triggered');
+          e.preventDefault();
+          await login();
+        });
+        console.log('Login form event listener attached');
+      } else {
+        console.error('Login form element not found!');
+      }
+
+      el('logoutBtn').addEventListener('click', logout);
+
+      el('refreshBtn').addEventListener('click', () => { loadKpis(); loadOrb(); loadTrades(); });
+
+      el('flatBtn').addEventListener('click', async () => {
+        try {
+          await fetch('/orb/control/flat_now', {
+            method: 'POST',
+            headers: { 'Authorization': `Bearer ${jwtToken}` }
+          });
+        } catch (e) { }
+        await loadKpis(); await loadOrb();
+      });
+
+      // --- Initialize
+      el('year').textContent = new Date().getFullYear();
+
+      // Check if already authenticated
+      if (jwtToken && jwtToken.trim() !== '') {
+        console.log('JWT token found, attempting to validate...');
+        const isValid = await validateToken();
+        if (isValid) {
+          console.log('Token is valid, showing dashboard');
+          isAuthenticated = true;
+          showDashboard();
+        } else {
+          console.log('Token is invalid, clearing and showing login');
+          jwtToken = null;
+          localStorage.removeItem('jwt_token');
+          showLogin();
+        }
+      } else {
+        console.log('No JWT token found, showing login form');
+        showLogin();
+      }
+
+      // Set up intervals only when authenticated
+      function startIntervals() {
+        if (isAuthenticated) {
+          setInterval(loadKpis, 15000);
+          setInterval(loadOrb, 15000);
+          setInterval(loadPrice, 15000);
+          setInterval(loadPxSpark, 30000);
+          setInterval(loadEquitySeries, 5 * 60 * 1000);
+          setInterval(loadTrades, 60 * 1000);
+        }
+      }
+
+      // Start intervals after a short delay
+      setTimeout(startIntervals, 1000);
+    });
+  </script>
+</body>
+
+</html>

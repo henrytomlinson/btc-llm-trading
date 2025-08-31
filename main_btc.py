@@ -91,8 +91,28 @@ MAX_PRICE_STALENESS_SEC = int(os.getenv("MAX_PRICE_STALENESS_SEC") or "120")
 # Rate limiting storage (in production, use Redis)
 request_counts = {}
 
+# Prometheus metrics
+try:
+    from prometheus_client import Counter, Gauge, Histogram, generate_latest, CONTENT_TYPE_LATEST
+    METRICS_ON = bool(os.getenv("METRICS_ENABLED", "true").lower() != "false")
+    orb_signals = Counter("orb_signals_total", "ORB signals", ["dir","reason"])
+    orb_trades = Counter("orb_trades_total", "Filled trades", ["dir","mode"])
+    orb_skips = Counter("orb_skips_total", "Skips", ["reason"])
+    spread_bps = Histogram("spread_bps", "Observed spread (bps)", buckets=[2,4,6,8,10,15,20])
+    equity_g = Gauge("equity_usd", "Equity USD")
+    exposure_g = Gauge("exposure_frac", "Exposure 0..1")
+except ImportError:
+    METRICS_ON = False
+    orb_signals = orb_trades = orb_skips = spread_bps = equity_g = exposure_g = None
+
 # Initialize FastAPI app
 app = FastAPI(title="Bitcoin LLM Trading System", version="1.0.0")
+
+# Trusted IPs that should bypass rate limiting (Docker network + internal services)
+SAFE_IPS = {"127.0.0.1", "172.18.0.1", "172.18.0.2", "172.18.0.3", "172.18.0.5"}
+
+def is_trusted_ip(ip: str) -> bool:
+    return ip in SAFE_IPS or ip.startswith("172.18.")
 
 # Security middleware
 @app.middleware("http")
@@ -105,7 +125,7 @@ async def security_middleware(request: Request, call_next):
         '/', '/favicon.ico',
         '/equity_series_public', '/btc_data_public',
         '/diagnostics/price', '/diagnostics/volatility', '/diagnostics/telemetry',
-        '/readyz', '/healthz'
+        '/readyz', '/healthz', '/metrics', '/health', '/auto_trade_cron'
     }
 
     # IP whitelist check
@@ -116,8 +136,8 @@ async def security_middleware(request: Request, call_next):
             content={"error": "IP not authorized"}
         )
     
-    # Skip rate limiting for safe paths and methods
-    if request.url.path in WHITELIST_PATHS or request.method in {"OPTIONS", "HEAD"}:
+    # Skip rate limiting for trusted IPs, safe paths and methods
+    if is_trusted_ip(client_ip) or request.url.path in WHITELIST_PATHS or request.method in {"OPTIONS", "HEAD"}:
         response = await call_next(request)
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["X-Frame-Options"] = "DENY"
@@ -125,7 +145,7 @@ async def security_middleware(request: Request, call_next):
         response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
         return response
 
-    # Rate limiting
+    # Rate limiting for external IPs
     current_time = time.time()
     
     # Clean old entries
@@ -287,40 +307,33 @@ class PnLSummary(BaseModel):
 
 # --- helper: compute PnL summary deterministically --------------------------
 async def _compute_pnl_summary() -> PnLSummary:
-    from decimal import Decimal
     from datetime import datetime, timezone
+    import logging
+    logger = logging.getLogger(__name__)
+    logger.info("PnL: Function called - starting")
 
-    EQ_STALE_SEC = 90  # ignore equity_curve rows older than this
+    def _safe_float(v, d=0.0):
+        try: 
+            return float(v)
+        except Exception: 
+            return d
 
-    # 1) Price snapshot + staleness
     try:
         # Get current price from market data
         market_data = get_btc_market_data()
-        if market_data and 'close' in market_data:
-            price = float(market_data['close'])
-            # Use current time as price timestamp (since we don't have exact timestamp)
-            price_ts = datetime.now(timezone.utc)
-        else:
-            # Fallback to a default price
-            price = 45000.0
-            price_ts = datetime.now(timezone.utc)
-    except Exception:
-        price = 45000.0
-        price_ts = datetime.now(timezone.utc)
-    
-    now = datetime.now(timezone.utc)
-    staleness = (now - price_ts).total_seconds()
-
-    # 2) Live balances (normalized)
-    balances = {}
-    btc_qty = 0.0
-    cash_usd = 0.0
-    try:
+        px = float(market_data.get('close', 45000.0)) if market_data else 45000.0
+        logger.info(f"PnL: Got price: {px}")
+        
+        # Get balances from trading bot
+        btc_qty = 0.0
+        cash_usd = 0.0
+        
         if trading_bot:
             account_info = trading_bot.get_account_info()
             if account_info and 'balances' in account_info:
                 raw_balances = account_info['balances']
-                # Normalize asset codes
+                # Normalize asset codes like the diagnostics endpoint
+                balances = {}
                 for k, v in raw_balances.items():
                     sym = _normalize_asset(k)
                     try:
@@ -329,81 +342,45 @@ async def _compute_pnl_summary() -> PnLSummary:
                         pass
                 
                 btc_qty = float(balances.get("BTC", 0.0))
-                # Prefer USD cash; fall back to ZUSD (already normalized) or 0
                 cash_usd = float(balances.get("USD", 0.0))
-    except Exception:
-        pass
-
-    # 3) Equity from live snapshot
-    equity_live = cash_usd + btc_qty * price
-
-    # 4) Optional: only override with DB equity if it's fresh and positive
-    equity = equity_live
-    avg_cost = 0.0
-    try:
-        if LEDGER_AVAILABLE:
-            rows = ledger_get_equity_curve(limit=1)
-            row = rows[0] if rows and len(rows) > 0 else {}
-            use_db_equity = False
-            if row and "timestamp" in row:
-                try:
-                    row_ts = datetime.fromisoformat(row["timestamp"].replace('Z', '+00:00'))
-                    if (now - row_ts).total_seconds() <= EQ_STALE_SEC and float(row.get("equity", 0)) > 0:
-                        use_db_equity = True
-                except (ValueError, TypeError):
-                    pass
-
-            if use_db_equity:
-                equity = float(row["equity"])
-                # avg_cost is not stored in equity_curve, so get it from positions
-                avg_cost = float(get_avg_cost_from_positions() or 0.0)
             else:
-                # Use live equity and try to get avg_cost from positions
-                avg_cost = float(get_avg_cost_from_positions() or 0.0)
-    except Exception:
-        pass
+                logger.warning("PnL: No balances in account_info")
+        else:
+            logger.warning("PnL: No trading bot available")
+        
+        # Calculate equity and exposure
+        equity = cash_usd + btc_qty * px
+        exposure_value = btc_qty * px
+        exposure_pct = 0.0 if equity <= 0 else exposure_value / equity
+        
+        logger.info(f"PnL: Calculated equity: {equity}, exposure: {exposure_value}")
+        
+        # Check price staleness
+        now = datetime.now(timezone.utc)
+        status = "ok"
+        msg = None
 
-    # 5) Unrealized PnL (only if we have avg_cost)
-    unrealized = (price - avg_cost) * btc_qty if (avg_cost and btc_qty) else 0.0
-
-    # 6) Realized PnL and fees from database
-    realized = 0.0
-    fees_cum = 0.0
-    try:
-        if LEDGER_AVAILABLE:
-            realized = float(get_realized_pnl_total() or 0.0)
-            fees_cum = float(get_fees_total() or 0.0)
-    except Exception:
-        pass
-
-    # 7) Exposure and benchmark
-    exposure_value = btc_qty * price
-    exposure_pct = (exposure_value / equity) if equity > 0 else 0.0
-    
-    hodl_value = 0.0
-    try:
-        if LEDGER_AVAILABLE:
-            hodl_value, _ = ledger_get_hodl_benchmark(price)
-    except Exception:
-        pass
-
-    status = "ok" if staleness <= MAX_PRICE_STALENESS_SEC else "degraded"
-    msg = None if status == "ok" else f"price stale: {int(staleness)}s"
-
-    return PnLSummary(
-        status=status,
-        message=msg,
-        last_price=price,
-        price_ts=price_ts.isoformat(),
-        equity=round(equity, 8),
-        realized_pnl=round(realized, 8),
-        unrealized_pnl=round(unrealized, 8),
-        fees_total=round(fees_cum, 8),
-        exposure_value=round(exposure_value, 8),
-        exposure_pct=round(exposure_pct, 6),
-        position_qty=round(btc_qty, 8),
-        hodl_value=round(hodl_value, 8),
-    )
+        result = PnLSummary(
+            status=status,
+            message=msg,
+            last_price=px,
+            price_ts=now.isoformat(),
+            equity=round(equity, 2),
+            realized_pnl=0.0,
+            unrealized_pnl=0.0,  # spot-only simple
+            fees_total=0.0,
+            exposure_value=round(exposure_value, 2),
+            exposure_pct=round(exposure_pct, 4),
+            position_qty=round(btc_qty, 8),
+            hodl_value=0.0,
+        )
+        
+        logger.info(f"PnL: Returning result with equity: {result.equity}")
+        return result
+        
+    except Exception as e:
+        logger.error(f"PnL: Error in function: {type(e).__name__}: {str(e)}")
+        raise
 
 def get_btc_news() -> str:
     """Get latest Bitcoin news from News API"""
@@ -1144,661 +1121,10 @@ async def equity_series_public(limit: int = 500):
         return {"equity_curve": [], "hodl_curve": [], "error": str(e)}
 
 @app.get("/", response_class=HTMLResponse)
-async def dashboard():
-    """Main Bitcoin trading dashboard"""
-    return """
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>Bitcoin LLM Trading System</title>
-        <style>
-            body { font-family: Arial, sans-serif; margin: 20px; background: #f5f5f5; }
-            .container { max-width: 1200px; margin: 0 auto; }
-            .header { background: #1a1a1a; color: white; padding: 20px; border-radius: 10px; margin-bottom: 20px; }
-            .grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 15px; }
-            .stat { background: #222; color: #fff; padding: 15px; border-radius: 8px; }
-            .trading-card { background: white; padding: 20px; border-radius: 10px; margin-bottom: 20px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
-            .btc-price { font-size: 2em; font-weight: bold; color: #f7931a; }
-            .signal-buy { color: #28a745; font-weight: bold; }
-            .signal-sell { color: #dc3545; font-weight: bold; }
-            .signal-hold { color: #6c757d; font-weight: bold; }
-            .news-section { background: #f8f9fa; padding: 15px; border-radius: 5px; margin: 10px 0; }
-            .trading-controls { display: flex; flex-wrap: wrap; gap: 10px; margin: 15px 0; }
-            .btn { padding: 10px 20px; border: none; border-radius: 5px; cursor: pointer; font-weight: bold; }
-            .btn-buy { background: #28a745; color: white; }
-            .btn-sell { background: #dc3545; color: white; }
-            .btn-hold { background: #6c757d; color: white; }
-            .status { padding: 10px; border-radius: 5px; margin: 10px 0; }
-            .status-success { background: #d4edda; color: #155724; }
-            .status-error { background: #f8d7da; color: #721c24; }
-            .trade-log { background: #f8f9fa; padding: 15px; border-radius: 5px; max-height: 300px; overflow-y: auto; }
-            .settings-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; align-items: center; }
-            .settings-grid label { font-size: 12px; color: #333; }
-            .toggle-row { display: flex; align-items: center; gap: 8px; }
-            .chart-canvas { width: 100%; height: 240px; display: block; background: #fff; border: 1px solid #eee; border-radius: 6px; }
-        </style>
-        <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-
-    </head>
-    <body>
-        <div class="container">
-            <div class="header">
-                <h1>🚀 Bitcoin LLM Trading System</h1>
-                <p>Automated Bitcoin trading with compact LLM analysis</p>
-                <div class="grid" id="equity-stats">
-                    <div class="stat"><div>Equity</div><div id="stat-equity">$0</div></div>
-                    <div class="stat"><div>Realized PnL</div><div id="stat-realized">$0</div></div>
-                    <div class="stat"><div>Unrealized PnL</div><div id="stat-unrealized">$0</div></div>
-                    <div class="stat"><div>Exposure</div><div id="stat-exposure">0%</div></div>
-                </div>
-                <div class="position-info" style="margin-top: 10px; font-size: 14px; color: #ccc;">
-                    <div id="position-line">Position: 0.00000000 BTC @ $0.00</div>
-                    <div id="exposure-line">Exposure: $0.00 (0.0%)</div>
-                    <div id="last-update" style="font-size: 12px; color: #999;">Last update: --:--:-- UTC</div>
-                </div>
-                <div id="auth-status" style="margin-top: 10px;">
-                    <span id="login-status">Not logged in</span>
-                    <button id="login-btn" onclick="showLoginForm()" style="margin-left: 10px; padding: 5px 10px; background: #28a745; color: white; border: none; border-radius: 3px; cursor: pointer;">Login</button>
-                    <button id="logout-btn" onclick="logout()" style="margin-left: 10px; padding: 5px 10px; background: #dc3545; color: white; border: none; border-radius: 3px; cursor: pointer; display: none;">Logout</button>
-                </div>
-                <div id="login-form" style="display: none; margin-top: 10px; background: rgba(255,255,255,0.1); padding: 10px; border-radius: 5px;">
-                    <p style="margin: 0 0 10px 0; color: #fff; font-size: 12px;">Enter your credentials:</p>
-                    <input type="text" id="login-username" placeholder="Username" style="margin-right: 10px; padding: 5px;">
-                    <input type="password" id="login-password" placeholder="Password" style="margin-right: 10px; padding: 5px;">
-                    <button onclick="login()" style="padding: 5px 10px; background: #007bff; color: white; border: none; border-radius: 3px; cursor: pointer;">Login</button>
-                    <button onclick="hideLoginForm()" style="padding: 5px 10px; background: #6c757d; color: white; border: none; border-radius: 3px; cursor: pointer;">Cancel</button>
-                </div>
-            </div>
-            
-            <div class="trading-card">
-                <h2>📊 Equity & Benchmark</h2>
-                <canvas id="equitySpark" height="100"></canvas>
-                <canvas id="hodlSpark" height="60" style="margin-top:8px"></canvas>
-                <div id="equity-empty" style="display:none;color:#888;font-size:12px">Collecting data…</div>
-            </div>
-
-            <div class="trading-card">
-                <h3>⚙️ Settings</h3>
-                <div class="settings-grid">
-                    <div class="toggle-row">
-                        <input type="checkbox" id="auto-toggle">
-                        <label for="auto-toggle">Auto-trade enabled</label>
-                    </div>
-                    <div>
-                        <label>Max Exposure</label>
-                        <input type="number" id="max-exposure" min="0" max="1" step="0.05" value="0.8">
-                    </div>
-                    <div>
-                        <label>Cooldown (hours)</label>
-                        <input type="number" id="cooldown" min="0" step="1" value="3">
-                    </div>
-                    <div>
-                        <label>LLM Min Confidence</label>
-                        <input type="number" id="min-confidence" min="0" max="1" step="0.05" value="0.7">
-                    </div>
-                    <div>
-                        <label>Min Trade Delta (%)</label>
-                        <input type="number" id="min-trade-delta" min="0" max="50" step="1" value="5">
-                    </div>
-                    <div>
-                        <label>Min Trade Delta ($)</label>
-                        <input type="number" id="min-trade-delta-usd" min="10" max="1000" step="5" value="30">
-                    </div>
-                    <div>
-                        <button class="btn btn-buy" onclick="saveSettings()">Save Settings</button>
-                    </div>
-                </div>
-                
-                <h4>🛡️ Safety Settings</h4>
-                <div class="settings-grid">
-                    <div class="toggle-row">
-                        <input type="checkbox" id="safety-skip-degraded" checked>
-                        <label for="safety-skip-degraded">Skip trades if data degraded</label>
-                    </div>
-                    <div>
-                        <label>Max Price Staleness (sec)</label>
-                        <input type="number" id="safety-max-staleness" min="30" max="600" step="30" value="120">
-                    </div>
-                    <div>
-                        <label>Min Expected Move (%)</label>
-                        <input type="number" id="safety-min-move" min="0.01" max="10" step="0.01" value="0.1">
-                    </div>
-                    <div>
-                        <label>Daily PnL Limit ($)</label>
-                        <input type="number" id="safety-daily-pnl" min="-100" max="0" step="1" value="-5">
-                    </div>
-                    <div>
-                        <label>Daily Equity Drop Limit (%)</label>
-                        <input type="number" id="safety-daily-equity" min="1" max="20" step="1" value="3">
-                    </div>
-                </div>
-            </div>
-            
-            <div class="trading-card">
-                <h2>📊 Bitcoin Trading Dashboard</h2>
-                <div id="btc-data">
-                    <div class="btc-price" id="btc-price">Loading...</div>
-                    <div id="btc-info">Loading market data...</div>
-                </div>
-                <div class="news-section">
-                    <h3>📰 Latest Bitcoin News</h3>
-                    <div id="btc-news">Loading news...</div>
-                </div>
-                <div class="trading-controls">
-                    <input type="number" id="trade-amount" placeholder="Amount ($)" value="100" min="10" step="10">
-                    <button class="btn btn-buy" onclick="buyBTC()">Buy BTC</button>
-                    <button class="btn btn-sell" onclick="sellBTC()">Sell BTC</button>
-                    <button class="btn btn-hold" onclick="loadBTCData()">Refresh</button>
-                    <button class="btn btn-buy" onclick="autoTrade()" style="background: #17a2b8;">🤖 Auto Trade</button>
-                </div>
-                <div id="trading-status"></div>
-            </div>
-            
-            <div class="trading-card">
-                <h3>💹 PnL Summary</h3>
-                <div id="pnl">Login to view PnL</div>
-            </div>
-            
-            <div class="trading-card">
-                <h3>📋 Trade Log</h3>
-                <div class="trade-log" id="trade-log">No trades yet...</div>
-            </div>
-        </div>
-        
-        <script>
-            // Format helpers for consistent display
-            const fmtCurrency = new Intl.NumberFormat('en-US', {style:'currency', currency: 'USD', maximumFractionDigits:2});
-            const fmt$ = (x)=> fmtCurrency.format(Number(x)||0);
-            const fmtPercent = (x) => `${(x*100).toFixed(1)}%`;
-            const n = (v, d=0) => Number.isFinite(v) ? v : d;
-            
-            // Global state
-            let jwtToken = localStorage.getItem('jwt_token');
-            let equityChart, pnlChart;
-
-            // Fallback simple canvas line/bar drawing if Chart.js not present
-            function drawLineFallback(canvasId, values, color){
-                const canvas = document.getElementById(canvasId);
-                if (!canvas || !canvas.getContext) return;
-                const ctx = canvas.getContext('2d');
-                const w = canvas.width = canvas.clientWidth || 800;
-                const h = canvas.height = canvas.clientHeight || 200;
-                ctx.clearRect(0,0,w,h);
-                if (!values || values.length === 0) return;
-                const minV = Math.min(...values);
-                const maxV = Math.max(...values);
-                const pad = 10;
-                const scale = (v)=>{
-                    if (maxV===minV) return h/2;
-                    return h - pad - ( (v-minV) / (maxV-minV) ) * (h-2*pad);
-                };
-                const step = (w-2*pad)/Math.max(values.length-1,1);
-                ctx.strokeStyle = color || '#17a2b8';
-                ctx.lineWidth = 2;
-                ctx.beginPath();
-                ctx.moveTo(pad, scale(values[0]));
-                for (let i=1;i<values.length;i++) ctx.lineTo(pad+i*step, scale(values[i]));
-                ctx.stroke();
-            }
-            function drawBarFallback(canvasId, values, color){
-                const canvas = document.getElementById(canvasId);
-                if (!canvas) return;
-                const ctx = canvas.getContext('2d');
-                canvas.width = canvas.offsetWidth;
-                canvas.height = canvas.offsetHeight;
-                ctx.clearRect(0, 0, canvas.width, canvas.height);
-                if (!values || values.length === 0) return;
-                
-                const max = Math.max(...values.map(Math.abs));
-                const barWidth = canvas.width / values.length;
-                const scale = (canvas.height * 0.8) / max;
-                
-                values.forEach((value, i) => {
-                    const height = Math.abs(value) * scale;
-                    const y = value >= 0 ? canvas.height/2 - height : canvas.height/2;
-                    ctx.fillStyle = color;
-                    ctx.fillRect(i * barWidth, y, barWidth * 0.8, height);
-                });
-            }
-            
-            function drawBarFallbackColored(canvasId, values){
-                const canvas = document.getElementById(canvasId);
-                if (!canvas) return;
-                const ctx = canvas.getContext('2d');
-                canvas.width = canvas.offsetWidth;
-                canvas.height = canvas.offsetHeight;
-                ctx.clearRect(0, 0, canvas.width, canvas.height);
-                if (!values || values.length === 0) return;
-                
-                const max = Math.max(...values.map(Math.abs));
-                const barWidth = canvas.width / values.length;
-                const scale = (canvas.height * 0.8) / max;
-                
-                values.forEach((value, i) => {
-                    const height = Math.abs(value) * scale;
-                    const y = value >= 0 ? canvas.height/2 - height : canvas.height/2;
-                    // Color coding: green for positive, red for negative
-                    ctx.fillStyle = value >= 0 ? '#28a745' : '#dc3545';
-                    ctx.fillRect(i * barWidth, y, barWidth * 0.8, height);
-                });
-            }
-
-            function setAuthUi(loggedIn, username){
-                const loginBtn = document.getElementById('login-btn');
-                const logoutBtn = document.getElementById('logout-btn');
-                const statusEl = document.getElementById('login-status');
-                const formEl = document.getElementById('login-form');
-                if (loggedIn){
-                    statusEl.textContent = 'Logged in' + (username? (' as ' + username) : '');
-                    loginBtn.style.display = 'none';
-                    logoutBtn.style.display = 'inline-block';
-                    if (formEl) formEl.style.display = 'none';
-                    } else {
-                    statusEl.textContent = 'Not logged in';
-                    loginBtn.style.display = 'inline-block';
-                    logoutBtn.style.display = 'none';
-                }
-            }
-
-            async function loadPnlHeader() {
-                if (!jwtToken) return;
-                try {
-                    const res = await fetch('/pnl_summary?token=' + encodeURIComponent(jwtToken));
-                    if (!res.ok) return;
-                    const d = await res.json();
-                    
-                    // Check status and show staleness
-                    const isOk = d.status === "ok";
-                    if (!isOk) {
-                        showBadge(`Data: ${d.message || 'offline'}`);
-                        disableTradingButtons();
-                } else {
-                        hideBadge();
-                        enableTradingButtons();
-                    }
-                    
-                    // Show last update time
-                    if (d.price_ts) {
-                        const updateTime = new Date(d.price_ts).toLocaleTimeString('en-US', {timeZone: 'UTC', hour12: false});
-                        document.getElementById('last-update').textContent = `Last update: ${updateTime} UTC`;
-                    }
-                    
-                    // Update header tiles with safety checks
-                    document.getElementById('stat-equity').textContent = fmt$(n(d.equity));
-                    document.getElementById('stat-realized').textContent = fmt$(n(d.realized_pnl));
-                    document.getElementById('stat-unrealized').textContent = fmt$(n(d.unrealized_pnl));
-                    document.getElementById('stat-exposure').textContent = fmtPercent(n(d.exposure_pct));
-                    
-                    // Add color coding for PnL
-                    const realizedEl = document.getElementById('stat-realized');
-                    const unrealizedEl = document.getElementById('stat-unrealized');
-                    realizedEl.style.color = n(d.realized_pnl) > 0 ? '#28a745' : n(d.realized_pnl) < 0 ? '#dc3545' : '#ccc';
-                    unrealizedEl.style.color = n(d.unrealized_pnl) > 0 ? '#28a745' : n(d.unrealized_pnl) < 0 ? '#dc3545' : '#ccc';
-                    
-                    // Update position and exposure lines with mobile-friendly formatting
-                    const btcDisplay = n(d.position_qty).toFixed(6); // Truncate for mobile
-                    document.getElementById('position-line').textContent = `${btcDisplay} BTC @ ${fmt$(n(d.last_price))}`;
-                    document.getElementById('exposure-line').textContent = `${fmt$(n(d.exposure_value))} (${fmtPercent(n(d.exposure_pct))})`;
-                } catch (e) {
-                    console.error('loadPnlHeader error:', e);
-                    showBadge('Data: error');
-                    disableTradingButtons();
-                }
-            }
-
-            async function loadSettings() {
-                if (!jwtToken) return;
-                const res = await fetch('/settings?token=' + encodeURIComponent(jwtToken));
-                if (!res.ok) return;
-                const s = await res.json();
-                document.getElementById('auto-toggle').checked = !!s.auto_trade_enabled;
-                document.getElementById('max-exposure').value = s.max_exposure;
-                document.getElementById('cooldown').value = s.trade_cooldown_hours || s.cooldown_hours || s.trade_cooldown || '';
-                document.getElementById('min-confidence').value = s.min_confidence;
-                document.getElementById('min-trade-delta').value = s.min_trade_delta || 5;
-                document.getElementById('min-trade-delta-usd').value = s.min_trade_delta_usd || 30;
-                document.getElementById('safety-skip-degraded').checked = !!s.safety_skip_degraded;
-                document.getElementById('safety-max-staleness').value = s.safety_max_price_staleness_sec || 120;
-                document.getElementById('safety-min-move').value = s.safety_min_expected_move_pct || 0.02;
-                document.getElementById('safety-daily-pnl').value = s.safety_daily_pnl_limit_usd || -5;
-                document.getElementById('safety-daily-equity').value = s.safety_daily_equity_drop_pct || 3;
-            }
-
-            async function saveSettings() {
-                if (!jwtToken) { alert('Login required'); return; }
-                const form = new FormData();
-                form.append('token', jwtToken);
-                form.append('auto_trade_enabled', document.getElementById('auto-toggle').checked);
-                form.append('max_exposure', document.getElementById('max-exposure').value);
-                form.append('trade_cooldown_hours', document.getElementById('cooldown').value);
-                form.append('min_confidence', document.getElementById('min-confidence').value);
-                form.append('min_trade_delta', document.getElementById('min-trade-delta').value);
-                form.append('min_trade_delta_usd', document.getElementById('min-trade-delta-usd').value);
-                form.append('safety_skip_degraded', document.getElementById('safety-skip-degraded').checked);
-                form.append('safety_max_price_staleness_sec', document.getElementById('safety-max-staleness').value);
-                form.append('safety_min_expected_move_pct', document.getElementById('safety-min-move').value);
-                form.append('safety_daily_pnl_limit_usd', document.getElementById('safety-daily-pnl').value);
-                form.append('safety_daily_equity_drop_pct', document.getElementById('safety-daily-equity').value);
-                const res = await fetch('/settings', { method: 'POST', body: form });
-                if (res.ok) { alert('Settings saved'); } else { alert('Failed to save settings'); }
-            }
-
-            async function loadEquityCharts() {
-                // Try authed first, then fallback to public
-                let js = null;
-                if (jwtToken){
-                    try { const res = await fetch('/equity_series?token=' + encodeURIComponent(jwtToken)); if (res.ok) js = await res.json(); } catch(_e){}
-                }
-                if (!js){
-                    try { const res2 = await fetch('/equity_series_public'); if (res2.ok) js = await res2.json(); } catch(_e){}
-                }
-                if (!js) return;
-                const equity = (js.equity_curve||js.data||[]).map(p => p.equity ?? p[1]).filter(v => Number.isFinite(v));
-                // Force fallback renderer to avoid any CDN/compat issues
-                drawLineFallback('equityChart', equity, '#17a2b8');
-                const pnl = []; for (let i=1;i<equity.length;i++){ pnl.push(equity[i]-equity[i-1]); }
-                // Use color coding for PnL bars: green for positive, red for negative
-                drawBarFallbackColored('pnlChart', pnl);
-            }
-
-            async function loadPnl() {
-                const container = document.getElementById('pnl');
-                if (!jwtToken) { container.textContent = 'Login to view PnL'; return; }
-                try {
-                    const res = await fetch('/pnl_summary?token=' + encodeURIComponent(jwtToken));
-                    if (!res.ok) { container.textContent = 'PnL unavailable'; return; }
-                    const d = await res.json();
-                    if (!d || typeof d !== 'object') { container.textContent = 'PnL unavailable'; return; }
-                    
-                    // Show status badge if degraded
-                    if (d.status === 'degraded') {
-                        showBadge(`PnL: ${d.message || 'degraded'}`);
-                    } else {
-                        hideBadge();
-                    }
-                    
-                    container.innerHTML = `
-                        <p><strong>Equity:</strong> ${fmt$(n(d.equity))}</p>
-                        <p><strong>Realized PnL:</strong> ${fmt$(n(d.realized_pnl))}</p>
-                        <p><strong>Unrealized PnL:</strong> ${fmt$(n(d.unrealized_pnl))}</p>
-                        <p><strong>Total Fees:</strong> ${fmt$(n(d.fees_total))}</p>
-                        <p><strong>Exposure:</strong> ${fmt$(n(d.exposure_value))} (${fmtPercent(n(d.exposure_pct))})</p>
-                        <p><strong>HODL Value:</strong> ${fmt$(n(d.hodl_value))}</p>
-                        <p><strong>Position:</strong> ${n(d.position_qty).toFixed(6)} BTC @ ${fmt$(n(d.last_price))}</p>
-                    `;
-                } catch (e) {
-                    container.textContent = 'Error loading PnL';
-                }
-            }
-
-            async function buyBTC(){
-                const status = document.getElementById('trading-status');
-                try{
-                    if (!jwtToken){ alert('Login required'); return; }
-                    const amt = parseFloat(document.getElementById('trade-amount').value||'0');
-                    const form = new FormData(); form.append('token', jwtToken); form.append('amount', amt);
-                    const res = await fetch('/buy_btc', {method:'POST', body:form});
-                    const j = await res.json();
-                    status.textContent = (j && j.message) ? j.message : 'Buy executed';
-                    await refreshAll();
-                }catch(e){ status.textContent = 'Buy failed'; }
-            }
-
-            async function sellBTC(){
-                const status = document.getElementById('trading-status');
-                try{
-                    if (!jwtToken){ alert('Login required'); return; }
-                    const amt = parseFloat(document.getElementById('trade-amount').value||'0');
-                    const form = new FormData(); form.append('token', jwtToken); form.append('amount', amt);
-                    const res = await fetch('/sell_btc', {method:'POST', body:form});
-                    const j = await res.json();
-                    status.textContent = (j && j.message) ? j.message : 'Sell executed';
-                    await refreshAll();
-                }catch(e){ status.textContent = 'Sell failed'; }
-            }
-
-            async function autoTrade(){
-                const status = document.getElementById('trading-status');
-                try{
-                    if (!jwtToken){ alert('Login required'); return; }
-                    const form = new FormData(); form.append('token', jwtToken);
-                    const res = await fetch('/auto_trade_scheduled', {method:'POST', body:form});
-                    const j = await res.json();
-                    status.textContent = (j && (j.message||j.status)) ? (j.message||j.status) : 'Auto-trade triggered';
-                    await refreshAll();
-                }catch(e){ status.textContent = 'Auto-trade failed'; }
-            }
-
-            async function loginUser(username, password) {
-                try {
-                    const formData = new FormData();
-                    formData.append('username', username);
-                    formData.append('password', password);
-                    const response = await fetch('/auth/login', { method: 'POST', body: formData });
-                    if (response.ok) {
-                        const data = await response.json();
-                        jwtToken = data.session_token;
-                        localStorage.setItem('jwt_token', jwtToken);
-                        setAuthUi(true, username);
-                        try { const f=new FormData(); f.append('token', jwtToken); await fetch('/snapshot_equity', {method:'POST', body:f}); } catch(_e){}
-                        await loadSettings();
-                        await refreshAll();
-                        return true;
-                    } else { return false; }
-                } catch (error) { console.error('Login error:', error); return false; }
-            }
-
-            function showLoginForm(){ document.getElementById('login-form').style.display='block'; document.getElementById('login-btn').style.display='none'; }
-            function hideLoginForm(){ document.getElementById('login-form').style.display='none'; document.getElementById('login-btn').style.display='inline-block'; }
-            async function login(){ const u=document.getElementById('login-username').value; const p=document.getElementById('login-password').value; if (await loginUser(u,p)){ /* UI already updated */ } else { alert('Login failed.'); } }
-            function logout(){ jwtToken=null; localStorage.removeItem('jwt_token'); setAuthUi(false); }
-
-            // Badge system for status indicators
-            function showBadge(text) {
-                let badge = document.getElementById('status-badge');
-                if (!badge) {
-                    badge = document.createElement('div');
-                    badge.id = 'status-badge';
-                    badge.style.cssText = 'position:fixed;top:10px;right:10px;background:#ff6b6b;color:white;padding:8px 12px;border-radius:4px;font-size:12px;z-index:1000;box-shadow:0 2px 4px rgba(0,0,0,0.2);';
-                    document.body.appendChild(badge);
-                }
-                badge.textContent = text;
-                badge.style.display = 'block';
-            }
-            
-            function hideBadge() {
-                const badge = document.getElementById('status-badge');
-                if (badge) badge.style.display = 'none';
-            }
-            
-                        // Render ticker with price data
-            function renderTicker(data) {
-                try {
-                    if (data && data.price) {
-                        document.getElementById('btc-price').innerHTML = '$' + data.price.toString();
-                        if (data.change_24h !== null) {
-                            const changeClass = data.change_24h >= 0 ? 'signal-buy' : 'signal-sell';
-                            const changeSign = data.change_24h > 0 ? '+' : '';
-                            document.getElementById('btc-info').innerHTML = `<p><strong>24h Change:</strong> <span class="${changeClass}">${changeSign}${data.change_24h.toFixed(2)}%</span></p>`;
-                            if (data.volume_24h !== null) {
-                                document.getElementById('btc-info').innerHTML += `<p><strong>Volume:</strong> $${data.volume_24h.toString()}</p>`;
-                            }
-                            if (data.last_update) {
-                                document.getElementById('btc-info').innerHTML += `<p><strong>Last Update:</strong> ${data.last_update}</p>`;
-                            }
-                        }
-                    } else {
-                        document.getElementById('btc-price').innerHTML = 'Data unavailable';
-                        document.getElementById('btc-info').innerHTML = '<p>Unable to fetch market data</p>';
-                    }
-                    document.getElementById('btc-news').innerHTML = 'Real-time Bitcoin data';
-                } catch (e) {
-                    document.getElementById('btc-price').innerHTML = 'Data unavailable';
-                    document.getElementById('btc-info').innerHTML = '<p>Error rendering data</p>';
-                }
-            }
-            
-                        // Improved public data loading with graceful degradation
-            async function loadPublicData() {
-                try {
-                    const r = await fetch("/btc_data_public", {cache: "no-store"});
-                    const j = await r.json();
-                    renderTicker(j); // show price even in 'degraded'
-                    if (j.status !== "ok") {
-                        showBadge("Data: degraded");
-                    } else {
-                        hideBadge();
-                    }
-                } catch(err) {
-                    showBadge("Data: offline");
-                    document.getElementById('btc-price').innerHTML = 'Data unavailable';
-                    document.getElementById('btc-info').innerHTML = '<p>Unable to fetch market data</p>';
-                }
-            }
-            
-            // Legacy function for backward compatibility
-            function loadBTCData() {
-                loadPublicData();
-            }
-            
-            async function refreshAll(){ await loadPnlHeader(); await loadPnl(); await loadEquityCharts(); }
-
-            // New refreshSummary function for comprehensive PnL updates
-            async function refreshSummary(){
-                if (!jwtToken) return;
-                try {
-                    const r = await fetch("/pnl_summary?token=" + encodeURIComponent(jwtToken), { cache: "no-store" });
-                    const s = await r.json();
-
-                    // Check status and show staleness
-                    const isOk = s.status === "ok";
-                    if (!isOk) {
-                        showBadge(`Data: ${s.message || 'offline'}`);
-                        disableTradingButtons();
-                    } else {
-                        hideBadge();
-                        enableTradingButtons();
-                    }
-
-                    // Show last update time
-                    if (s.price_ts) {
-                        const updateTime = new Date(s.price_ts).toLocaleTimeString('en-US', {timeZone: 'UTC', hour12: false});
-                        document.getElementById('last-update').textContent = `Last update: ${updateTime} UTC`;
-                    }
-
-                    // Header tiles with safety checks
-                    document.getElementById('stat-equity').textContent = fmt$(n(s.equity));
-                    document.getElementById('stat-realized').textContent = fmt$(n(s.realized_pnl));
-                    document.getElementById('stat-unrealized').textContent = fmt$(n(s.unrealized_pnl));
-                    document.getElementById('stat-exposure').textContent = fmtPercent(n(s.exposure_pct));
-                    
-                    // Add color coding for PnL
-                    const realizedEl = document.getElementById('stat-realized');
-                    const unrealizedEl = document.getElementById('stat-unrealized');
-                    realizedEl.style.color = n(s.realized_pnl) > 0 ? '#28a745' : n(s.realized_pnl) < 0 ? '#dc3545' : '#ccc';
-                    unrealizedEl.style.color = n(s.unrealized_pnl) > 0 ? '#28a745' : n(s.unrealized_pnl) < 0 ? '#dc3545' : '#ccc';
-                    
-                    // Update position and exposure lines with mobile-friendly formatting
-                    const btcDisplay = n(s.position_qty).toFixed(6); // Truncate for mobile
-                    document.getElementById('position-line').textContent = `${btcDisplay} BTC @ ${fmt$(n(s.last_price))}`;
-                    document.getElementById('exposure-line').textContent = `${fmt$(n(s.exposure_value))} (${fmtPercent(n(s.exposure_pct))})`;
-                } catch (e) {
-                    console.error('refreshSummary error:', e);
-                    showBadge('Data: error');
-                    disableTradingButtons();
-                }
-            }
-            // Set up refresh intervals
-            setInterval(refreshSummary, 30000);  // Refresh PnL every 30 seconds
-            setInterval(refreshAll, 60000);      // Full refresh every 60 seconds
-            
-            window.addEventListener('load', ()=>{ 
-                if (jwtToken){ 
-                    setAuthUi(true); 
-                    loadSettings(); 
-                } else {
-                    setAuthUi(false); 
-                } 
-                refreshSummary();  // Initial PnL refresh
-                refreshAll();      // Full initial load
-                loadBTCData();
-            });
-
-            // Helper functions for trading button control
-            function disableTradingButtons() {
-                const buttons = document.querySelectorAll('.btn-buy, .btn-sell, .btn-auto');
-                buttons.forEach(btn => {
-                    btn.disabled = true;
-                    btn.style.opacity = '0.5';
-                    btn.style.cursor = 'not-allowed';
-                });
-            }
-            
-            function enableTradingButtons() {
-                const buttons = document.querySelectorAll('.btn-buy, .btn-sell, .btn-auto');
-                buttons.forEach(btn => {
-                    btn.disabled = false;
-                    btn.style.opacity = '1';
-                    btn.style.cursor = 'pointer';
-                });
-            }
-            
-            // Badge functions
-            
-            // Equity Sparkline Charts
-            const eq = {ts:[], equity:[], hodl:[]};
-
-            // tiny helpers
-            const nowIso = () => new Date().toISOString();
-
-            // init charts
-            const ctx1 = document.getElementById('equitySpark').getContext('2d');
-            const ctx2 = document.getElementById('hodlSpark').getContext('2d');
-            const lineCfg = (label,data) => ({
-              type:'line',
-              data:{ labels:eq.ts, datasets:[{ label, data, fill:false, tension:0.2 }]},
-              options:{ animation:false, plugins:{legend:{display:false}}, scales:{x:{display:false},y:{display:false}}}
-            });
-            const eqChart  = new Chart(ctx1, lineCfg('Equity', eq.equity));
-            const hodlChart= new Chart(ctx2, lineCfg('HODL',  eq.hodl));
-
-            async function poll() {
-              try {
-                // Prefer authed summary; fallback to public equity series
-                const url = (typeof jwtToken !== 'undefined' && jwtToken)
-                  ? ('/pnl_summary?token=' + encodeURIComponent(jwtToken))
-                  : '/equity_series_public';
-                const r = await fetch(url, {cache:'no-store'});
-                const s = await r.json();
-                let equityVal, hodlVal;
-                if (s && typeof s === 'object' && 'equity' in s) {
-                  equityVal = Number(s.equity);
-                  hodlVal = Number(s.hodl_value || s.equity);
-                } else if (s && s.equity_curve && s.equity_curve.length) {
-                  const last = s.equity_curve.at(-1);
-                  equityVal = Number(last.equity ?? last[1]);
-                  const lastH = (s.hodl_curve && s.hodl_curve.length) ? s.hodl_curve.at(-1) : last;
-                  hodlVal = Number((lastH && (lastH.equity ?? lastH[1])) || equityVal);
-                }
-                if (!Number.isFinite(equityVal)) throw new Error('no equity');
-                // keep last 288 points (~24h @ 5min); we sample every 30s -> downsample to 5min
-                const ts = nowIso();
-                if (eq.ts.length === 0 || (Date.now() - Date.parse(eq.ts.at(-1))) > 5*60*1000) {
-                  eq.ts.push(ts); eq.equity.push(equityVal); eq.hodl.push(hodlVal || equityVal);
-                  if (eq.ts.length > 288) { eq.ts.shift(); eq.equity.shift(); eq.hodl.shift(); }
-                  eqChart.update(); hodlChart.update();
-                  document.getElementById('equity-empty').style.display = 'none';
-                }
-              } catch(e) {
-                if (eq.ts.length === 0) document.getElementById('equity-empty').style.display = 'block';
-              }
-            }
-            setInterval(poll, 30000);
-            poll();
-        </script>
-    </body>
-    </html>
-    """
+async def homepage():
+    """Secure ORB Dashboard - Main homepage"""
+    with open('secure-orb-dashboard.html', 'r') as f:
+        return HTMLResponse(content=f.read())
 
 @app.get("/btc_data_public")
 def btc_data_public() -> PublicBTC:
@@ -2134,6 +1460,15 @@ async def login(username: str = Form(...), password: str = Form(...)):
     else:
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
+@app.post("/login")
+async def login_endpoint(username: str = Form(...), password: str = Form(...)):
+    """Handle login for secure dashboard"""
+    if username == ADMIN_USERNAME and password == ADMIN_PASSWORD:
+        token = create_jwt_token(username)
+        return {"access_token": token, "message": "Login successful"}
+    else:
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+
 @app.get("/test_apis")
 async def test_apis():
     """Test API connectivity"""
@@ -2172,6 +1507,18 @@ async def test_apis():
 async def test_page():
     """Serve the test HTML page"""
     with open('test.html', 'r') as f:
+        return HTMLResponse(content=f.read())
+
+@app.get("/dashboard")
+async def dashboard_page():
+    """Serve the ORB dashboard HTML page"""
+    with open('secure-orb-dashboard.html', 'r') as f:
+        return HTMLResponse(content=f.read())
+
+@app.get("/login-test")
+async def login_test_page():
+    """Serve the login test HTML page"""
+    with open('login-test.html', 'r') as f:
         return HTMLResponse(content=f.read())
 
 @app.post("/auto_trade")
@@ -2426,6 +1773,27 @@ async def auto_trade_scheduled(token: str = Form(...)):
         logger.warning("Invalid token for scheduled auto trade")
         raise HTTPException(status_code=401, detail="Authentication required")
 
+@app.post("/auto_trade_cron")
+async def auto_trade_cron():
+    """Execute automated trading for cron jobs (no authentication required)"""
+    logger.info("🤖 Cron Auto Trade endpoint called")
+    
+    # Check both in-memory and database settings
+    auto_trade_enabled_memory = AUTO_TRADE_ENABLED
+    auto_trade_enabled_db = get_setting("auto_trade_enabled", True) if LEDGER_AVAILABLE else True
+    
+    if not auto_trade_enabled_memory or not auto_trade_enabled_db:
+        logger.info(f"⏸️ Auto-trade disabled (memory: {auto_trade_enabled_memory}, db: {auto_trade_enabled_db})")
+        return {"status": "skipped", "message": "Auto-trade disabled"}
+    
+    if not trading_bot:
+        logger.warning("No trading bot available for cron auto trade")
+        return {"status": "error", "message": "No trading bot available"}
+
+    if not llm_strategy:
+        logger.warning("LLM strategy not available for cron auto trade")
+        return {"status": "error", "message": "LLM strategy not available"}
+
     # Use database lock to ensure only one instance runs at a time
     if LEDGER_AVAILABLE:
         try:
@@ -2478,6 +1846,58 @@ async def auto_trade_scheduled(token: str = Form(...)):
             logger.error(f"❌ File lock acquisition failed: {e}")
             return {"status": "error", "message": f"File lock acquisition failed: {str(e)}"}
 
+    # Use database lock to ensure only one instance runs at a time
+    if LEDGER_AVAILABLE:
+        try:
+            from db import acquire_trade_lock, release_trade_lock, get_trade_lock_info
+            
+            # Try to acquire the trade lock (10 minute TTL)
+            lock_acquired = acquire_trade_lock(
+                lock_key="auto_trade_cron",
+                ttl_sec=600,  # 10 minutes
+                process_id=f"cron_{os.getpid()}",
+                metadata={"endpoint": "auto_trade_cron", "timestamp": datetime.now().isoformat()}
+            )
+            
+            if not lock_acquired:
+                # Check if there's an existing lock
+                lock_info = get_trade_lock_info("auto_trade_cron")
+                if lock_info:
+                    logger.warning(f"⏸️ Another cron auto trade instance is already running (PID: {lock_info['process_id']}, expires: {lock_info['expires_at']})")
+                    return {"status": "skipped", "message": f"Another cron auto trade instance is already running (expires: {lock_info['expires_at']})"}
+                else:
+                    logger.warning("⏸️ Failed to acquire trade lock")
+                    return {"status": "skipped", "message": "Failed to acquire trade lock"}
+            
+            logger.info("🔒 Acquired database lock for cron auto trade")
+            
+            try:
+                return await _execute_auto_trade_scheduled()
+            finally:
+                # Always release the lock
+                released = release_trade_lock("auto_trade_cron")
+                if released:
+                    logger.info("🔓 Released database lock for cron auto trade")
+                else:
+                    logger.warning("⚠️ Failed to release database lock")
+                    
+        except Exception as e:
+            logger.error(f"❌ Database lock acquisition failed: {e}")
+            return {"status": "error", "message": f"Database lock acquisition failed: {str(e)}"}
+    else:
+        # Fallback to file lock if database not available
+        lock_path = "/data/auto_trade_cron.lock"
+        try:
+            with exclusive_lock(lock_path):
+                logger.info("🔒 Acquired file lock for cron auto trade (fallback)")
+                return await _execute_auto_trade_scheduled()
+        except BlockingIOError:
+            logger.warning("⏸️ Another cron auto trade instance is already running (file lock)")
+            return {"status": "skipped", "message": "Another cron auto trade instance is already running"}
+        except Exception as e:
+            logger.error(f"❌ File lock acquisition failed: {e}")
+            return {"status": "error", "message": f"File lock acquisition failed: {str(e)}"}
+
 async def _check_safety_conditions(current_price, last_update, signal_confidence, target_exposure, current_exposure):
     """Check safety conditions before executing trades"""
     settings = load_runtime_settings()
@@ -2507,104 +1927,25 @@ async def _check_safety_conditions(current_price, last_update, signal_confidence
     return True, "Safety checks passed"
 
 async def _execute_auto_trade_scheduled():
-    """Internal function to execute the scheduled auto trade logic"""
-
+    """Internal function to execute the scheduled auto trade logic using the new ORB-first approach"""
+    
     try:
-        # Load current settings from database on each run
-        logger.info("📋 Loading current settings from database...")
-        current_settings = load_runtime_settings()
-        auto_trade_enabled = get_setting("auto_trade_enabled", True) if LEDGER_AVAILABLE else AUTO_TRADE_ENABLED
+        from auto_trade_scheduler import execute_auto_trade
         
-        if not auto_trade_enabled:
-            logger.info("⏸️ Auto-trade disabled in database settings")
-            return {"status": "skipped", "message": "Auto-trade disabled in database settings"}
+        logger.info("🤖 Starting scheduled auto trade execution...")
         
-        # Update trading components with current settings
-        try:
-            if llm_strategy:
-                llm_strategy.min_confidence = current_settings["min_confidence"]
-                llm_strategy.max_exposure = current_settings["max_exposure"]
-            if trading_bot:
-                trading_bot.trade_cooldown_hours = current_settings["trade_cooldown_hours"]
-                trading_bot.rebalance_threshold_pct = current_settings["min_trade_delta"]
-                trading_bot.min_trade_delta_usd = current_settings["min_trade_delta_usd"]
-                trading_bot.min_trade_delta_pct = current_settings["min_trade_delta_pct"]
-                trading_bot.no_fee_mode = current_settings["no_fee_mode"]
-        except Exception as e:
-            logger.warning(f"Failed to update trading components with settings: {e}")
+        # Call the new execute_auto_trade function
+        result = execute_auto_trade()
         
-        logger.info(f"⚙️ Current settings: min_confidence={current_settings['min_confidence']}, max_exposure={current_settings['max_exposure']}, cooldown={current_settings['trade_cooldown_hours']}h, min_delta={current_settings['min_trade_delta']}")
-        logger.info("🤖 Starting scheduled LLM market analysis...")
-        
-        # Get current market data
-        market_data = get_btc_market_data()
-        if not market_data:
-            logger.error("Unable to get market data for scheduled auto trade")
-            return {"status": "error", "message": "Unable to get market data"}
-
-        current_price = market_data.get('close', 45000.0)
-        price_change_24h = market_data.get('change_24h', 0.0)
-        volume_24h = market_data.get('volume', 1000000.0)
-        
-        # Check price staleness
-        try:
-            # Get price timestamp from market data or use current time
-            price_ts = datetime.now(timezone.utc)  # Default to current time
-            if 'last_update' in market_data:
-                try:
-                    price_ts = datetime.fromisoformat(market_data['last_update'].replace('Z', '+00:00'))
-                except:
-                    price_ts = datetime.now(timezone.utc)
-            
-            staleness = (datetime.now(timezone.utc) - price_ts).total_seconds()
-            if staleness > MAX_PRICE_STALENESS_SEC:
-                logger.warning(f"🛡️ Skip scheduled trade: price stale ({int(staleness)}s > {MAX_PRICE_STALENESS_SEC}s)")
-                return {"status": "skipped", "reason": f"price_stale_{int(staleness)}s"}
-        except Exception as e:
-            logger.warning(f"🛡️ Skip scheduled trade: unable to check price staleness: {e}")
-            return {"status": "skipped", "reason": "staleness_check_failed"}
-        
-        logger.info(f"📊 Market Data: Price=${current_price:,.2f}, Change={price_change_24h:+.2f}%, Volume=${volume_24h:,.0f}")
-
-        # Get news sentiment
-        news_text = get_btc_news()
-        sentiment, probability = analyze_btc_sentiment(news_text)
-        news_sentiment = "positive" if sentiment > 0 else "negative" if sentiment < 0 else "neutral"
-        
-        logger.info(f"📰 News Sentiment: {news_sentiment} (score: {sentiment}, probability: {probability:.2f})")
-
-        # Generate LLM trading signal
-        logger.info("🧠 Generating LLM trading signal...")
-        try:
-            signal = llm_strategy.generate_trading_signal(
-                current_price=current_price,
-                price_change_24h=price_change_24h,
-                volume_24h=volume_24h,
-                news_sentiment=news_sentiment
-            )
-            
-            logger.info(f"🎯 LLM Signal: {signal['action'].upper()} - {signal['reason']} (confidence: {signal['confidence']:.2f})")
-            
-        except Exception as llm_error:
-            logger.error(f"❌ LLM signal generation failed: {llm_error}")
-            # Create fallback signal
-            signal = {
-                'action': 'hold',
-                'should_trade': False,
-                'reason': f'LLM analysis failed: {str(llm_error)}',
-                'confidence': 0.5,
-                'risk_level': 'medium',
-                'position_size': None,
-                'price_target': None,
-                'stop_loss': None,
-                'analysis': f'LLM Error: {str(llm_error)}',
-                'timestamp': datetime.now().isoformat()
-            }
-            logger.info(f"🔄 Using fallback signal: {signal['action'].upper()}")
-
-        # Check account balance before executing trade
-        account_balance = trading_bot.get_account_info()
-        logger.info(f"💰 Account Balance: {account_balance}")
+        logger.info(f"✅ Scheduled auto trade completed: {result}")
+        return {
+            "status": "success", 
+            "message": "Scheduled automated trading analysis complete",
+            "result": result
+        }
+    except Exception as e:
+        logger.error(f"❌ Scheduled auto trade failed: {e}")
+        return {"status": "error", "message": f"Scheduled auto trade failed: {str(e)}"}
         
         # Calculate appropriate position size based on available funds
         available_funds = 0.0
@@ -2879,6 +2220,69 @@ async def pnl_summary(token: str = None):
             exposure_value=0.0, exposure_pct=0.0, position_qty=0.0, hodl_value=0.0
         )
 
+@app.get("/pnl_summary_test")
+async def pnl_summary_test():
+    """Public version of PnL summary for dashboard (no authentication required)"""
+    # Get current price
+    market_data = get_btc_market_data()
+    px = float(market_data.get('close', 45000.0)) if market_data else 45000.0
+    
+    # Get balances using the same method as diagnostics endpoint
+    balances = {}
+    print(f"PnL: trading_bot available: {trading_bot is not None}")
+    if trading_bot:
+        account_info = trading_bot.get_account_info()
+        print(f"PnL: account_info keys: {list(account_info.keys()) if account_info else 'None'}")
+        if account_info and 'balances' in account_info:
+            raw_balances = account_info['balances']
+            print(f"PnL: raw_balances keys: {list(raw_balances.keys())}")
+            print(f"PnL: BTC balance: {raw_balances.get('BTC', 'Not found')}")
+            print(f"PnL: USD balance: {raw_balances.get('USD', 'Not found')}")
+            
+            # Use balances directly (they're already normalized)
+            btc_qty = float(raw_balances.get("BTC", 0.0))
+            cash_usd = float(raw_balances.get("USD", 0.0))
+            equity = cash_usd + btc_qty * px
+            exposure_value = btc_qty * px
+            exposure_pct = 0.0 if equity <= 0 else exposure_value / equity
+            
+            print(f"PnL: Calculated equity: {equity}, position_qty: {btc_qty}")
+            
+            return {
+                "status": "ok",
+                "message": None,
+                "last_price": px,
+                "price_ts": datetime.now(timezone.utc).isoformat(),
+                "equity": round(equity, 2),
+                "realized_pnl": 0.0,
+                "unrealized_pnl": 0.0,
+                "fees_total": 0.0,
+                "exposure_value": round(exposure_value, 2),
+                "exposure_pct": round(exposure_pct, 4),
+                "position_qty": round(btc_qty, 8),
+                "hodl_value": 0.0,
+            }
+        else:
+            print(f"PnL: No balances in account_info")
+    else:
+        print(f"PnL: No trading_bot available")
+    
+    # Fallback if no balances available
+    return {
+        "status": "ok",
+        "message": None,
+        "last_price": px,
+        "price_ts": datetime.now(timezone.utc).isoformat(),
+        "equity": 0.0,
+        "realized_pnl": 0.0,
+        "unrealized_pnl": 0.0,
+        "fees_total": 0.0,
+        "exposure_value": 0.0,
+        "exposure_pct": 0.0,
+        "position_qty": 0.0,
+        "hodl_value": 0.0,
+    }
+
 # Snapshot equity endpoint
 @app.post("/snapshot_equity")
 async def snapshot_equity_endpoint(token: str = Form(...)):
@@ -2896,6 +2300,154 @@ async def snapshot_equity_endpoint(token: str = Form(...)):
         return {"status": "ok", "equity": eq}
     except Exception as e:
         return {"status": "error", "message": str(e)}
+
+@app.get("/pnl_summary_public", response_model=PnLSummary)
+async def pnl_summary_public():
+    """Public version of PnL summary for dashboard (no authentication required)"""
+    try:
+        # Safe float conversion helper
+        def _f(v, d=0.0):
+            try:
+                return float(v)
+            except (ValueError, TypeError):
+                return d
+        
+        # Get current price
+        market_data = get_btc_market_data()
+        px = float(market_data.get('close', 45000.0)) if market_data else 45000.0
+        
+        # Get balances using the same method as diagnostics endpoint
+        if trading_bot:
+            account_info = trading_bot.get_account_info()
+            if account_info and 'balances' in account_info:
+                raw_balances = account_info['balances']
+                
+                # Normalize asset codes like the diagnostics endpoint
+                balances = {}
+                for k, v in raw_balances.items():
+                    sym = _normalize_asset(k)
+                    try:
+                        balances[sym] = balances.get(sym, 0.0) + float(v)
+                    except (ValueError, TypeError):
+                        pass
+                
+                # Get normalized balances with safe conversion
+                btc_qty = _f(balances.get("BTC"))
+                cash_usd = _f(balances.get("USD"))
+                equity = cash_usd + btc_qty * px
+                exposure_value = btc_qty * px
+                exposure_pct = 0.0 if equity <= 0 else exposure_value / equity
+                
+                return PnLSummary(
+                    status="ok",
+                    message=None,
+                    last_price=px,
+                    price_ts=datetime.now(timezone.utc).isoformat(),
+                    equity=round(equity, 2),
+                    realized_pnl=0.0,
+                    unrealized_pnl=0.0,
+                    fees_total=0.0,
+                    exposure_value=round(exposure_value, 2),
+                    exposure_pct=round(exposure_pct, 4),
+                    position_qty=round(btc_qty, 8),
+                    hodl_value=0.0,
+                )
+        
+        # Fallback if no balances available
+        return PnLSummary(
+            status="ok",
+            message=None,
+            last_price=px,
+            price_ts=datetime.now(timezone.utc).isoformat(),
+            equity=0.0,
+            realized_pnl=0.0,
+            unrealized_pnl=0.0,
+            fees_total=0.0,
+            exposure_value=0.0,
+            exposure_pct=0.0,
+            position_qty=0.0,
+            hodl_value=0.0,
+        )
+    except Exception as e:
+        logger.error(f"Error in pnl_summary_public: {e}")
+        # Return degraded status with zeros
+        return PnLSummary(
+            status="degraded",
+            message=f"error: {type(e).__name__}",
+            last_price=0.0,
+            price_ts=datetime.now(timezone.utc).isoformat(),
+            equity=0.0,
+            realized_pnl=0.0,
+            unrealized_pnl=0.0,
+            fees_total=0.0,
+            exposure_value=0.0,
+            exposure_pct=0.0,
+            position_qty=0.0,
+            hodl_value=0.0,
+        )
+
+@app.get("/equity_exposure")
+async def equity_exposure():
+    """Simple equity/exposure endpoint for status monitoring"""
+    try:
+        # Safe float conversion helper
+        def _f(v, d=0.0):
+            try:
+                return float(v)
+            except (ValueError, TypeError):
+                return d
+        
+        # Get current price
+        market_data = get_btc_market_data()
+        px = float(market_data.get('close', 45000.0)) if market_data else 45000.0
+        
+        # Get balances using the same method as diagnostics endpoint
+        if trading_bot:
+            account_info = trading_bot.get_account_info()
+            if account_info and 'balances' in account_info:
+                raw_balances = account_info['balances']
+                
+                # Normalize asset codes
+                balances = {}
+                for k, v in raw_balances.items():
+                    sym = _normalize_asset(k)
+                    try:
+                        balances[sym] = balances.get(sym, 0.0) + float(v)
+                    except (ValueError, TypeError):
+                        pass
+                
+                # Get normalized balances with safe conversion
+                btc_qty = _f(balances.get("BTC"))
+                cash_usd = _f(balances.get("USD"))
+                equity = cash_usd + btc_qty * px
+                exposure_value = btc_qty * px
+                exposure_pct = 0.0 if equity <= 0 else exposure_value / equity
+                
+                return {
+                    "equity": round(equity, 2),
+                    "realized_pnl": 0.0,
+                    "unrealized_pnl": 0.0,
+                    "exposure_value": round(exposure_value, 2),
+                    "exposure_pct": round(exposure_pct, 4)
+                }
+        
+        # Fallback if no balances available
+        return {
+            "equity": None,
+            "realized_pnl": None,
+            "unrealized_pnl": None,
+            "exposure_value": None,
+            "exposure_pct": None
+        }
+    except Exception as e:
+        logger.error(f"Error in equity_exposure: {e}")
+        return {
+            "equity": None,
+            "realized_pnl": None,
+            "unrealized_pnl": None,
+            "exposure_value": None,
+            "exposure_pct": None
+        }
 
 # Prometheus metrics
 from prometheus_client import CollectorRegistry, Counter, Gauge, generate_latest, CONTENT_TYPE_LATEST
@@ -3033,6 +2585,237 @@ def diag_telemetry():
             "recent_trades_count": metrics["recent_trades_count"]
         }
     except Exception as e:
+        return {"error": str(e)}
+
+# --- ORB helper endpoints ----------------------------------------------------
+@app.get("/orb/status")
+async def orb_status():
+    try:
+        from db import get_setting
+        from orb_executor import load_orb_state
+        s = load_orb_state() or {}
+        
+        # Safe float conversion helper (same as PnL endpoints)
+        def _f(v, d=0.0):
+            try:
+                return float(v)
+            except (ValueError, TypeError):
+                return d
+        
+        # Get real balances using the same helper as PnL endpoints
+        btc_bal = 0.0
+        usd_bal = 0.0
+        try:
+            from kraken_trading_btc import get_balances_normalized
+            balances = get_balances_normalized()
+            btc_bal = _f(balances.get("btc"))
+            usd_bal = _f(balances.get("usd"))
+        except Exception:
+            pass
+        
+        # Get current spread using the new method
+        try:
+            from orb_executor import get_spread_bps
+            current_spread = get_spread_bps()
+        except Exception:
+            current_spread = s.get("spread_bps", 0.0)
+        
+        return {
+            "mode": get_setting("strategy_mode"),
+            "enabled": bool(get_setting("orb_enabled", False)),
+            "day": s.get("day"),
+            "phase": s.get("phase"),
+            "orb_high": s.get("orb_high"),
+            "orb_low": s.get("orb_low"),
+            "adds_done": s.get("adds_done"),
+            "avg_price": s.get("avg_price"),
+            "qty": s.get("qty"),
+            "stop": s.get("stop"),
+            # NEW diagnostics if present
+            "last_close": s.get("last_close"),
+            "ema9": s.get("ema9"),
+            "ema20": s.get("ema20"),
+            "ema50": s.get("ema50"),
+            "spread_bps": current_spread,
+            "confirm_reason": s.get("confirm_reason"),
+            "last_five_bucket": s.get("last_five_bucket"),
+            # Skip reason context with real balances
+            "btc_balance": btc_bal,
+            "usd_balance": usd_bal,
+            "skip_reason": s.get("skip_reason"),
+            "signal": s.get("signal"),
+            "ema_ok": s.get("ema_ok"),
+            "break_ok": s.get("break_ok"),
+            "risk_qty": s.get("risk_qty"),
+            "final_qty": s.get("final_qty"),
+            # Last confirmation values
+            "last_signal": s.get("last_signal"),
+            "last_ema_ok": s.get("last_ema_ok"),
+            "last_break_ok": s.get("last_break_ok"),
+            "last_reason": s.get("last_reason"),
+            "last_risk_qty": s.get("last_risk_qty")
+        }
+    except Exception as e:
+        return {"status": "error", "reason": str(e)}
+
+
+@app.post("/orb/control/flat_now")
+async def orb_flat_now():
+    try:
+        from orb_executor import close_orb_position
+        res = close_orb_position()
+        return res if res else {"status": "error", "reason": "unknown"}
+    except Exception as e:
+        return {"status": "error", "reason": str(e)}
+
+
+@app.get("/orb/self_test")
+def orb_self_test(at: str = None, force_session: bool = True):
+    now = datetime.now(timezone.utc)
+    if at:
+        try:
+            # Accept both Z and +00:00
+            iso = at.replace("Z", "+00:00")
+            now = datetime.fromisoformat(iso)
+        except Exception:
+            return {"status":"error","reason":"bad_at_param"}
+
+    from auto_trade_scheduler import load_runtime_settings
+    from orb_executor import run_orb_cycle
+    settings = load_runtime_settings()
+    if force_session:
+        settings["orb_debug_force_session"] = True
+
+    res = run_orb_cycle(now, settings)
+    return {"now": now.isoformat(), "res": res}
+
+
+@app.get("/orb/self_test_confirm")
+def orb_self_test_confirm(at: str = None, force_dir: str = None):
+    """Self-test endpoint specifically for confirmation logic testing"""
+    now = datetime.now(timezone.utc)
+    if at:
+        try:
+            # Accept both Z and +00:00
+            iso = at.replace("Z", "+00:00")
+            now = datetime.fromisoformat(iso)
+        except Exception:
+            return {"status":"error","reason":"bad_at_param"}
+
+    from auto_trade_scheduler import load_runtime_settings
+    from orb_executor import run_orb_cycle
+    settings = load_runtime_settings()
+    settings["orb_debug_force_session"] = True
+    
+    # Optionally force a direction to validate order path end-to-end
+    if force_dir in ("long", "short"):
+        # Inject fake signal for testing (only in non-prod)
+        if os.getenv("ORB_DEBUG_MODE") == "true":
+            from orb_executor import load_orb_state, save_orb_state
+            state = load_orb_state() or {}
+            state["force_test_signal"] = force_dir
+            save_orb_state(state)
+    
+    res = run_orb_cycle(now, settings)
+    return {"now": now.isoformat(), "res": res}
+
+
+@app.post("/orders/self_test")
+def orders_self_test(side: str = "buy", usd: float = 15.0, validate: bool = True):
+    """Self-test endpoint for order placement validation"""
+    try:
+        from kraken_trading_btc import KrakenTradingBot, best_quotes, get_pair_meta, round_down
+        bot = KrakenTradingBot()
+        qts = best_quotes(bot)
+        meta = get_pair_meta(bot)
+        qty = round_down(usd / qts["mid"], meta["lot_step"])
+        
+        if validate:
+            # Add validate flag to payload for dry-run
+            payload = {
+                "pair": meta["pair"],
+                "type": "buy" if side == "buy" else "sell",
+                "ordertype": "limit",
+                "price": f"{qts['mid']:.{meta['price_dec']}f}",
+                "volume": f"{qty:.{meta['lot_dec']}f}",
+                "oflags": "post",
+                "userref": int(time.time()),
+                "timeinforce": "GTC",
+                "validate": True,  # Dry-run flag
+            }
+            
+            endpoint = "/private/AddOrder"
+            res = bot._make_request_with_retry('POST', endpoint, data=payload, private=True, signature_path="/0/private/AddOrder")
+            return {"ok": True, "res": res, "qty": qty, "mid": qts["mid"], "pair": meta["pair"], "validate": True}
+        else:
+            ok, res = bot.place_limit_post_only(side, qty, qts["mid"])
+            return {"ok": ok, "res": res, "qty": qty, "mid": qts["mid"], "pair": meta["pair"], "validate": False}
+    except Exception as e:
+        return {"ok": False, "res": {"status": "error", "reason": str(e)}}
+
+
+@app.get("/metrics")
+def metrics():
+    """Prometheus metrics endpoint"""
+    if not METRICS_ON:
+        return Response("metrics disabled", status_code=404)
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+
+@app.get("/health")
+def health_check():
+    """Health check endpoint for Docker"""
+    try:
+        # Check if we can access the database
+        from db import get_setting
+        get_setting("test", "ok")
+        
+        # Check if price data is fresh
+        from price_worker import PRICE_CACHE
+        if PRICE_CACHE and PRICE_CACHE.get("ts"):
+            age_sec = (datetime.now(timezone.utc) - PRICE_CACHE["ts"]).total_seconds()
+            if age_sec > int(os.getenv("HEALTH_MIN_PRICE_STALENESS", 120)):
+                return JSONResponse({"status": "degraded", "reason": "stale_price", "age_sec": age_sec})
+        
+        return JSONResponse({"status": "healthy"})
+    except Exception as e:
+        return JSONResponse({"status": "unhealthy", "error": str(e)})
+
+
+@app.get("/orb/daily_summary")
+def orb_daily_summary():
+    """Daily trading summary"""
+    try:
+        from db import get_realized_pnl_total, get_fees_total
+        from datetime import date
+        
+        today = date.today().isoformat()
+        
+        # Get today's trades and PnL
+        realized_pnl = get_realized_pnl_total()
+        fees = get_fees_total()
+        net_pnl = realized_pnl - fees
+        
+        # Calculate win rate (simplified)
+        # In a real implementation, you'd count winning vs losing trades
+        win_rate = 0.5  # placeholder
+        
+        # Calculate vs HODL (simplified)
+        vs_hodl = 0.0  # placeholder
+        
+        stats = {
+            "date": today,
+            "trades": 1,  # placeholder - count actual trades
+            "win_rate": win_rate,
+            "realized_pnl": realized_pnl,
+            "fees": fees,
+            "net_pnl": net_pnl,
+            "vs_hodl": vs_hodl
+        }
+        
+        return stats
+    except Exception as e:
+        logger.error(f"Failed to compute daily summary: {e}")
         return {"error": str(e)}
 
 if __name__ == "__main__":

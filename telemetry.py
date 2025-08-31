@@ -9,8 +9,48 @@ from datetime import datetime, timezone
 from collections import defaultdict, deque
 from typing import Dict, List, Optional
 import threading
+import os
+import requests
 
 logger = logging.getLogger(__name__)
+log = logging.getLogger(__name__)
+TOK = os.getenv("TELEGRAM_BOT_TOKEN")
+CHAT = os.getenv("TELEGRAM_CHAT_ID")
+
+def send_tg(msg: str):
+    """Send Telegram notification"""
+    if not (os.getenv("NOTIFY_TELEGRAM", "false").lower() == "true" and TOK and CHAT):
+        return
+    try:
+        requests.post(f"https://api.telegram.org/bot{TOK}/sendMessage",
+                      json={"chat_id": CHAT, "text": msg})
+    except Exception as e:
+        log.warning("TG_FAIL %s", e)
+
+def notify_orb_filled(sig_dir: str, qty: float, entry: float, stop: float):
+    """Notify when ORB position is filled"""
+    send_tg(f"✅ ORB FILLED {sig_dir.upper()} qty={qty:.6f} @ {entry:.2f} stop {stop:.2f}")
+
+def notify_orb_flat(pnl: float, reason: str = "time stop"):
+    """Notify when ORB position is flattened"""
+    send_tg(f"🛑 ORB FLAT ({reason}) PnL={pnl:.2f}")
+
+def notify_daily_summary(stats: dict):
+    """Notify daily trading summary"""
+    msg = f"📊 Daily Summary:\n"
+    msg += f"Trades: {stats.get('trades', 0)}\n"
+    msg += f"Win Rate: {stats.get('win_rate', 0):.1%}\n"
+    msg += f"PnL: ${stats.get('pnl', 0):.2f}\n"
+    msg += f"vs HODL: {stats.get('vs_hodl', 0):.2f}%"
+    send_tg(msg)
+
+def notify_error(error_msg: str):
+    """Notify of critical errors"""
+    send_tg(f"🚨 ERROR: {error_msg}")
+
+def notify_health_check(status: str):
+    """Notify health check status"""
+    send_tg(f"💓 Health: {status}")
 
 class TradeTelemetry:
     """Track trade quality metrics for monitoring and tuning"""

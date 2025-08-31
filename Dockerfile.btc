@@ -25,6 +25,9 @@ COPY price_worker.py .
 COPY telemetry.py .
 COPY auto_trade_scheduler.py .
 COPY strategy_core.py .
+COPY orb_strategy.py .
+COPY orb_executor.py .
+COPY secure-orb-dashboard.html .
 
 # Create non-root user and writable data dir for SQLite
 RUN useradd -m -u 1000 appuser \
@@ -36,8 +39,8 @@ USER appuser
 EXPOSE 8000
 
 # Health check
-HEALTHCHECK --interval=30s --timeout=30s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:8000/test_apis || exit 1
+HEALTHCHECK --interval=30s --timeout=3s --retries=3 \
+    CMD curl -f http://localhost:8000/health || exit 1
 
 # Run the application with explicit Python path
 CMD ["/usr/local/bin/python", "main_btc.py"] 

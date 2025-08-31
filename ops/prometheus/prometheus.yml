@@ -1,0 +1,9 @@
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: "orb-bot"
+    static_configs:
+      - targets: ["btc-trading-app:8000"]  # Using container name
+    metrics_path: "/metrics"
+    scrape_interval: 15s

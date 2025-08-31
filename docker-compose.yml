@@ -32,8 +32,14 @@ services:
       - RETRY_DELAY_BASE=${RETRY_DELAY_BASE}
       - LOG_LLM_PROMPTS=${LOG_LLM_PROMPTS}
       - LOG_LLM_RESPONSES=${LOG_LLM_RESPONSES}
+      - NOTIFY_TELEGRAM=${NOTIFY_TELEGRAM}
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
+      - MAX_OPEN_MINS=${MAX_OPEN_MINS:-3}
+      - REPRICE_TICKS=${REPRICE_TICKS:-2}
+      - ALLOW_SHORT=${ALLOW_SHORT:-false}
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/test_apis"]
+      test: [ "CMD", "curl", "-f", "http://localhost:8000/test_apis" ]
       interval: 30s
       timeout: 10s
       retries: 3

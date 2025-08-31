@@ -8,9 +8,19 @@ import requests
 import json
 import logging
 from datetime import datetime, timezone
+from typing import Any, Dict
 import time
 import os
 import sys
+
+# Add the current directory to Python path to import modules
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
+def safe_json(obj: Any) -> str:
+    try:
+        return json.dumps(obj, ensure_ascii=False, default=str)
+    except Exception:
+        return str(obj)
 
 # Create a session for all requests with proper headers
 SESSION = requests.Session()
@@ -264,6 +274,20 @@ def load_runtime_settings():
             "grid_step_pct": float(settings.get("grid_step_pct", 0.25)),
             "grid_order_usd": float(settings.get("grid_order_usd", 12.0)),
             "max_grid_exposure": float(settings.get("max_grid_exposure", 0.1)),
+            # Strategy mode and ORB params
+            "strategy_mode": str(settings.get("strategy_mode", "ORB")),
+            "orb_enabled": parse_bool(settings.get("orb_enabled", False)),
+            "orb_open_minutes": int(settings.get("orb_open_minutes", 15)),
+            "orb_confirm_minutes": int(settings.get("orb_confirm_minutes", 5)),
+            "orb_min_range_pct": float(settings.get("orb_min_range_pct", 0.002)),
+            "orb_ema_fast": int(settings.get("orb_ema_fast", 9)),
+            "orb_ema_mid": int(settings.get("orb_ema_mid", 20)),
+            "orb_ema_slow": int(settings.get("orb_ema_slow", 50)),
+            "orb_risk_per_trade": float(settings.get("orb_risk_per_trade", 0.005)),
+            "orb_buffer_frac": float(settings.get("orb_buffer_frac", 0.10)),
+            "orb_max_spread_bps": int(settings.get("orb_max_spread_bps", 8)),
+            "orb_max_adds": int(settings.get("orb_max_adds", 2)),
+            "orb_trail_atr_mult": float(settings.get("orb_trail_atr_mult", 2.0)),
         }
     except Exception as e:
         logger.warning(f"Failed to load settings from DB: {e}")
@@ -280,6 +304,20 @@ def load_runtime_settings():
             "grid_step_pct": float(os.getenv("GRID_STEP_PCT", "0.25")),
             "grid_order_usd": float(os.getenv("GRID_ORDER_USD", "12.0")),
             "max_grid_exposure": float(os.getenv("MAX_GRID_EXPOSURE", "0.1")),
+            # Strategy mode and ORB params
+            "strategy_mode": str(os.getenv("STRATEGY_MODE", "ORB")),
+            "orb_enabled": parse_bool(os.getenv("ORB_ENABLED", "True")),
+            "orb_open_minutes": int(os.getenv("ORB_OPEN_MINUTES", "15")),
+            "orb_confirm_minutes": int(os.getenv("ORB_CONFIRM_MINUTES", "5")),
+            "orb_min_range_pct": float(os.getenv("ORB_MIN_RANGE_PCT", "0.002")),
+            "orb_ema_fast": int(os.getenv("ORB_EMA_FAST", "9")),
+            "orb_ema_mid": int(os.getenv("ORB_EMA_MID", "20")),
+            "orb_ema_slow": int(os.getenv("ORB_EMA_SLOW", "50")),
+            "orb_risk_per_trade": float(os.getenv("ORB_RISK_PER_TRADE", "0.005")),
+            "orb_buffer_frac": float(os.getenv("ORB_BUFFER_FRAC", "0.10")),
+            "orb_max_spread_bps": int(os.getenv("ORB_MAX_SPREAD_BPS", "8")),
+            "orb_max_adds": int(os.getenv("ORB_MAX_ADDS", "2")),
+            "orb_trail_atr_mult": float(os.getenv("ORB_TRAIL_ATR_MULT", "2.0")),
         }
 
 def check_price_staleness():
@@ -327,144 +365,47 @@ def check_price_staleness():
         logger.warning(f"🛡️ Skip trade: price staleness check failed: {e}")
         return False, "degraded"
 
-def execute_auto_trade():
-    """Execute automated trading via the API endpoint"""
-    logger.info("🤖 Starting automated trading execution...")
-    
-    # Check same-candle guard before proceeding
-    now = datetime.now(timezone.utc)
-    if _is_same_candle(db=None, now=now):
-        logger.info("⏸️ Skip: same candle guard")
-        return {"status":"skipped","reason":"same_candle"}
-    
-    # Check price staleness before proceeding
-    price_ok, reason = check_price_staleness()
-    if not price_ok:
-        logger.warning(f"🛡️ Skipping trade due to stale data: {reason}")
-        return {"status": "skipped", "reason": reason}
-    
-    # Load current settings from database
-    settings = load_runtime_settings()
-    logger.info(f"⚙️ Current settings: max_exposure={settings['max_exposure']}, cooldown={settings['cooldown_hours']}h, min_confidence={settings['min_confidence']}, min_delta={settings['min_trade_delta']}, no_fee_mode={settings['no_fee_mode']}, min_delta_usd={settings['min_trade_delta_usd']}")
-    
-    # Execute grid trading if enabled and available
-    if GRID_AVAILABLE and settings.get('grid_executor_enabled', True):
-        try:
-            # Get current price from the public endpoint
-            price_response = SESSION.get(
-                "https://henryt-btc.live/btc_data_public",
-                timeout=10
-            )
-            
-            if price_response.status_code == 200:
-                price_data = price_response.json()
-                if price_data.get('status') == 'ok' and price_data.get('price'):
-                    last_price = float(price_data['price'])
-                    current_bias = get_current_bias()
-                    now = datetime.now(timezone.utc)
-                    
-                    # Load grid state from DB; create default if missing
-                    state = load_grid_state("BTC") or GridState(
-                        last_grid_price=last_price,
-                        bias_allocation=current_bias,
-                        last_update=now,
-                        grid_step_pct=settings.get('grid_step_pct', 0.25),
-                        grid_order_usd=settings.get('grid_order_usd', 12.0),
-                        max_grid_exposure=settings.get('max_grid_exposure', 0.1)
-                    )
-                    
-                    # Initialize grid executor and check if grid trade should be executed
-                    grid_executor = GridExecutor()
-                    action = grid_executor.should_grid_trade(last_price, state) if settings.get('grid_executor_enabled', True) else None
-                    
-                    if action:
-                        logger.info(f"🔗 Grid trade triggered: {action} at ${last_price:,.2f}")
-                        
-                        # Check per-side candle guard
-                        now = datetime.now(timezone.utc)
-                        if _is_same_candle_per_side(action, now):
-                            logger.info(f"⏸️ Skip: same candle per-side guard for {action}")
-                            return {"status":"skipped","reason":f"same_candle_{action}"}
-                        
-                        # Respect max exposure and bias. Buy if not at cap; sell if above 0/target.
-                        notional = max(DEFAULT_GRID_ORDER_USD, settings.get('min_trade_delta_usd', 10.0))  # ≥ $10
-                        
-                        # Place the grid trade
-                        trade_result = place_delta_notional(action, notional, settings)
-                        
-                        if trade_result:
-                            # Update grid state
-                            state.last_grid_price = grid_executor.next_grid_anchor(last_price)
-                            state.last_update = now
-                            state.grid_trades_count += 1
-                            save_grid_state("BTC", state)
-                            
-                            logger.info(f"✅ Grid trade executed successfully: {action} ${notional:.2f}")
-                        else:
-                            logger.warning("❌ Grid trade failed to execute")
-                    else:
-                        logger.info(f"⏸️ No grid trade triggered at ${last_price:,.2f}")
-                        
-        except Exception as e:
-            logger.error(f"❌ Grid trading error: {e}")
-    
-    # Continue with regular auto-trade execution
-    
-    # Get authentication token
+def execute_auto_trade(now: datetime | None = None) -> Dict[str, Any]:
+    """
+    Main scheduler entrypoint — called by /auto_trade (cron every minute).
+    Runs ORB if enabled. Only falls back to other strategies when ORB disabled.
+    Logs every outcome. Never raises (returns a dict instead).
+    """
+    now = now or datetime.now(timezone.utc)
+    settings = load_runtime_settings()  # must contain orb_enabled, max_price_staleness_sec, max_spread_bps, etc.
+
+    # 1) ORB path
     try:
-        auth_response = SESSION.post(
-            "https://henryt-btc.live/auth/login",
-            data={
-                'username': os.getenv('ADMIN_USERNAME', 'admin'),
-                'password': os.getenv('ADMIN_PASSWORD', 'change_this_password_immediately')
-            },
-            timeout=10
-        )
-        
-        if auth_response.status_code == 200:
-            auth_data = auth_response.json()
-            token = auth_data.get('session_token')
-            if not token:
-                logger.error("❌ No session token in auth response")
-                return {"status": "error", "reason": "auth_failed"}
-        else:
-            logger.error(f"❌ Auth failed with status {auth_response.status_code}")
-            return {"status": "error", "reason": "auth_failed"}
-            
+        if settings.get("orb_enabled"):
+            from orb_executor import run_orb_cycle
+            res = run_orb_cycle(now, settings) or {"status": "error", "reason": "orb_cycle_returned_none"}
+            logger.info("ORB_CYCLE %s", safe_json(res))
+            return res
     except Exception as e:
-        logger.error(f"❌ Auth request failed: {e}")
-        return {"status": "error", "reason": "auth_failed"}
-    
-    for attempt in range(MAX_RETRIES):
-        try:
-            logger.info(f"📡 Attempt {attempt + 1}/{MAX_RETRIES}: Calling auto-trade endpoint...")
-            
-            # Make POST request to the scheduled auto-trade endpoint with token
-            response = SESSION.post(
-                TRADING_URL,
-                data={'token': token},
-                timeout=60  # 60 second timeout
-            )
-            
-            if response.status_code == 200:
-                result = response.json()
-                logger.info("✅ Auto-trade executed successfully!")
-                logger.info(f"📊 Result: {json.dumps(result, indent=2)}")
-                return result
-            else:
-                logger.error(f"❌ Auto-trade failed with status {response.status_code}: {response.text}")
-                
-        except requests.exceptions.RequestException as e:
-            logger.error(f"❌ Network error on attempt {attempt + 1}: {e}")
-        except Exception as e:
-            logger.error(f"❌ Unexpected error on attempt {attempt + 1}: {e}")
-        
-        if attempt < MAX_RETRIES - 1:
-            logger.info(f"⏳ Waiting {RETRY_DELAY} seconds before retry...")
-            time.sleep(RETRY_DELAY)
-    
-    logger.error("❌ All retry attempts failed")
-    return None
+        logger.exception("ORB_RUN_ERROR %s", e)
+
+    # 2) (optional) Grid path
+    try:
+        if settings.get("grid_executor_enabled"):
+            from grid_executor import run_grid_cycle
+            res = run_grid_cycle(now, settings) or {"status":"error","reason":"grid_cycle_returned_none"}
+            logger.info("GRID_CYCLE %s", safe_json(res))
+            return res
+    except Exception as e:
+        logger.exception("GRID_RUN_ERROR %s", e)
+
+    # 3) (optional) LLM path
+    try:
+        if settings.get("llm_enabled"):
+            from llm_trading_strategy import run_llm_cycle
+            res = run_llm_cycle(now, settings) or {"status":"error","reason":"llm_cycle_returned_none"}
+            logger.info("LLM_CYCLE %s", safe_json(res))
+            return res
+    except Exception as e:
+        logger.exception("LLM_RUN_ERROR %s", e)
+
+    logger.info("SCHED_NOOP no strategy enabled")
+    return {"status": "noop", "reason": "no_strategy_enabled"}
 
 def main():
     """Main function to execute automated trading"""
@@ -473,7 +414,7 @@ def main():
     
     try:
         result = execute_auto_trade()
-        if result:
+        if result and result.get("status") != "error":
             logger.info("🎉 Automated trading completed successfully")
         else:
             logger.error("💥 Automated trading failed")

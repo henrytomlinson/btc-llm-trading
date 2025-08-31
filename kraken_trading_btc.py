@@ -24,10 +24,155 @@ logger = logging.getLogger(__name__)
 
 # Trading constants
 KRAKEN_PAIR = "XXBTZUSD"
+QUOTE_CCY   = "ZUSD"
 FALLBACK_LOT_STEP = 1e-5
 FALLBACK_TICK     = 0.10
 FALLBACK_OB_DEPTH = 10
 EXCHANGE_MIN_NOTIONAL_USD = 10.0
+
+# Kraken public API endpoint
+K_PUBLIC = "https://api.kraken.com/0/public"
+
+# --- Pair metadata + rounding helpers ---
+from functools import lru_cache
+import math
+
+@lru_cache(maxsize=16)
+def get_pair_meta(api) -> dict:
+    """
+    Fetches tick/lot and minimums once and caches.
+    Returns: {'pair': 'XXBTZUSD', 'tick': float, 'lot_step': float, 'ordermin': float, 'price_dec': int, 'lot_dec': int}
+    """
+    try:
+        info = api._make_request_with_retry('GET', '/public/AssetPairs', data={"pair": KRAKEN_PAIR})
+        d = next(iter(info["result"].values()))
+        tick = 10 ** (-int(d.get("pair_decimals", 2)))
+        lot_step = 10 ** (-int(d.get("lot_decimals", 8)))
+        ordermin = float(d.get("ordermin", lot_step))
+        return {
+            "pair": KRAKEN_PAIR,
+            "tick": tick,
+            "lot_step": lot_step,
+            "ordermin": ordermin,
+            "price_dec": int(d.get("pair_decimals", 2)),
+            "lot_dec": int(d.get("lot_decimals", 8)),
+        }
+    except Exception as e:
+        logger.warning(f"Failed to get pair metadata, using fallbacks: {e}")
+        return {
+            "pair": KRAKEN_PAIR,
+            "tick": FALLBACK_TICK,
+            "lot_step": FALLBACK_LOT_STEP,
+            "ordermin": FALLBACK_LOT_STEP,
+            "price_dec": 2,
+            "lot_dec": 8,
+        }
+
+def round_down(v: float, step: float) -> float:
+    return math.floor(v / step) * step
+
+def round_up(v: float, step: float) -> float:
+    return math.ceil(v / step) * step
+
+def clamp_qty_to_limits(qty: float, price: float, meta: dict, min_notional_usd: float) -> float:
+    # Kraken also enforces ordermin (in BTC). Respect ordermin and min_notional
+    min_qty = max(meta["ordermin"], (min_notional_usd / max(price, 1e-9)))
+    q = max(qty, min_qty)
+    return max(round_down(q, meta["lot_step"]), 0.0)
+
+def get_funds_sanitized(api, price: float, side: str, meta: dict, safety_buf: float = 0.995) -> float:
+    """Return max BTC you can trade after buffers and rounding."""
+    try:
+        bal = api._make_request_with_retry('POST', '/private/Balance', private=True, signature_path="/0/private/Balance")
+        bal_result = bal["result"]
+        usd = float(bal_result.get(QUOTE_CCY, 0.0))
+        btc = float(bal_result.get("XXBT", 0.0))  # Kraken asset code for BTC
+        if side == "buy":
+            max_qty = (usd * safety_buf) / price
+        else:
+            max_qty = btc * safety_buf
+        return max(round_down(max_qty, meta["lot_step"]), 0.0)
+    except Exception as e:
+        logger.warning(f"Failed to get funds, using fallback: {e}")
+        return 0.0
+
+def best_quotes(api) -> dict:
+    """
+    Return top-of-book for the configured pair using Kraken 'Depth' endpoint.
+    Handles any key name Kraken returns (XXBTZUSD / XBTUSD).
+    """
+    try:
+        ob = api._make_request_with_retry('GET', '/public/Depth', data={"pair": KRAKEN_PAIR, "count": 1})
+        if ob.get("error"):
+            raise RuntimeError(f"Kraken Depth error: {ob['error']}")
+        result = ob.get("result", {})
+        if not result:
+            raise RuntimeError("Empty result from Kraken Depth")
+        pair_key = next(iter(result.keys()))  # don't assume exact key name
+        bids = result[pair_key].get("bids", [])
+        asks = result[pair_key].get("asks", [])
+        if not bids or not asks:
+            raise RuntimeError("Empty book from Kraken Depth")
+        bid = float(bids[0][0])
+        ask = float(asks[0][0])
+        mid = 0.5 * (bid + ask)
+        return {"bid": bid, "ask": ask, "mid": mid}
+    except Exception as e:
+        logger.warning(f"Failed to get best quotes, using fallback: {e}")
+        return {"bid": 100000.0, "ask": 100001.0, "mid": 100000.5}
+
+
+# --- Fill watchdog: cancel & reprice stale post-only orders ---
+def wait_for_fill_or_reprice(api, txid: str, side: str, meta: dict,
+                             max_open_mins: int = 3, reprice_ticks: int = 2) -> dict:
+    deadline = time.time() + max_open_mins*60
+    last_status = None
+    while time.time() < deadline:
+        # Query order
+        try:
+            q = api._make_request_with_retry('POST', '/private/QueryOrders', data={"txid": txid}, private=True, signature_path="/0/private/QueryOrders")
+            if q.get("error"): break
+            od = q["result"][txid]
+            status = od.get("status")              # open|closed|canceled
+            last_status = status
+            if status == "closed":                 # filled
+                return {"status":"filled", "txid": txid, "descr": od.get("descr")}
+        except Exception as e:
+            logger.warning(f"Failed to query order {txid}: {e}")
+            break
+        # brief sleep
+        time.sleep(5)
+
+    # Not filled in time: cancel + reprice further from crossing
+    try:
+        api._make_request_with_retry('POST', '/private/CancelOrder', data={"txid": txid}, private=True, signature_path="/0/private/CancelOrder")
+        book = best_quotes(api)
+        tick = meta["tick"]
+        if side == "buy":
+            px = round_down(book["bid"] - reprice_ticks*tick, tick)
+        else:
+            px = round_up(book["ask"] + reprice_ticks*tick, tick)
+
+        # Re-submit with same qty as before
+        vol = od.get("vol") or od.get("vol_exec") or "0"
+        payload = {
+            "pair": meta["pair"], "type": "buy" if side=="buy" else "sell",
+            "ordertype": "limit", "price": f"{px:.{meta['price_dec']}f}",
+            "volume": vol, "oflags": "post", "timeinforce":"GTC",
+            "userref": int(time.time())
+        }
+        
+        # Log the reprice attempt
+        logger.info("WATCHDOG reprice order_id=%s ticks=%d", txid, reprice_ticks)
+        
+        r2 = api._make_request_with_retry('POST', '/private/AddOrder', data=payload, private=True, signature_path="/0/private/AddOrder")
+        if r2.get("error"):
+            logger.warning("REPRICE_FAIL %s", r2["error"])
+            return {"status":"reprice_error", "detail": r2["error"]}
+        return {"status":"repriced", "result": r2.get("result")}
+    except Exception as e:
+        logger.warning(f"Failed to reprice order {txid}: {e}")
+        return {"status":"reprice_error", "detail": str(e)}
 
 # Asset code normalization for Kraken
 _ASSET_MAP = {
@@ -61,7 +206,15 @@ def _normalize_asset(symbol: str) -> str:
 
 def get_balances_normalized() -> dict[str, float]:
     """Get normalized balances from Kraken"""
-    raw = get_balances_raw_from_kraken()  # your existing private/Balance call
+    try:
+        # Create a temporary bot instance to get account info
+        bot = KrakenTradingBot()
+        account_info = bot.get_account_info()
+        raw = account_info.get('balances', {})
+    except Exception as e:
+        logger.warning(f"Failed to get balances: {e}")
+        raw = {}
+    
     balances = {}
     for k, v in (raw or {}).items():
         sym = _normalize_asset(k)
@@ -112,6 +265,41 @@ class KrakenTradingBot:
             self.demo_mode = False
         
         logger.info("Kraken Bitcoin trading bot initialized successfully")
+    
+    def get_ticker(self, pair: str = "XBTUSD") -> tuple[float, float, float]:
+        """
+        Return (bid, ask, mid) using Kraken /Ticker.
+        We pass 'XBTUSD' and read the first key of result (usually 'XXBTZUSD').
+        """
+        try:
+            r = requests.get(f"{K_PUBLIC}/Ticker", params={"pair": pair}, timeout=5)
+            r.raise_for_status()
+            data = r.json()["result"]
+            book = next(iter(data.values()))
+            bid = float(book["b"][0][0])
+            ask = float(book["a"][0][0])
+            mid = (bid + ask) / 2.0
+            return bid, ask, mid
+        except Exception as e:
+            logger.warning(f"get_ticker failed: {e}")
+            raise
+    
+    def get_top_of_book(self, pair: str = "XBTUSD") -> tuple[float, float, float]:
+        """
+        Return (bid, ask, mid) using Kraken /Depth endpoint.
+        """
+        try:
+            r = requests.get(f"{K_PUBLIC}/Depth", params={"pair": pair, "count": 1}, timeout=5)
+            r.raise_for_status()
+            data = r.json()["result"]
+            book = next(iter(data.values()))
+            bid = float(book["bids"][0][0])
+            ask = float(book["asks"][0][0])
+            mid = (bid + ask) / 2.0
+            return bid, ask, mid
+        except Exception as e:
+            logger.warning(f"get_top_of_book failed: {e}")
+            raise
     
     def _get_pair_meta(self, pair=KRAKEN_PAIR):
         """Get pair metadata for lot step and tick size"""
@@ -749,156 +937,151 @@ class KrakenTradingBot:
             return {'status': 'error', 'reason': str(e)}
     
     def get_orderbook_snapshot(self, symbol: str = "XXBTZUSD") -> Dict:
-        """Get current orderbook snapshot for price discovery"""
+        """Get current orderbook snapshot for price discovery via Depth."""
         try:
-            endpoint = "/public/OrderBook"
-            data = {'pair': symbol, 'count': 1}  # Get top of book
-            
+            endpoint = "/public/Depth"
+            data = {'pair': symbol, 'count': 1}
             result = self._make_request_with_retry('GET', endpoint, data=data, private=False)
-            
             if 'error' in result and result['error']:
                 return {'status': 'error', 'reason': result['error']}
-            
-            orderbook = result.get('result', {}).get(symbol, {})
-            if not orderbook:
-                return {'status': 'error', 'reason': 'No orderbook data available'}
-            
+            res = result.get('result', {})
+            if not res:
+                return {'status': 'error', 'reason': 'Empty result from Depth'}
+            # pick whatever key Kraken returns (e.g., XXBTZUSD or XBTUSD)
+            pair_key = next(iter(res.keys()))
+            orderbook = res.get(pair_key, {})
             bids = orderbook.get('bids', [])
             asks = orderbook.get('asks', [])
-            
             best_bid = float(bids[0][0]) if bids else None
             best_ask = float(asks[0][0]) if asks else None
-            
             return {
                 'status': 'success',
                 'best_bid': best_bid,
                 'best_ask': best_ask,
-                'spread': best_ask - best_bid if best_bid and best_ask else None,
-                'spread_pct': ((best_ask - best_bid) / best_bid * 100) if best_bid and best_ask else None
+                'spread': (best_ask - best_bid) if (best_bid is not None and best_ask is not None) else None,
+                'spread_pct': (((best_ask - best_bid) / best_bid) * 100) if (best_bid and best_ask) else None
             }
-            
         except Exception as e:
             logger.error(f"Error getting orderbook snapshot: {e}")
             return {'status': 'error', 'reason': str(e)}
 
-    def place_limit_post_only(self, side: str, qty: float, price: float) -> tuple[bool, dict]:
-        """Place a post-only limit order with proper price positioning"""
-        pair = KRAKEN_PAIR
-        lot_step, tick = self._get_pair_meta(pair)
-        
-        # Get orderbook for price positioning
-        ob = self.get_orderbook_snapshot(pair, depth=FALLBACK_OB_DEPTH) or {}
-        best_bid, best_ask = float(ob.get("best_bid", 0)), float(ob.get("best_ask", 0))
-        if best_bid <= 0 or best_ask <= 0: 
-            return (False, {"status": "error", "reason": "no_orderbook"})
+    def place_limit_post_only(self, side: str, qty: float, price_ref: float) -> tuple[bool, dict]:
+        """Robust post-only limit with maker-safe price and retries"""
+        api = self  # Use self as the API client
+        meta = get_pair_meta(api)
+        qts = best_quotes(api)
+        tick = meta["tick"]
 
-        # Ensure non-marketable post-only price
-        if side == "buy":  
-            po = min(best_bid, best_ask - tick, price)
-        else:            
-            po = max(best_ask, best_bid + tick, price)
-        po = _round_price(po, tick)
-        if side == "buy" and po >= best_ask: 
-            po = best_ask - tick
-        if side == "sell" and po <= best_bid: 
-            po = best_bid + tick
+        # maker-safe price (avoid crossing); if spread < tick, step one more tick
+        if side == "buy":
+            px = min(qts["bid"], qts["ask"] - tick)
+            if qts["ask"] - qts["bid"] < tick: px = qts["bid"] - tick
+            px = round_down(px, tick)
+        else:
+            px = max(qts["ask"], qts["bid"] + tick)
+            if qts["ask"] - qts["bid"] < tick: px = qts["ask"] + tick
+            px = round_up(px, tick)
 
-        vol = _round_qty(qty, lot_step)
-        if vol <= 0: 
-            return (False, {"status": "skipped", "reason": "qty_rounding_zero"})
-        
-        userref = f"grid-po-{side}-{_now_iso()}"
+        # clamp qty to limits and available funds, apply rounding
+        qty = clamp_qty_to_limits(qty, qts["mid"], meta, min_notional_usd=self.min_trade_amount)
+        qty = min(qty, get_funds_sanitized(api, qts["mid"], side, meta))
+        qty = round_down(qty, meta["lot_step"])
+        if qty <= 0:
+            return False, {"status": "error", "reason": "qty_le_0_after_limits"}
 
-        if self.demo_mode:
-            # Simulate post-only order in demo mode
-            logger.info(f"Demo post-only {side} order: {vol:.6f} BTC at ${po:.2f}")
-            return (True, {
-                'status': 'success',
-                'order_id': f"demo_post_only_{side}_{int(time.time())}",
-                'side': side,
-                'quantity': vol,
-                'price': po,
-                'ordertype': 'limit',
-                'mode': 'post_only',
-                'price_used': po,
-                'userref': userref,
-                'demo_mode': True
-            })
-
+        # Prepare order payload
         payload = {
-            "pair": pair, "type": side, "ordertype": "limit", "price": f"{po:.10f}",
-            "volume": f"{vol:.10f}", "oflags": "post", "userref": userref
+            "pair": meta["pair"],
+            "type": "buy" if side == "buy" else "sell",
+            "ordertype": "limit",
+            "price": f"{px:.{meta['price_dec']}f}",
+            "volume": f"{qty:.{meta['lot_dec']}f}",
+            "oflags": "post",           # post-only
+            "userref": int(time.time()),
+            "timeinforce": "GTC",
+            # "validate": True,         # enable for dry-run if needed
         }
-        
+
         try:
             endpoint = "/private/AddOrder"
-            result = self._make_request_with_retry('POST', endpoint, data=payload, private=True, signature_path="/0/private/AddOrder")
+            res = self._make_request_with_retry('POST', endpoint, data=payload, private=True, signature_path="/0/private/AddOrder")
             
-            err = (result or {}).get("error") or []
-            if any("post" in str(e).lower() and "take" in str(e).lower() for e in err):
-                return (False, {"status": "rejected", "reason": "postonly_would_take", "payload": payload})
+            if res.get("error"):
+                err = "|".join(res["error"])
+                # Common auto-fix paths
+                if "EOrder:Post only" in err or "EOrder:Cannot post only" in err:
+                    # We would have taken liquidity; step one more tick away and retry once.
+                    px2 = round_down(px - tick, tick) if side == "buy" else round_up(px + tick, tick)
+                    payload["price"] = f"{px2:.{meta['price_dec']}f}"
+                    res2 = self._make_request_with_retry('POST', endpoint, data=payload, private=True, signature_path="/0/private/AddOrder")
+                    if res2.get("error"):
+                        return False, {"status": "error", "reason": "post_only_reject", "detail": res2["error"]}
+                    return True, {"status": "success", "mode":"post_only", "result": res2.get("result", {})}
+                if "EOrder:Insufficient funds" in err:
+                    # downsize 5% and try once
+                    qty2 = round_down(qty * 0.95, meta["lot_step"])
+                    if qty2 > 0:
+                        payload["volume"] = f"{qty2:.{meta['lot_dec']}f}"
+                        res2 = self._make_request_with_retry('POST', endpoint, data=payload, private=True, signature_path="/0/private/AddOrder")
+                        if res2.get("error"):
+                            return False, {"status": "error", "reason": "insufficient_funds", "detail": res2["error"]}
+                        return True, {"status": "success", "mode":"post_only", "result": res2.get("result", {})}
+                return False, {"status": "error", "reason": "addorder_error", "detail": res["error"]}
+
+            result = res.get("result", {})
+            # Start fill watchdog for post-only orders
+            if result.get("txid"):
+                txid = result["txid"][0] if isinstance(result["txid"], list) else result["txid"]
+                import os
+                watchdog = wait_for_fill_or_reprice(api, txid, side, meta,
+                                                    max_open_mins=int(os.getenv("MAX_OPEN_MINS", 3)),
+                                                    reprice_ticks=int(os.getenv("REPRICE_TICKS", 2)))
+                logger.info("WATCHDOG %s", watchdog)
+                result["watchdog"] = watchdog
             
-            if _parse_ok(result):
-                result.update({"status": "success", "mode": "post_only", "price_used": po, "userref": userref})
-                return (True, result)
-            
-            return (False, {"status": "error", "reason": "kraken_reject", "resp": result, "payload": payload})
+            return True, {"status": "success", "mode":"post_only", "result": result}
         except Exception as e:
-            return (False, {"status": "error", "reason": str(e)})
+            return False, {"status": "error", "reason": str(e)}
 
     def place_market_with_slippage_cap(self, side: str, qty: float, max_slippage_bps: int = 10) -> dict:
-        """Place a market order with slippage protection using IOC limit"""
-        pair = KRAKEN_PAIR
-        lot_step, tick = self._get_pair_meta(pair)
-        
-        # Get orderbook for slippage calculation
-        ob = self.get_orderbook_snapshot(pair, depth=FALLBACK_OB_DEPTH) or {}
-        best_bid, best_ask = float(ob.get("best_bid", 0)), float(ob.get("best_ask", 0))
-        if best_bid <= 0 or best_ask <= 0: 
-            return {"status": "error", "reason": "no_orderbook"}
+        """Market order with slippage cap (synthetic IOC limit)"""
+        api = self
+        meta = get_pair_meta(api)
+        qts = best_quotes(api)
+        tick = meta["tick"]
 
-        cap = _slip_cap(best_ask if side == "buy" else best_bid, side, max_slippage_bps)
-        px = _round_price(cap, tick)
-        vol = _round_qty(qty, lot_step)
-        if vol <= 0: 
-            return {"status": "skipped", "reason": "qty_rounding_zero"}
-        
-        userref = f"grid-mkcap-{side}-{_now_iso()}"
+        qty = round_down(qty, meta["lot_step"])
+        if qty <= 0:
+            return {"status": "error", "reason": "qty_le_0"}
 
-        if self.demo_mode:
-            # Simulate market order with slippage cap in demo mode
-            market_data = self.get_market_data()
-            current_price = market_data['close'] if market_data else 45000.0
-            
-            logger.info(f"Demo market {side} order: {vol:.6f} BTC at ${px:.2f} (max slippage: {max_slippage_bps}bps)")
-            
-            return {
-                'status': 'success',
-                'order_id': f"demo_market_{side}_{int(time.time())}",
-                'side': side,
-                'quantity': vol,
-                'price': px,
-                'ordertype': 'limit',
-                'mode': 'mk_slip_cap',
-                'price_cap': px,
-                'userref': userref,
-                'demo_mode': True
-            }
+        if side == "buy":
+            cap = qts["ask"] * (1.0 + max_slippage_bps/1e4)
+            px  = round_up(cap, tick)
+            ordertype = "limit"   # IOC limit acts like slippage-capped market
+            tif = "IOC"
+        else:
+            cap = qts["bid"] * (1.0 - max_slippage_bps/1e4)
+            px  = round_down(cap, tick)
+            ordertype = "limit"
+            tif = "IOC"
 
         payload = {
-            "pair": pair, "type": side, "ordertype": "limit", "price": f"{px:.10f}",
-            "volume": f"{vol:.10f}", "timeinforce": "IOC", "userref": userref
+            "pair": meta["pair"],
+            "type": "buy" if side == "buy" else "sell",
+            "ordertype": ordertype,
+            "price": f"{px:.{meta['price_dec']}f}",
+            "volume": f"{qty:.{meta['lot_dec']}f}",
+            "timeinforce": tif,
+            "userref": int(time.time()),
+            # "validate": True,
         }
         
         try:
             endpoint = "/private/AddOrder"
-            result = self._make_request_with_retry('POST', endpoint, data=payload, private=True, signature_path="/0/private/AddOrder")
-            
-            if _parse_ok(result):
-                result.update({"status": "success", "mode": "mk_slip_cap", "price_cap": px, "userref": userref})
-                return result
-            
-            return {"status": "error", "reason": "kraken_reject", "resp": result, "payload": payload}
+            res = self._make_request_with_retry('POST', endpoint, data=payload, private=True, signature_path="/0/private/AddOrder")
+            if res.get("error"):
+                return {"status":"error","reason":"addorder_error","detail":res["error"]}
+            return {"status": "success", "mode":"ioc_limit_cap", "result": res.get("result", {})}
         except Exception as e:
             return {"status": "error", "reason": str(e)}
 

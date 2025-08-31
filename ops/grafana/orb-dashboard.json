@@ -1,0 +1,165 @@
+{
+    "id": null,
+    "title": "ORB Bot Overview",
+    "timezone": "browser",
+    "schemaVersion": 38,
+    "version": 1,
+    "refresh": "15s",
+    "time": {
+        "from": "now-24h",
+        "to": "now"
+    },
+    "panels": [
+        {
+            "type": "timeseries",
+            "title": "Signals (rate)",
+            "gridPos": {
+                "x": 0,
+                "y": 0,
+                "w": 12,
+                "h": 8
+            },
+            "targets": [
+                {
+                    "expr": "rate(orb_signals_total{dir!=\"none\"}[15m])",
+                    "legendFormat": "{{dir}} {{reason}}",
+                    "refId": "A"
+                }
+            ],
+            "options": {
+                "legend": {
+                    "displayMode": "table",
+                    "placement": "right"
+                }
+            }
+        },
+        {
+            "type": "barchart",
+            "title": "Skips by reason (15m rate)",
+            "gridPos": {
+                "x": 12,
+                "y": 0,
+                "w": 12,
+                "h": 8
+            },
+            "targets": [
+                {
+                    "expr": "sum(rate(orb_skips_total[15m])) by (reason)",
+                    "legendFormat": "{{reason}}",
+                    "refId": "A"
+                }
+            ],
+            "options": {
+                "legend": {
+                    "displayMode": "list",
+                    "placement": "right"
+                },
+                "orientation": "auto",
+                "stacking": "normal"
+            }
+        },
+        {
+            "type": "timeseries",
+            "title": "Trades (daily increase)",
+            "gridPos": {
+                "x": 0,
+                "y": 8,
+                "w": 8,
+                "h": 8
+            },
+            "targets": [
+                {
+                    "expr": "increase(orb_trades_total[1d])",
+                    "legendFormat": "{{dir}} {{mode}}",
+                    "refId": "A"
+                }
+            ],
+            "options": {
+                "legend": {
+                    "displayMode": "list",
+                    "placement": "right"
+                }
+            }
+        },
+        {
+            "type": "timeseries",
+            "title": "Spread p90 (bps)",
+            "gridPos": {
+                "x": 8,
+                "y": 8,
+                "w": 8,
+                "h": 8
+            },
+            "targets": [
+                {
+                    "expr": "histogram_quantile(0.9, sum(rate(spread_bps_bucket[5m])) by (le))",
+                    "legendFormat": "p90",
+                    "refId": "A"
+                }
+            ],
+            "fieldConfig": {
+                "defaults": {
+                    "unit": "bps"
+                },
+                "overrides": []
+            },
+            "options": {
+                "legend": {
+                    "displayMode": "list",
+                    "placement": "right"
+                }
+            }
+        },
+        {
+            "type": "timeseries",
+            "title": "Equity (USD)",
+            "gridPos": {
+                "x": 16,
+                "y": 8,
+                "w": 8,
+                "h": 8
+            },
+            "targets": [
+                {
+                    "expr": "equity_usd",
+                    "legendFormat": "equity",
+                    "refId": "A"
+                }
+            ],
+            "fieldConfig": {
+                "defaults": {
+                    "unit": "currencyUSD",
+                    "decimals": 2
+                },
+                "overrides": []
+            }
+        },
+        {
+            "type": "timeseries",
+            "title": "Exposure (0..1)",
+            "gridPos": {
+                "x": 0,
+                "y": 16,
+                "w": 12,
+                "h": 8
+            },
+            "targets": [
+                {
+                    "expr": "exposure_frac",
+                    "legendFormat": "exposure",
+                    "refId": "A"
+                }
+            ],
+            "fieldConfig": {
+                "defaults": {
+                    "unit": "percentunit",
+                    "decimals": 2
+                },
+                "overrides": []
+            }
+        }
+    ],
+    "templating": {
+        "list": []
+    }
+}

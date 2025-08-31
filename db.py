@@ -448,25 +448,43 @@ def init_default_settings() -> None:
     """Initialize default settings if they don't exist."""
     import os
     defaults = {
-        # Trading Settings - Updated to recommended values
-        "min_confidence": float(os.getenv("MIN_CONFIDENCE") or "0.8"),  # Raised from 0.7 to 0.8
-        "max_exposure": float(os.getenv("MAX_EXPOSURE") or "0.8"),  # Keep at 0.8 (aggressive)
-        "trade_cooldown_hours": float(os.getenv("TRADE_COOLDOWN_HOURS") or "1"),  # Reduced from 3 to 1
-        "min_trade_delta": float(os.getenv("MIN_TRADE_DELTA") or "0.0"),  # Reduced from 0.05 to 0.0
-        "min_trade_delta_usd": float(os.getenv("MIN_TRADE_DELTA_USD") or "10.0"),  # Keep at 10.0 (exchange minimum)
-        "min_trade_delta_pct": float(os.getenv("MIN_TRADE_DELTA_PCT") or "0.00"),  # Keep at 0.00
-        "no_fee_mode": parse_bool(os.getenv("NO_FEE_MODE") or "True"),  # Keep no-fee mode enabled
-        "grid_executor_enabled": parse_bool(os.getenv("GRID_EXECUTOR_ENABLED") or "True"),  # Keep grid executor enabled
-        "grid_step_pct": float(os.getenv("GRID_STEP_PCT") or "0.25"),  # Keep at 0.25%
-        "grid_order_usd": float(os.getenv("GRID_ORDER_USD") or "12.0"),  # Keep at $12 per grid trade
-        "max_grid_exposure": float(os.getenv("MAX_GRID_EXPOSURE") or "0.1"),  # Keep at 10% max grid exposure
-        "auto_trade_enabled": True,  # Keep auto-trade enabled
+        # Strategy Mode and core
+        "strategy_mode": os.getenv("STRATEGY_MODE") or "ORB",
+        # Trading Settings - set for ORB verification
+        "min_confidence": float(os.getenv("MIN_CONFIDENCE") or "0.8"),
+        "max_exposure": float(os.getenv("MAX_EXPOSURE") or "0.8"),
+        "trade_cooldown_hours": float(os.getenv("TRADE_COOLDOWN_HOURS") or "1"),
+        "min_trade_delta": float(os.getenv("MIN_TRADE_DELTA") or "0.0"),
+        "min_trade_delta_usd": float(os.getenv("MIN_NOTIONAL_USD") or os.getenv("MIN_TRADE_DELTA_USD") or "10.0"),
+        "min_trade_delta_pct": float(os.getenv("MIN_TRADE_DELTA_PCT") or "0.00"),
+        "no_fee_mode": parse_bool(os.getenv("NO_FEE_MODE") or "True"),
+        # Grid OFF during ORB validation
+        "grid_executor_enabled": parse_bool(os.getenv("GRID_EXECUTOR_ENABLED") or "False"),
+        "grid_step_pct": float(os.getenv("GRID_STEP_PCT") or "0.25"),
+        "grid_order_usd": float(os.getenv("GRID_ORDER_USD") or "12.0"),
+        "max_grid_exposure": float(os.getenv("MAX_GRID_EXPOSURE") or "0.1"),
+        "auto_trade_enabled": True,
+        # ORB defaults (enabled by default for this rollout)
+        "orb_enabled": parse_bool(os.getenv("ORB_ENABLED") or "True"),
+        "orb_open_minutes": 15,
+        "orb_confirm_minutes": 5,
+        "orb_min_range_pct": 0.002,
+        "orb_ema_fast": 9,
+        "orb_ema_mid": 20,
+        "orb_ema_slow": 50,
+        "orb_risk_per_trade": 0.005,
+        "orb_buffer_frac": 0.10,
+        "orb_max_spread_bps": 8,
+        "orb_max_adds": 2,
+        "orb_trail_atr_mult": 2.0,
         # Safety Settings - Updated to recommended values
-        "safety_skip_degraded": True,  # Keep skip trades if data degraded
-        "safety_max_price_staleness_sec": 120.0,  # Keep at 120s
+        "safety_skip_degraded": True,
+        "safety_max_price_staleness_sec": float(os.getenv("MAX_PRICE_STALENESS_SEC") or "120"),
         "safety_min_expected_move_pct": 0.02,  # Reduced from 0.1 to 0.02 (spread guard handles micro-chop)
-        "safety_daily_pnl_limit_usd": -5.0,  # Keep at -$5 (stop for the day after losing $5)
+        "safety_daily_pnl_limit_usd": float(os.getenv("DAILY_PNL_LIMIT") or "-5"),
         "safety_daily_equity_drop_pct": 3.0,  # Keep at 3%
+        # Session close exit time (ET)
+        "session_close_et": os.getenv("SESSION_CLOSE_ET") or "16:00",
     }
     
     current_settings = read_settings()

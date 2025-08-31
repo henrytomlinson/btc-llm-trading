@@ -1,0 +1,47 @@
+version: "3.9"
+services:
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: orb-prometheus
+    volumes:
+      - ./ops/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "127.0.0.1:9090:9090"
+    restart: unless-stopped
+    networks:
+      - btcnet
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: orb-grafana
+    env_file:
+      - ./ops/secrets.env
+    environment:
+      - GF_SECURITY_ADMIN_USER=henry_admin
+      - GF_SECURITY_ADMIN_PASSWORD=9pcm5YTa2Uu/y25mVkgZYDkjxxh5aW/Nm45WiWsRjfgQYaUgBFDEDj/Cm0zSyHDE
+      - GF_SERVER_DOMAIN=localhost
+      - GF_SERVER_PROTOCOL=http
+      - GF_SERVER_ENFORCE_DOMAIN=false
+      - GF_SERVER_USE_TLS=false
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_AUTH_ANONYMOUS_ENABLED=false
+      - GF_SECURITY_DISABLE_GRAVATAR=true
+      - GF_SECURITY_COOKIE_SECURE=true
+      - GF_SECURITY_ALLOW_EMBEDDING=false
+      - GF_LOG_MODE=console
+      - GF_SERVER_ROOT_URL=https://henryt-btc.live/grafana/
+      - GF_SERVER_SERVE_FROM_SUB_PATH=true
+      - GF_SERVER_ENFORCE_DOMAIN=false
+      - GF_SERVER_DOMAIN=localhost
+    volumes:
+      - ./ops/grafana/data:/var/lib/grafana
+    ports:
+      - "127.0.0.1:3000:3000"
+    restart: unless-stopped
+    networks:
+      - btcnet
+
+networks:
+  btcnet:
+    external: true
+    name: btc-llm-trading_btc-network
