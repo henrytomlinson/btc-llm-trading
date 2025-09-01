@@ -40,30 +40,22 @@ def get_free_usd() -> float:
     Return spendable USD on Kraken spot with proper asset mapping.
     Kraken /Balance returns like {"ZUSD":"242.11","XXBT":"0.00001", ...}
     """
-    ASSET_MAP = {
-        "USD": ("ZUSD", "USD"),
-        "BTC": ("XXBT", "XBT", "BTC"),
-    }
-    
     SAFETY_BUFFER = float(os.getenv("SAFETY_BUFFER", "0.995"))  # default 99.5%
     
     try:
-        from kraken_trading_btc import get_balances_normalized
-        bal = get_balances_normalized()
+        # Use the working balance detection from KrakenTradingBot
+        from kraken_trading_btc import KrakenTradingBot
+        bot = KrakenTradingBot()
+        account_info = bot.get_account_info()
         
-        # Optional: one-time debug
-        logger.debug(f"BALANCE_RAW {bal}")
-        
-        for key in ASSET_MAP["USD"]:
-            if key in bal:
-                try:
-                    usd = float(bal[key])
-                    return max(0.0, usd) * SAFETY_BUFFER
-                except Exception:
-                    pass
-        return 0.0
+        if "error" in account_info:
+            return 0.0
+            
+        # Get USD balance from the account info
+        usd_balance = account_info.get("cash", 0.0)
+        return max(0.0, usd_balance) * SAFETY_BUFFER
     except Exception as e:
-        logger.warning(f"Failed to get USD balance: {e}")
+        # logger.warning(f"Failed to get USD balance: {e}")  # Commented out - logger not available yet
         return 0.0
 
 
@@ -829,10 +821,26 @@ class ORBExecutor:
                 return {"status": "skipped", "reason": "bad_price", "session": session_label}
             
             # Get balances with improved USD detection
-            from kraken_trading_btc import get_balances_normalized, get_pair_meta
-            balances = get_balances_normalized()
-            self.last_btc_balance = float(balances.get("btc", 0.0))
-            self.last_usd_balance = get_free_usd()  # Use improved USD detection
+            from kraken_trading_btc import get_pair_meta
+            try:
+                from kraken_trading_btc import KrakenTradingBot
+                bot = KrakenTradingBot()
+                account_info = bot.get_account_info()
+                
+                if "error" not in account_info:
+                    # Get USD balance from account info
+                    self.last_usd_balance = float(account_info.get("cash", 0.0))
+                    
+                    # Get BTC balance from account info
+                    balances = account_info.get("balances", {})
+                    btc_balance = float(balances.get("XXBT", 0.0))
+                    self.last_btc_balance = btc_balance
+                else:
+                    self.last_usd_balance = 0.0
+                    self.last_btc_balance = 0.0
+            except Exception:
+                self.last_usd_balance = 0.0
+                self.last_btc_balance = 0.0
             
             # Get pair metadata for rounding
             try:
@@ -853,13 +861,22 @@ class ORBExecutor:
             acct = bot.get_current_exposure()
             equity = float(acct.get("equity", 0.0))
             
-            # Size the position
-            qty = size_by_risk(self.params.risk_per_trade, equity, entry, stop)
-            self.last_risk_qty = qty
+            # --- Size with risk and cap USD usage to keep cash for adds ---
+            # risk-based position size
+            price_diff = abs(entry - stop) or 1e-9
+            risk_usd = float(self.params.risk_per_trade) * equity
+            qty_by_risk = max(0.0, risk_usd / price_diff)
+            usd_by_risk = qty_by_risk * entry
+            # cap by max entry exposure and free USD
+            usd_cap = equity * float(os.getenv("MAX_ENTRY_EXPOSURE", "0.6"))
+            usd_free = max(0.0, float(self.last_usd_balance or 0.0))
+            usd_to_use = min(usd_free, usd_by_risk, usd_cap)
+            qty = max(0.0, usd_to_use / entry)
+            self.last_risk_qty = qty_by_risk
             
             # Check USD balance before proceeding
             min_notional_usd = float(os.getenv("MIN_NOTIONAL_USD", "10.0"))
-            if self.last_usd_balance < min_notional_usd:
+            if (qty * entry) < min_notional_usd or self.last_usd_balance < min_notional_usd:
                 logger.info(f"ORB_SKIP reason=insufficient_usd usd_bal={self.last_usd_balance:.2f} "
                            f"min_notional={min_notional_usd}")
                 return {"status": "error", "reason": "insufficient_usd", "session": session_label}
@@ -889,12 +906,13 @@ class ORBExecutor:
             logger.warning(f"Failed to execute entry: {e}")
             return {"status": "error", "session": session_label, "reason": str(e)}
 
-    def run_orb_cycle(self, now_utc: datetime | None = None) -> dict:
+    def run_orb_cycle(self, now_utc: datetime | None = None, settings: Dict[str, Any] | None = None) -> dict:
         now_utc = now_utc or datetime.now(timezone.utc)
         
-        # Load settings and state
-        from auto_trade_scheduler import load_runtime_settings
-        settings = load_runtime_settings()
+        # Load settings if not provided
+        if settings is None:
+            from auto_trade_scheduler import load_runtime_settings
+            settings = vars(load_runtime_settings())
         
         # Check if ORB is enabled
         if not settings.get("orb_enabled", False):
@@ -1012,6 +1030,6 @@ class ORBExecutor:
 def run_orb_cycle(now: datetime, settings: Dict[str, Any]) -> Dict[str, Any]:
     """Legacy wrapper for the new ORBExecutor class"""
     executor = ORBExecutor()
-    return executor.run_orb_cycle(now)
+    return executor.run_orb_cycle(now, settings)
 
 

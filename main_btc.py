@@ -2587,6 +2587,24 @@ def diag_telemetry():
     except Exception as e:
         return {"error": str(e)}
 
+@app.get("/diagnostics/scheduler_settings")
+async def diagnostics_scheduler_settings():
+    """Get effective settings that the scheduler will use"""
+    try:
+        from auto_trade_scheduler import load_runtime_settings
+        s = load_runtime_settings()
+        return {
+            "strategy_mode": s.strategy_mode,
+            "orb_enabled": s.orb_enabled,
+            "orb_sessions": s.orb_sessions,
+            "orb_days": s.orb_days,
+            "london_open": s.london_open, "london_close": s.london_close,
+            "ny_open": s.ny_open, "ny_close": s.ny_close,
+            "spot_only": s.spot_only, "allow_short": s.allow_short,
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
 # --- ORB helper endpoints ----------------------------------------------------
 @app.get("/orb/status")
 async def orb_status():
@@ -2607,10 +2625,17 @@ async def orb_status():
         btc_bal = 0.0
         usd_bal = 0.0
         try:
-            from kraken_trading_btc import get_balances_normalized
-            balances = get_balances_normalized()
-            btc_bal = _f(balances.get("btc"))
-            usd_bal = _f(balances.get("usd"))
+            from kraken_trading_btc import KrakenTradingBot
+            bot = KrakenTradingBot()
+            account_info = bot.get_account_info()
+            
+            if "error" not in account_info:
+                # Get USD balance from account info
+                usd_bal = _f(account_info.get("cash"))
+                
+                # Get BTC balance from account info
+                balances = account_info.get("balances", {})
+                btc_bal = _f(balances.get("XXBT"))
         except Exception:
             pass
         
@@ -2624,7 +2649,7 @@ async def orb_status():
         # Unify session logic with the executor
         now_utc = datetime.now(timezone.utc)
         settings = load_runtime_settings()
-        session_name, open_utc, close_utc = resolve_session(now_utc, settings)
+        session_name, open_utc, close_utc = resolve_session(now_utc, vars(settings))
         
         # Create executor instance to get current state
         executor = ORBExecutor()

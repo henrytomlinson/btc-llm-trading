@@ -38,6 +38,9 @@ services:
       - MAX_OPEN_MINS=${MAX_OPEN_MINS:-3}
       - REPRICE_TICKS=${REPRICE_TICKS:-2}
       - ALLOW_SHORT=${ALLOW_SHORT:-false}
+      - ORB_ENABLED=${ORB_ENABLED:-true}
+      - STRATEGY_MODE=${STRATEGY_MODE:-ORB}
+      - GRID_EXECUTOR_ENABLED=${GRID_EXECUTOR_ENABLED:-false}
     healthcheck:
       test: [ "CMD", "curl", "-f", "http://localhost:8000/test_apis" ]
       interval: 30s

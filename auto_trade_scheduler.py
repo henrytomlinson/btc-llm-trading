@@ -12,6 +12,7 @@ from typing import Any, Dict
 import time
 import os
 import sys
+from types import SimpleNamespace
 
 # Add the current directory to Python path to import modules
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -59,6 +60,15 @@ except ImportError:
         if v is None: return default
         s = str(v).strip().lower()
         return s in {"1","true","t","yes","y","on","enabled","enable"}
+
+TRUE_SET = {"1","true","yes","y","on"}
+FALSE_SET = {"0","false","no","n","off"}
+
+def _typed(val, typ, default=None):
+    try:
+        return typ(val)
+    except Exception:
+        return default
 
 # Grid trading constants
 from math import floor
@@ -258,67 +268,95 @@ def place_delta_notional(action: str, notional: float, settings: dict):
         return {"status":"error","reason":str(e)}
 
 def load_runtime_settings():
-    """Load runtime settings from database."""
+    """Load runtime settings with precedence: defaults < ENV < DB (non-empty keys only)."""
+    # 1) defaults (edit to match your current defaults)
+    defaults = {
+        "strategy_mode": "ORB",
+        "orb_enabled": True,
+        "orb_sessions": "LONDON,NY",
+        "orb_days": "1234567",
+        "london_open": "08:00",
+        "london_close": "16:00",
+        "ny_open": "09:30",
+        "ny_close": "16:00",
+        "orb_minutes": 15,
+        "orb_confirm_minutes": 5,
+        "orb_min_orb_pct": 0.002,
+        "orb_risk_per_trade": 0.005,
+        "orb_buffer_bps": 2,
+        "orb_buffer_frac": 0.10,
+        "orb_max_adds": 2,
+        "orb_trail_atr_mult": 2.0,
+        "max_spread_bps": 8,
+        "max_price_staleness_sec": 120,
+        "min_notional_usd": 10,
+        "grid_executor_enabled": False,
+        "spot_only": True,
+        "allow_short": False,
+    }
+
+    # 2) ENV overlay (strings -> normalized later)
+    env = {
+        "strategy_mode": os.getenv("STRATEGY_MODE"),
+        "orb_enabled": os.getenv("ORB_ENABLED"),
+        "orb_sessions": os.getenv("ORB_SESSIONS"),
+        "orb_days": os.getenv("ORB_DAYS"),
+        "london_open": os.getenv("LONDON_OPEN"),
+        "london_close": os.getenv("LONDON_CLOSE"),
+        "ny_open": os.getenv("NY_OPEN"),
+        "ny_close": os.getenv("NY_CLOSE"),
+        "orb_minutes": os.getenv("ORB_MINUTES"),
+        "orb_confirm_minutes": os.getenv("ORB_CONFIRM_MINUTES"),
+        "orb_min_orb_pct": os.getenv("ORB_MIN_ORB_PCT"),
+        "orb_risk_per_trade": os.getenv("ORB_RISK_PER_TRADE"),
+        "orb_buffer_bps": os.getenv("ORB_BUFFER_BPS"),
+        "orb_buffer_frac": os.getenv("ORB_BUFFER_FRAC"),
+        "orb_max_adds": os.getenv("ORB_MAX_ADDS"),
+        "orb_trail_atr_mult": os.getenv("ORB_TRAIL_ATR_MULT"),
+        "max_spread_bps": os.getenv("MAX_SPREAD_BPS"),
+        "max_price_staleness_sec": os.getenv("MAX_PRICE_STALENESS_SEC"),
+        "min_notional_usd": os.getenv("MIN_NOTIONAL_USD"),
+        "grid_executor_enabled": os.getenv("GRID_EXECUTOR_ENABLED"),
+        "spot_only": os.getenv("SPOT_ONLY"),
+        "allow_short": os.getenv("ALLOW_SHORT"),
+    }
+    env = {k:v for k,v in env.items() if v not in (None, "")}
+
+    # 3) DB overlay (only if not empty)
     try:
         from db import read_settings
-        settings = read_settings()
-        return {
-            "max_exposure": float(settings.get("max_exposure", 0.8)),
-            "cooldown_hours": float(settings.get("trade_cooldown_hours", 3)),
-            "min_confidence": float(settings.get("min_confidence", 0.7)),
-            "min_trade_delta": float(settings.get("min_trade_delta", 0.05)),
-            "min_trade_delta_usd": float(settings.get("min_trade_delta_usd", 10.0)),
-            "min_trade_delta_pct": float(settings.get("min_trade_delta_pct", 0.00)),
-            "no_fee_mode": parse_bool(settings.get("no_fee_mode", True)),
-            "grid_executor_enabled": parse_bool(settings.get("grid_executor_enabled", True)),
-            "grid_step_pct": float(settings.get("grid_step_pct", 0.25)),
-            "grid_order_usd": float(settings.get("grid_order_usd", 12.0)),
-            "max_grid_exposure": float(settings.get("max_grid_exposure", 0.1)),
-            # Strategy mode and ORB params
-            "strategy_mode": str(settings.get("strategy_mode", "ORB")),
-            "orb_enabled": parse_bool(settings.get("orb_enabled", False)),
-            "orb_open_minutes": int(settings.get("orb_open_minutes", 15)),
-            "orb_confirm_minutes": int(settings.get("orb_confirm_minutes", 5)),
-            "orb_min_range_pct": float(settings.get("orb_min_range_pct", 0.002)),
-            "orb_ema_fast": int(settings.get("orb_ema_fast", 9)),
-            "orb_ema_mid": int(settings.get("orb_ema_mid", 20)),
-            "orb_ema_slow": int(settings.get("orb_ema_slow", 50)),
-            "orb_risk_per_trade": float(settings.get("orb_risk_per_trade", 0.005)),
-            "orb_buffer_frac": float(settings.get("orb_buffer_frac", 0.10)),
-            "orb_max_spread_bps": int(settings.get("orb_max_spread_bps", 8)),
-            "orb_max_adds": int(settings.get("orb_max_adds", 2)),
-            "orb_trail_atr_mult": float(settings.get("orb_trail_atr_mult", 2.0)),
-        }
+        db = read_settings() or {}
     except Exception as e:
-        logger.warning(f"Failed to load settings from DB: {e}")
-        # Fallback to environment variables
-        return {
-                    "max_exposure": float(os.getenv("MAX_EXPOSURE", "0.8")),
-        "cooldown_hours": float(os.getenv("TRADE_COOLDOWN_HOURS", "1")),
-        "min_confidence": float(os.getenv("MIN_CONFIDENCE", "0.8")),
-            "min_trade_delta": float(os.getenv("MIN_TRADE_DELTA", "0.0")),
-            "min_trade_delta_usd": float(os.getenv("MIN_TRADE_DELTA_USD", "10.0")),
-            "min_trade_delta_pct": float(os.getenv("MIN_TRADE_DELTA_PCT", "0.00")),
-            "no_fee_mode": parse_bool(os.getenv("NO_FEE_MODE", "True")),
-            "grid_executor_enabled": parse_bool(os.getenv("GRID_EXECUTOR_ENABLED", "True")),
-            "grid_step_pct": float(os.getenv("GRID_STEP_PCT", "0.25")),
-            "grid_order_usd": float(os.getenv("GRID_ORDER_USD", "12.0")),
-            "max_grid_exposure": float(os.getenv("MAX_GRID_EXPOSURE", "0.1")),
-            # Strategy mode and ORB params
-            "strategy_mode": str(os.getenv("STRATEGY_MODE", "ORB")),
-            "orb_enabled": parse_bool(os.getenv("ORB_ENABLED", "True")),
-            "orb_open_minutes": int(os.getenv("ORB_OPEN_MINUTES", "15")),
-            "orb_confirm_minutes": int(os.getenv("ORB_CONFIRM_MINUTES", "5")),
-            "orb_min_range_pct": float(os.getenv("ORB_MIN_RANGE_PCT", "0.002")),
-            "orb_ema_fast": int(os.getenv("ORB_EMA_FAST", "9")),
-            "orb_ema_mid": int(os.getenv("ORB_EMA_MID", "20")),
-            "orb_ema_slow": int(os.getenv("ORB_EMA_SLOW", "50")),
-            "orb_risk_per_trade": float(os.getenv("ORB_RISK_PER_TRADE", "0.005")),
-            "orb_buffer_frac": float(os.getenv("ORB_BUFFER_FRAC", "0.10")),
-            "orb_max_spread_bps": int(os.getenv("ORB_MAX_SPREAD_BPS", "8")),
-            "orb_max_adds": int(os.getenv("ORB_MAX_ADDS", "2")),
-            "orb_trail_atr_mult": float(os.getenv("ORB_TRAIL_ATR_MULT", "2.0")),
-        }
+        logging.warning("SETTINGS db read failed: %s", e)
+        db = {}
+    db = {k:v for k,v in db.items() if v not in (None, "")}
+
+    # precedence: defaults < env < db
+    merged = {**defaults, **env, **db}
+
+    # normalize types
+    merged["strategy_mode"] = str(merged.get("strategy_mode","ORB")).upper()
+    merged["orb_enabled"] = parse_bool(merged.get("orb_enabled"), defaults["orb_enabled"])
+    merged["grid_executor_enabled"] = parse_bool(merged.get("grid_executor_enabled"), defaults["grid_executor_enabled"])
+    merged["spot_only"] = parse_bool(merged.get("spot_only"), defaults["spot_only"])
+    merged["allow_short"] = parse_bool(merged.get("allow_short"), defaults["allow_short"])
+
+    for k in ["orb_minutes","orb_confirm_minutes","orb_max_adds",
+              "max_spread_bps","max_price_staleness_sec","min_notional_usd"]:
+        merged[k] = _typed(merged.get(k), int, defaults[k])
+
+    for k in ["orb_min_orb_pct","orb_risk_per_trade","orb_buffer_frac","orb_trail_atr_mult"]:
+        merged[k] = _typed(merged.get(k), float, defaults[k])
+
+    merged["orb_buffer_bps"] = _typed(merged.get("orb_buffer_bps"), int, defaults["orb_buffer_bps"])
+
+    # log once per boot for visibility
+    logging.info("SETTINGS effective=%s", json.dumps({k: merged[k] for k in [
+        "strategy_mode","orb_enabled","orb_sessions","orb_days",
+        "london_open","london_close","ny_open","ny_close",
+        "spot_only","allow_short","grid_executor_enabled"
+    ]}))
+    return SimpleNamespace(**merged)
 
 def check_price_staleness():
     """Check if price data is stale before executing trades"""
@@ -372,40 +410,21 @@ def execute_auto_trade(now: datetime | None = None) -> Dict[str, Any]:
     Logs every outcome. Never raises (returns a dict instead).
     """
     now = now or datetime.now(timezone.utc)
-    settings = load_runtime_settings()  # must contain orb_enabled, max_price_staleness_sec, max_spread_bps, etc.
+    s = load_runtime_settings()  # must contain orb_enabled, max_price_staleness_sec, max_spread_bps, etc.
 
-    # 1) ORB path
-    try:
-        if settings.get("orb_enabled"):
+    # ORB-first scheduler guard
+    if s.strategy_mode == "ORB" or s.orb_enabled:
+        try:
             from orb_executor import run_orb_cycle
-            res = run_orb_cycle(now, settings) or {"status": "error", "reason": "orb_cycle_returned_none"}
-            logger.info("ORB_CYCLE %s", safe_json(res))
-            return res
-    except Exception as e:
-        logger.exception("ORB_RUN_ERROR %s", e)
-
-    # 2) (optional) Grid path
-    try:
-        if settings.get("grid_executor_enabled"):
-            from grid_executor import run_grid_cycle
-            res = run_grid_cycle(now, settings) or {"status":"error","reason":"grid_cycle_returned_none"}
-            logger.info("GRID_CYCLE %s", safe_json(res))
-            return res
-    except Exception as e:
-        logger.exception("GRID_RUN_ERROR %s", e)
-
-    # 3) (optional) LLM path
-    try:
-        if settings.get("llm_enabled"):
-            from llm_trading_strategy import run_llm_cycle
-            res = run_llm_cycle(now, settings) or {"status":"error","reason":"llm_cycle_returned_none"}
-            logger.info("LLM_CYCLE %s", safe_json(res))
-            return res
-    except Exception as e:
-        logger.exception("LLM_RUN_ERROR %s", e)
-
-    logger.info("SCHED_NOOP no strategy enabled")
-    return {"status": "noop", "reason": "no_strategy_enabled"}
+            res = run_orb_cycle(now, vars(s)) or {"status": "error", "reason": "orb_cycle_returned_none"}
+            logging.info("ORB_CYCLE %s", safe_json(res))
+            return {"status":"ok", **res}
+        except Exception as e:
+            logging.exception("ORB_RUN_ERROR %s", e)
+            return {"status": "error", "reason": str(e)}
+    
+    logging.info("AUTO_SKIP no_strategy_enabled %s", {"mode": s.strategy_mode, "orb_enabled": s.orb_enabled})
+    return {"status":"noop","reason":"no_strategy_enabled","mode":s.strategy_mode,"orb_enabled":s.orb_enabled}
 
 def main():
     """Main function to execute automated trading"""
