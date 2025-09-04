@@ -412,6 +412,26 @@ def execute_auto_trade(now: datetime | None = None) -> Dict[str, Any]:
     now = now or datetime.now(timezone.utc)
     s = load_runtime_settings()  # must contain orb_enabled, max_price_staleness_sec, max_spread_bps, etc.
 
+    # 0) Cash/exposure maintenance – runs every tick, fast and safe
+    buffer_usd = float(getattr(s, "cash_buffer_usd", 25.0))
+    max_expo = float(getattr(s, "max_exposure", 0.80))
+    min_notional = float(getattr(s, "min_notional_usd", 10.0))
+
+    try:
+        from orb_executor import ensure_cash_buffer
+        from kraken_trading_btc import KrakenTradingBot
+        
+        bot = KrakenTradingBot()
+        buf = ensure_cash_buffer(bot, buffer_usd, max_expo, min_notional)
+        logging.info("CASH_BUFFER %s", buf.__dict__)
+        
+        # If we just placed a sell to raise cash, stop here so we don't immediately buy it back
+        if buf.action == "sell" and buf.placed:
+            logger.info("🛑 CASH_BUFFER: stopping ORB cycle to prevent buying back freed cash")
+            return {"status": "ok", "reason": "cash_buffer_created"}
+    except Exception as e:
+        logging.warning("CASH_BUFFER_ERR %s", e)
+
     # ORB-first scheduler guard
     if s.strategy_mode == "ORB" or s.orb_enabled:
         try:

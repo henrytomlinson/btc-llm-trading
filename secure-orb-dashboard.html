@@ -98,6 +98,13 @@
           <span id="sessionChip" class="chip bg-neutral-800 text-neutral-300 border border-neutral-700">Session:
             —</span>
           <span id="priceChip" class="chip bg-neutral-800 text-neutral-300 border border-neutral-700">Price: —</span>
+          <span id="bufferChip" class="chip bg-neutral-800 text-neutral-300 border border-neutral-700">Cash buffer:
+            —</span>
+          <span id="usdChip" class="chip bg-neutral-800 text-neutral-300 border border-neutral-700">USD: —</span>
+          <span id="exposureChip" class="chip bg-neutral-800 text-neutral-300 border border-neutral-700">Exposure:
+            —</span>
+          <span id="bufferBadge"
+            class="chip bg-amber-500/15 text-amber-300 border border-amber-500/20 hidden">maintaining buffer…</span>
           <button id="flatBtn"
             class="chip bg-rose-500/15 text-rose-300 border border-rose-500/20 hover:bg-rose-500/25">Flat Now</button>
           <button id="logoutBtn"
@@ -485,8 +492,30 @@
       } catch (e) { body.innerHTML = ''; el('noTrades').style.display = 'block'; }
     }
 
+    async function loadCashBuffer() {
+      try {
+        const s = await jget('/orb/cash_buffer_status');
+        if (!s || s.status !== 'success') return;
+        const cb = s.cash_buffer || {};
+        const bufferChip = el('bufferChip');
+        const usdChip = el('usdChip');
+        const exposureChip = el('exposureChip');
+        const badge = el('bufferBadge');
+
+        bufferChip.textContent = `Cash buffer: ${fmt$((cb.target_usd ?? 0))}`;
+        usdChip.textContent = `USD: ${fmt$((cb.current_usd ?? 0))}`;
+        exposureChip.textContent = `Exposure: ${((cb.current_exposure_pct ?? 0)).toFixed(1)}%`;
+
+        if (cb.buffer_status === 'needs_cash') {
+          badge.classList.remove('hidden');
+        } else {
+          badge.classList.add('hidden');
+        }
+      } catch (e) { /* noop */ }
+    }
+
     function loadAllData() {
-      loadKpis(); loadOrb(); loadPrice(); loadEquitySeries(); loadPxSpark(); loadTrades();
+      loadKpis(); loadOrb(); loadPrice(); loadEquitySeries(); loadPxSpark(); loadTrades(); loadCashBuffer();
     }
 
     // --- Initialize when DOM is ready
@@ -553,6 +582,7 @@
           setInterval(loadPxSpark, 30000);
           setInterval(loadEquitySeries, 5 * 60 * 1000);
           setInterval(loadTrades, 60 * 1000);
+          setInterval(loadCashBuffer, 15000); // Add interval for cash buffer
         }
       }
 

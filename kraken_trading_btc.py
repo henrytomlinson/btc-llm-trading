@@ -1122,6 +1122,65 @@ class KrakenTradingBot:
             # Fallback to market order
             return self.place_market_with_slippage_cap(side, qty, max_slippage_bps=10)
 
+    def place_post_only_limit(self, side: str, qty: float, price: float, validate: bool = False, userref: str = None) -> dict:
+        """
+        Place a post-only limit order for cash buffer maintenance.
+        This method is specifically designed for the cash buffer maintenance system.
+        """
+        try:
+            if self.demo_mode:
+                logger.info(f"DEMO: Would place post-only {side} order: {qty:.8f} BTC at ${price:.2f}")
+                return {"status": "success", "demo_mode": True, "side": side, "qty": qty, "price": price}
+            
+            # Prepare order payload
+            payload = {
+                "pair": "XXBTZUSD",
+                "type": side,
+                "ordertype": "limit",
+                "price": f"{price:.2f}",
+                "volume": f"{qty:.8f}",
+                "oflags": "post",  # Post-only flag
+                "timeinforce": "GTC",
+                "userref": userref if userref else int(time.time())
+            }
+            
+            if validate:
+                payload["validate"] = True
+            
+            # Make the API call
+            endpoint = "/private/AddOrder"
+            result = self._make_request_with_retry(
+                'POST', 
+                endpoint, 
+                data=payload, 
+                private=True, 
+                signature_path="/0/private/AddOrder"
+            )
+            
+            if result.get("error"):
+                error_msg = str(result["error"])
+                logger.warning(f"Post-only order failed: {error_msg}")
+                return {"status": "error", "reason": error_msg}
+            
+            # Success
+            order_info = result.get("result", {})
+            txid = order_info.get("txid", [None])[0] if order_info.get("txid") else None
+            
+            logger.info(f"✅ Post-only {side} order placed: {qty:.8f} BTC at ${price:.2f}, txid: {txid}")
+            
+            return {
+                "status": "success",
+                "side": side,
+                "qty": qty,
+                "price": price,
+                "txid": txid,
+                "order_info": order_info
+            }
+            
+        except Exception as e:
+            logger.error(f"Error placing post-only order: {e}")
+            return {"status": "error", "reason": str(e)}
+
     def get_trading_summary(self) -> Dict:
         """Get comprehensive trading summary"""
         try:

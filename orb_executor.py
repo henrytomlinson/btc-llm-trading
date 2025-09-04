@@ -601,10 +601,15 @@ def execute_orb_entry(dir_: str, entry_price: float, stop: float, desired_qty: f
 
     # fetch balances once
     try:
-        from kraken_trading_btc import get_balances_normalized, get_pair_meta
-        bals = get_balances_normalized()  # returns {"btc": float, "usd": float, ...}
-        btc_bal = _safe_float(bals.get("btc", 0.0))
-        usd_bal = get_free_usd()  # Use improved USD detection with proper asset mapping
+        from kraken_trading_btc import KrakenTradingBot
+        bot = KrakenTradingBot()
+        account_info = bot.get_account_info()
+        if "error" in account_info:
+            btc_bal = 0.0
+            usd_bal = 0.0
+        else:
+            btc_bal = _safe_float(account_info.get("balances", {}).get("XXBT", 0.0))
+            usd_bal = _safe_float(account_info.get("cash", 0.0))
     except Exception as e:
         logger.warning(f"Failed to get balances: {e}")
         btc_bal = 0.0
@@ -619,9 +624,7 @@ def execute_orb_entry(dir_: str, entry_price: float, stop: float, desired_qty: f
 
         # Get minimum lot size from pair metadata
         try:
-            from kraken_trading_btc import get_pair_metadata
-            pair_meta = get_pair_metadata(KRAKEN_PAIR_CODE)
-            MIN_LOT_SIZE = float(pair_meta.get("lot_decimals", 0.0001))
+            MIN_LOT_SIZE = 0.0001  # Kraken minimum BTC lot size
         except Exception:
             MIN_LOT_SIZE = 0.0001  # fallback
 
@@ -642,9 +645,7 @@ def execute_orb_entry(dir_: str, entry_price: float, stop: float, desired_qty: f
 
         # Get minimum lot size from pair metadata
         try:
-            from kraken_trading_btc import get_pair_metadata
-            pair_meta = get_pair_metadata(KRAKEN_PAIR_CODE)
-            MIN_LOT_SIZE = float(pair_meta.get("lot_decimals", 0.0001))
+            MIN_LOT_SIZE = 0.0001  # Kraken minimum BTC lot size
         except Exception:
             MIN_LOT_SIZE = 0.0001  # fallback
 
@@ -821,7 +822,6 @@ class ORBExecutor:
                 return {"status": "skipped", "reason": "bad_price", "session": session_label}
             
             # Get balances with improved USD detection
-            from kraken_trading_btc import get_pair_meta
             try:
                 from kraken_trading_btc import KrakenTradingBot
                 bot = KrakenTradingBot()
@@ -842,24 +842,24 @@ class ORBExecutor:
                 self.last_usd_balance = 0.0
                 self.last_btc_balance = 0.0
             
-            # Get pair metadata for rounding
-            try:
-                from kraken_trading_btc import KrakenTradingBot
-                bot = KrakenTradingBot()
-                pair_meta = get_pair_meta(bot)
-                price_tick = float(pair_meta.get("tick", 0.1))
-            except Exception:
-                price_tick = 0.1  # fallback
+            # Use simple price tick for rounding
+            price_tick = 0.1  # fallback
             
             # round to tick
             entry = round_down(mid, price_tick)
             stop = compute_stop(entry, state.orb_high, state.orb_low, self.params.buffer_frac, signal)
             
             # Get equity for sizing
-            from kraken_trading_btc import KrakenTradingBot
-            bot = KrakenTradingBot()
-            acct = bot.get_current_exposure()
-            equity = float(acct.get("equity", 0.0))
+            try:
+                from kraken_trading_btc import KrakenTradingBot
+                bot = KrakenTradingBot()
+                account_info = bot.get_account_info()
+                if "error" not in account_info:
+                    equity = float(account_info.get("equity", 0.0))
+                else:
+                    equity = 0.0
+            except Exception:
+                equity = 0.0
             
             # --- Size with risk and cap USD usage to keep cash for adds ---
             # risk-based position size
@@ -867,12 +867,29 @@ class ORBExecutor:
             risk_usd = float(self.params.risk_per_trade) * equity
             qty_by_risk = max(0.0, risk_usd / price_diff)
             usd_by_risk = qty_by_risk * entry
-            # cap by max entry exposure and free USD
+            
+            # --- SAFER EXPOSURE MANAGEMENT ---
+            # Cap by max entry exposure (default 60%)
             usd_cap = equity * float(os.getenv("MAX_ENTRY_EXPOSURE", "0.6"))
-            usd_free = max(0.0, float(self.last_usd_balance or 0.0))
+            
+            # Always leave cash reserve for adds (default $25)
+            cash_reserve = float(os.getenv("ORB_CASH_RESERVE_USD", "25.0"))
+            usd_free = max(0.0, float(self.last_usd_balance or 0.0) - cash_reserve)
+            
+            # Cap total exposure to prevent "all USD to BTC" behavior (default 80%)
+            max_exposure_pct = float(os.getenv("ORB_MAX_EXPOSURE", "0.80"))
+            current_exposure = (equity - usd_free) / equity if equity > 0 else 0.0
+            if current_exposure >= max_exposure_pct:
+                logger.info(f"ORB_SKIP reason=max_exposure_reached current={current_exposure:.1%} max={max_exposure_pct:.1%}")
+                return {"status": "error", "reason": "max_exposure_reached", "session": session_label}
+            
+            # Use the most conservative limit
             usd_to_use = min(usd_free, usd_by_risk, usd_cap)
             qty = max(0.0, usd_to_use / entry)
             self.last_risk_qty = qty_by_risk
+            
+            logger.info(f"ORB_EXPOSURE_CHECK usd_free={usd_free:.2f} cash_reserve={cash_reserve:.2f} "
+                       f"current_exposure={current_exposure:.1%} max_exposure={max_exposure_pct:.1%}")
             
             # Check USD balance before proceeding
             min_notional_usd = float(os.getenv("MIN_NOTIONAL_USD", "10.0"))
@@ -1031,5 +1048,337 @@ def run_orb_cycle(now: datetime, settings: Dict[str, Any]) -> Dict[str, Any]:
     """Legacy wrapper for the new ORBExecutor class"""
     executor = ORBExecutor()
     return executor.run_orb_cycle(now, settings)
+
+# --- Cash buffer / exposure maintenance --------------------------------------
+from dataclasses import dataclass
+
+@dataclass
+class BufferResult:
+    action: str            # "noop" | "sell"
+    placed: bool           # order placed?
+    reason: str
+    usd_before: float
+    usd_after: float | None
+    qty_sold: float | None
+    price_used: float | None
+
+def ensure_cash_buffer(bot,
+                       buffer_usd: float = 25.0,
+                       max_exposure: float = 0.80,
+                       min_notional_usd: float = 10.0,
+                       safety_buffer: float = 0.995) -> BufferResult:
+    """
+    Ensure we always have at least `buffer_usd` cash and don't exceed `max_exposure`.
+    Sells a tiny BTC slice (post-only limit) to top up cash when needed.
+    Runs idempotently; if there's not enough BTC to sell the min_notional, it noops.
+    """
+    try:
+        # Get account info using the actual method
+        account_info = bot.get_account_info()
+        if "error" in account_info:
+            return BufferResult("noop", False, f"account_error:{account_info['error']}", 0.0, None, None, None)
+        
+        usd = float(account_info.get("cash", 0.0))
+        btc = float(account_info.get("balances", {}).get("XXBT", 0.0))
+        
+        # Get current BTC price using the actual method
+        try:
+            bid, ask, mid = bot.get_top_of_book()
+            price = float(bid)  # conservative on sells
+        except:
+            # Fallback to demo price if API fails
+            price = 45000.0
+
+        equity = usd + btc * price
+        target_cash = max(buffer_usd, equity * (1.0 - max_exposure))
+
+        if usd >= target_cash:
+            return BufferResult("noop", False, "buffer_ok", usd, None, None, None)
+
+        need = (target_cash - usd)
+        # Respect exchange minimums
+        usd_to_sell = max(need, min_notional_usd)
+        qty = usd_to_sell / price
+
+        # If we literally don't have that much BTC, sell what we have if it meets min_notional.
+        if btc * price < min_notional_usd:
+            return BufferResult("noop", False, "btc_not_enough_for_min_notional", usd, None, None, None)
+
+        qty = min(qty, btc)
+
+        # Use simple rounding for now since the bot doesn't have those methods
+        px = round(price * 1.001, 1)  # 0.1% above bid, Kraken requires 1 decimal place
+        qty = round(qty, 8)  # 8 decimal places for BTC
+
+        # Final safety: notional check after rounding
+        if px * qty < min_notional_usd:
+            return BufferResult("noop", False, "rounded_below_min_notional", usd, None, None, None)
+
+        # Execute the sell order
+        res = bot.place_post_only_limit("sell", qty, px, validate=False)
+        if res.get("status") == "success":
+            logger.info(f"✅ CASH_BUFFER sell order placed: {qty} BTC at ${px} for ${px * qty:.2f}")
+            return BufferResult("sell", True, "order_placed", usd, None, qty, px)
+        else:
+            logger.warning(f"❌ CASH_BUFFER sell order failed: {res.get('reason')}")
+            return BufferResult("sell", False, f"order_failed:{res.get('reason')}", usd, None, qty, px)
+        
+    except Exception as e:
+        return BufferResult("noop", False, f"error:{e}", 0.0, None, None, None)
+
+# --- FastAPI handler functions for safe route registration ---
+def get_orb_status() -> Dict[str, Any]:
+    """Get ORB status for FastAPI endpoint"""
+    try:
+        from db import get_setting
+        from auto_trade_scheduler import load_runtime_settings
+        from datetime import datetime, timezone
+        
+        # Safe float conversion helper
+        def _f(v, d=0.0):
+            try:
+                return float(v)
+            except (ValueError, TypeError):
+                return d
+        
+        # Get real balances
+        btc_bal = 0.0
+        usd_bal = 0.0
+        try:
+            from kraken_trading_btc import KrakenTradingBot
+            bot = KrakenTradingBot()
+            account_info = bot.get_account_info()
+            
+            if "error" not in account_info:
+                usd_bal = _f(account_info.get("cash"))
+                balances = account_info.get("balances", {})
+                btc_bal = _f(balances.get("XXBT"))
+        except Exception:
+            pass
+        
+        # Get current spread
+        try:
+            current_spread = get_spread_bps()
+        except Exception:
+            current_spread = 0.0
+        
+        # Get session info
+        now_utc = datetime.now(timezone.utc)
+        settings = load_runtime_settings()
+        session_name, open_utc, close_utc = resolve_session(now_utc, vars(settings))
+        
+        # Create executor instance to get current state
+        executor = ORBExecutor()
+        
+        # Determine phase
+        if session_name is None:
+            phase = "PRE"
+        elif executor.state and executor.state.orb_high is not None:
+            phase = executor.state.phase or "WAIT_CONFIRM"
+        else:
+            phase = "ORB_BUILD"
+        
+        # Get bar counts
+        bars_1m = 0
+        bars_5m = 0
+        try:
+            bars_1m = len(fetch_ohlc("XXBTZUSD", interval_min=1) or [])
+            bars_5m = len(fetch_ohlc("XXBTZUSD", interval_min=5) or [])
+        except Exception:
+            pass
+        
+        return {
+            "mode": get_setting("strategy_mode"),
+            "enabled": bool(get_setting("orb_enabled", False)),
+            "day": getattr(executor.state, "day", None) if executor.state else None,
+            "session": session_name,
+            "phase": phase,
+            "orb_high": getattr(executor.state, "orb_high", None) if executor.state else None,
+            "orb_low": getattr(executor.state, "orb_low", None) if executor.state else None,
+            "adds_done": getattr(executor.state, "adds_done", None) if executor.state else None,
+            "avg_price": getattr(executor.state, "avg_price", None) if executor.state else None,
+            "qty": getattr(executor.state, "qty", None) if executor.state else None,
+            "stop": getattr(executor.state, "stop", None) if executor.state else None,
+            "last_close": executor.last_close,
+            "ema9": executor.last_ema9,
+            "ema20": executor.last_ema20,
+            "ema50": executor.last_ema50,
+            "spread_bps": current_spread,
+            "confirm_reason": executor.last_reason,
+            "last_five_bucket": getattr(executor.state, "last_five_bucket", None).isoformat() if getattr(executor.state, "last_five_bucket", None) else None,
+            "btc_balance": btc_bal,
+            "usd_balance": usd_bal,
+            "skip_reason": None,
+            "signal": executor.last_signal,
+            "ema_ok": executor.last_ema_ok,
+            "break_ok": executor.last_break_ok,
+            "risk_qty": executor.last_risk_qty,
+            "final_qty": executor.last_final_qty,
+            "last_signal": executor.last_signal,
+            "last_ema_ok": executor.last_ema_ok,
+            "last_break_ok": executor.last_break_ok,
+            "last_reason": executor.last_reason,
+            "last_risk_qty": executor.last_risk_qty,
+            "bars_1m": bars_1m,
+            "bars_5m": bars_5m
+        }
+    except Exception as e:
+        logging.exception("Failed to get ORB status")
+        return {"status": "error", "detail": str(e)}
+
+def self_test() -> Dict[str, Any]:
+    """Self-test function for FastAPI endpoint"""
+    try:
+        from datetime import datetime, timezone
+        from auto_trade_scheduler import load_runtime_settings
+        now = datetime.now(timezone.utc)
+        settings = load_runtime_settings()
+        settings_dict = vars(settings)
+        settings_dict["orb_debug_force_session"] = True
+        
+        executor = ORBExecutor()
+        result = executor.run_orb_cycle(now, settings_dict)
+        return {"now": now.isoformat(), "res": result}
+    except Exception as e:
+        logging.exception("ORB self-test failed")
+        return {"status": "error", "detail": str(e)}
+
+def flat_all_positions() -> Dict[str, Any]:
+    """Close all ORB positions"""
+    try:
+        result = close_orb_position()
+        return {"status": "success", "result": result}
+    except Exception as e:
+        logging.exception("Failed to flat positions")
+        return {"status": "error", "detail": str(e)}
+
+
+def get_cash_buffer_status() -> Dict[str, Any]:
+    """Get current cash buffer status for UI display"""
+    try:
+        from kraken_trading_btc import KrakenTradingBot
+        bot = KrakenTradingBot()
+        
+        # Get account info
+        account_info = bot.get_account_info()
+        if "error" in account_info:
+            return {"status": "error", "reason": f"Failed to get account info: {account_info['error']}"}
+        
+        usd = float(account_info.get("cash", 0.0))
+        btc = float(account_info.get("balances", {}).get("XXBT", 0.0))
+        
+        # Get current BTC price
+        try:
+            bid, ask, mid = bot.get_top_of_book()
+            price = float(bid)
+        except:
+            price = 45000.0
+        
+        equity = usd + btc * price
+        target_cash = max(25.0, equity * 0.20)  # $25 or 20% of equity
+        current_exposure = (equity - usd) / equity if equity > 0 else 0.0
+        
+        # Check for pending buffer orders
+        buffer_orders = []
+        try:
+            open_orders = bot._make_request_with_retry('POST', '/private/OpenOrders', {}, private=True, signature_path="/0/private/OpenOrders")
+            if not open_orders.get("error"):
+                for txid, order in open_orders.get("result", {}).get("open", {}).items():
+                    userref = str(order.get("userref", ""))
+                    if userref.startswith("orb-buffer-"):
+                        buffer_orders.append({
+                            "txid": txid,
+                            "qty": float(order.get("vol", 0)),
+                            "price": float(order.get("descr", {}).get("price", 0)),
+                            "age_minutes": (time.time() - order.get("opentm", 0)) / 60 if order.get("opentm") else 0
+                        })
+        except Exception as e:
+            logger.warning(f"Failed to get buffer orders: {e}")
+        
+        return {
+            "status": "success",
+            "cash_buffer": {
+                "target_usd": target_cash,
+                "current_usd": usd,
+                "current_exposure_pct": current_exposure * 100,
+                "max_exposure_pct": 80.0,
+                "buffer_status": "ok" if usd >= target_cash else "needs_cash",
+                "pending_orders": buffer_orders
+            }
+        }
+        
+    except Exception as e:
+        logger.exception("Failed to get cash buffer status")
+        return {"status": "error", "reason": str(e)}
+
+
+def adopt_wallet_position() -> Dict[str, Any]:
+    """Adopt existing BTC in wallet as ORB position for management"""
+    try:
+        from kraken_trading_btc import KrakenTradingBot
+        bot = KrakenTradingBot()
+        
+        # Get current balances
+        account_info = bot.get_account_info()
+        if "error" in account_info:
+            return {"status": "error", "reason": f"Failed to get account info: {account_info['error']}"}
+        
+        btc_balance = float(account_info.get("balances", {}).get("XXBT", 0.0))
+        if btc_balance <= 0:
+            return {"status": "error", "reason": "No BTC in wallet to adopt"}
+        
+        # Get current BTC price
+        try:
+            bid, ask, mid = bot.get_top_of_book()
+            current_price = float(bid)
+        except:
+            current_price = 45000.0
+        
+        # Create ORB executor to check current state
+        executor = ORBExecutor()
+        
+        # Only adopt if no active ORB position
+        if executor.state and executor.state.in_position:
+            return {"status": "error", "reason": "ORB already has active position"}
+        
+        # Set the position data
+        if not executor.state:
+            # Create new state if none exists
+            from orb_strategy import ORBState
+            executor.state = ORBState(
+                day=datetime.now().strftime("%Y-%m-%d"),
+                session="WALLET",
+                in_position=True,
+                avg_price=current_price,
+                qty=btc_balance,
+                direction="long"
+            )
+        else:
+            # Update existing state
+            executor.state.in_position = True
+            executor.state.avg_price = current_price
+            executor.state.qty = btc_balance
+            executor.state.direction = "long"
+            executor.state.phase = "WALLET_ADOPTED"
+        
+        # Save the state
+        executor._save_state(executor.state)
+        
+        logger.info(f"✅ Adopted wallet position: {btc_balance} BTC at ${current_price:.2f}")
+        
+        return {
+            "status": "success",
+            "message": f"Adopted {btc_balance} BTC as ORB position",
+            "position": {
+                "qty": btc_balance,
+                "avg_price": current_price,
+                "direction": "long",
+                "value_usd": btc_balance * current_price
+            }
+        }
+        
+    except Exception as e:
+        logger.exception("Failed to adopt wallet position")
+        return {"status": "error", "reason": str(e)}
 
 

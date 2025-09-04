@@ -105,8 +105,65 @@ except ImportError:
     METRICS_ON = False
     orb_signals = orb_trades = orb_skips = spread_bps = equity_g = exposure_g = None
 
-# Initialize FastAPI app
-app = FastAPI(title="Bitcoin LLM Trading System", version="1.0.0")
+# main_btc.py (safe router wiring)
+from fastapi import FastAPI, APIRouter
+from fastapi.routing import APIRoute
+import logging
+app = FastAPI()
+logger = logging.getLogger("uvicorn")
+
+@app.get("/health")
+@app.get("/health/")
+def health(): 
+    return {"status":"healthy"}
+
+orb = APIRouter(prefix="/orb", tags=["orb"])
+
+@orb.get("/status")
+def orb_status():
+    try:
+        from orb_executor import get_orb_status
+        return get_orb_status()
+    except Exception as e:
+        logger.exception("ORB_STATUS_ERR"); return {"status":"error","detail":str(e)}
+
+@orb.post("/self_test")
+def orb_self_test():
+    try:
+        from orb_executor import self_test
+        return self_test()
+    except Exception as e:
+        logger.exception("ORB_SELF_TEST_ERR"); return {"status":"error","detail":str(e)}
+
+@orb.post("/control/flat_now")
+def flat_now():
+    try:
+        from orb_executor import flat_all_positions
+        return flat_all_positions()
+    except Exception as e:
+        logger.exception("ORB_FLAT_ERR"); return {"status":"error","detail":str(e)}
+
+@orb.get("/cash_buffer_status")
+def cash_buffer_status():
+    try:
+        from orb_executor import get_cash_buffer_status
+        return get_cash_buffer_status()
+    except Exception as e:
+        logger.exception("ORB_CASH_BUFFER_ERR"); return {"status":"error","detail":str(e)}
+
+@orb.post("/control/adopt_wallet")
+def adopt_wallet():
+    try:
+        from orb_executor import adopt_wallet_position
+        return adopt_wallet_position()
+    except Exception as e:
+        logger.exception("ORB_ADOPT_WALLET_ERR"); return {"status":"error","detail":str(e)}
+
+app.include_router(orb)
+
+@app.get("/debug/routes", include_in_schema=False)
+def debug_routes():
+    return [{"path": r.path, "methods": sorted(list(r.methods or []))} for r in app.routes if isinstance(r, APIRoute)]
 
 # Trusted IPs that should bypass rate limiting (Docker network + internal services)
 SAFE_IPS = {"127.0.0.1", "172.18.0.1", "172.18.0.2", "172.18.0.3", "172.18.0.5"}
@@ -2739,10 +2796,12 @@ def orb_self_test(at: str = None, force_session: bool = True):
     from auto_trade_scheduler import load_runtime_settings
     from orb_executor import run_orb_cycle
     settings = load_runtime_settings()
+    # Convert SimpleNamespace to dict for modification
+    settings_dict = vars(settings)
     if force_session:
-        settings["orb_debug_force_session"] = True
+        settings_dict["orb_debug_force_session"] = True
 
-    res = run_orb_cycle(now, settings)
+    res = run_orb_cycle(now, settings_dict)
     return {"now": now.isoformat(), "res": res}
 
 
@@ -2761,7 +2820,9 @@ def orb_self_test_confirm(at: str = None, force_dir: str = None):
     from auto_trade_scheduler import load_runtime_settings
     from orb_executor import run_orb_cycle
     settings = load_runtime_settings()
-    settings["orb_debug_force_session"] = True
+    # Convert SimpleNamespace to dict for modification
+    settings_dict = vars(settings)
+    settings_dict["orb_debug_force_session"] = True
     
     # Optionally force a direction to validate order path end-to-end
     if force_dir in ("long", "short"):
@@ -2772,7 +2833,7 @@ def orb_self_test_confirm(at: str = None, force_dir: str = None):
             state["force_test_signal"] = force_dir
             save_orb_state(state)
     
-    res = run_orb_cycle(now, settings)
+    res = run_orb_cycle(now, settings_dict)
     return {"now": now.isoformat(), "res": res}
 
 
@@ -2818,24 +2879,7 @@ def metrics():
     return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
-@app.get("/health")
-def health_check():
-    """Health check endpoint for Docker"""
-    try:
-        # Check if we can access the database
-        from db import get_setting
-        get_setting("test", "ok")
-        
-        # Check if price data is fresh
-        from price_worker import PRICE_CACHE
-        if PRICE_CACHE and PRICE_CACHE.get("ts"):
-            age_sec = (datetime.now(timezone.utc) - PRICE_CACHE["ts"]).total_seconds()
-            if age_sec > int(os.getenv("HEALTH_MIN_PRICE_STALENESS", 120)):
-                return JSONResponse({"status": "degraded", "reason": "stale_price", "age_sec": age_sec})
-        
-        return JSONResponse({"status": "healthy"})
-    except Exception as e:
-        return JSONResponse({"status": "unhealthy", "error": str(e)})
+# Health endpoint now handled by router (see above)
 
 
 @app.get("/orb/daily_summary")
